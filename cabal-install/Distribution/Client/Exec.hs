@@ -31,6 +31,7 @@ import Distribution.Simple.Utils       (die', warn)
 
 import Distribution.System    (Platform(..), OS(..), buildOS)
 import Distribution.Verbosity (Verbosity)
+import Distribution.Monad ( CabalM, liftIO )
 
 import System.Directory ( doesDirectoryExist )
 import System.Environment (lookupEnv)
@@ -41,47 +42,45 @@ import System.FilePath (searchPathSeparator, (</>))
 --
 -- The given command is executed with GHC configured to use the correct
 -- package database and with the sandbox bin directory added to the PATH.
-exec :: Verbosity
-     -> UseSandbox
+exec :: UseSandbox
      -> Compiler
      -> Platform
      -> ProgramDb
      -> [String]
-     -> IO ()
-exec verbosity useSandbox comp platform programDb extraArgs =
+     -> CabalM ()
+exec useSandbox comp platform programDb extraArgs =
     case extraArgs of
         (exe:args) -> do
-            program <- requireProgram' verbosity useSandbox programDb exe
+            program <- requireProgram' useSandbox programDb exe
             env <- environmentOverrides (programOverrideEnv program)
             let invocation = programInvocation
                                  program { programOverrideEnv = env }
                                  args
-            runProgramInvocation verbosity invocation
+            runProgramInvocation invocation
 
-        [] -> die' verbosity "Please specify an executable to run"
+        [] -> die' "Please specify an executable to run"
   where
     environmentOverrides env =
         case useSandbox of
             NoSandbox -> return env
             (UseSandbox sandboxDir) ->
-                sandboxEnvironment verbosity sandboxDir comp platform programDb env
+                sandboxEnvironment sandboxDir comp platform programDb env
 
 
 -- | Return the package's sandbox environment.
 --
 -- The environment sets GHC_PACKAGE_PATH so that GHC will use the sandbox.
-sandboxEnvironment :: Verbosity
-                   -> FilePath
+sandboxEnvironment :: FilePath
                    -> Compiler
                    -> Platform
                    -> ProgramDb
                    -> [(String, Maybe String)] -- environment overrides so far
-                   -> IO [(String, Maybe String)]
-sandboxEnvironment verbosity sandboxDir comp platform programDb iEnv =
+                   -> CabalM [(String, Maybe String)]
+sandboxEnvironment sandboxDir comp platform programDb iEnv =
     case compilerFlavor comp of
       GHC   -> env GHC.getGlobalPackageDB   ghcProgram   "GHC_PACKAGE_PATH"
       GHCJS -> env GHCJS.getGlobalPackageDB ghcjsProgram "GHCJS_PACKAGE_PATH"
-      _     -> die' verbosity "exec only works with GHC and GHCJS"
+      _     -> die' "exec only works with GHC and GHCJS"
   where
     (Platform _ os) = platform
     ldPath = case os of
@@ -90,14 +89,14 @@ sandboxEnvironment verbosity sandboxDir comp platform programDb iEnv =
                _       -> "LD_LIBRARY_PATH"
     env getGlobalPackageDB hcProgram packagePathEnvVar = do
         let Just program = lookupProgram hcProgram programDb
-        gDb <- getGlobalPackageDB verbosity program
-        sandboxConfigFilePath <- getSandboxConfigFilePath mempty
+        gDb <- getGlobalPackageDB program
+        sandboxConfigFilePath <- liftIO $ getSandboxConfigFilePath mempty
         let sandboxPackagePath   = sandboxPackageDBPath sandboxDir comp platform
             compilerPackagePaths = prependToSearchPath gDb sandboxPackagePath
         -- Packages database must exist, otherwise things will start
         -- failing in mysterious ways.
-        exists <- doesDirectoryExist sandboxPackagePath
-        unless exists $ warn verbosity $ "Package database is not a directory: "
+        exists <- liftIO $ doesDirectoryExist sandboxPackagePath
+        unless exists $ warn $ "Package database is not a directory: "
                                            ++ sandboxPackagePath
         -- MASSIVE HACK.  We need this to be synchronized with installLibDir
         -- in defaultInstallDirs' in Distribution.Simple.InstallDirs,
@@ -133,7 +132,7 @@ sandboxEnvironment verbosity sandboxDir comp platform programDb iEnv =
           if any ((==ldPath) . fst) iEnv
             then return $ updateLdPath extraLibPath iEnv
             else do
-              currentLibraryPath <- lookupEnv ldPath
+              currentLibraryPath <- liftIO $ lookupEnv ldPath
               let updatedLdPath =
                     case currentLibraryPath of
                       Nothing -> Just extraLibPath
@@ -161,14 +160,12 @@ sandboxEnvironment verbosity sandboxDir comp platform programDb iEnv =
 
 -- | Check that a program is configured and available to be run. If
 -- a sandbox is available check in the sandbox's directory.
-requireProgram' :: Verbosity
-                -> UseSandbox
+requireProgram' :: UseSandbox
                 -> ProgramDb
                 -> String
-                -> IO ConfiguredProgram
-requireProgram' verbosity useSandbox programDb exe = do
+                -> CabalM ConfiguredProgram
+requireProgram' useSandbox programDb exe = do
     (program, _) <- requireProgram
-                        verbosity
                         (simpleProgram exe)
                         updateSearchPath
     return program

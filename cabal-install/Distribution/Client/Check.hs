@@ -26,29 +26,30 @@ import Distribution.PackageDescription.Parsec
        (parseGenericPackageDescription, runParseResult)
 import Distribution.Parsec.Common                    (PWarning (..), showPError, showPWarning)
 import Distribution.Simple.Utils                     (defaultPackageDesc, die', warn, wrapText)
-import Distribution.Verbosity                        (Verbosity)
+import Distribution.Monad
+         ( CabalM, liftIO )
 
 import qualified Data.ByteString  as BS
 import qualified System.Directory as Dir
 
-readGenericPackageDescriptionCheck :: Verbosity -> FilePath -> IO ([PWarning], GenericPackageDescription)
-readGenericPackageDescriptionCheck verbosity fpath = do
-    exists <- Dir.doesFileExist fpath
+readGenericPackageDescriptionCheck :: FilePath -> CabalM ([PWarning], GenericPackageDescription)
+readGenericPackageDescriptionCheck fpath = do
+    exists <- liftIO $ Dir.doesFileExist fpath
     unless exists $
-      die' verbosity $
+      die' $
         "Error Parsing: file \"" ++ fpath ++ "\" doesn't exist. Cannot continue."
-    bs <- BS.readFile fpath
+    bs <- liftIO $ BS.readFile fpath
     let (warnings, result) = runParseResult (parseGenericPackageDescription bs)
     case result of
         Left (_, errors) -> do
-            traverse_ (warn verbosity . showPError fpath) errors
-            die' verbosity $ "Failed parsing \"" ++ fpath ++ "\"."
+            traverse_ (warn . showPError fpath) errors
+            die' $ "Failed parsing \"" ++ fpath ++ "\"."
         Right x  -> return (warnings, x)
 
-check :: Verbosity -> IO Bool
-check verbosity = do
-    pdfile <- defaultPackageDesc verbosity
-    (ws, ppd) <- readGenericPackageDescriptionCheck verbosity pdfile
+check :: CabalM Bool
+check = do
+    pdfile <- defaultPackageDesc 
+    (ws, ppd) <- readGenericPackageDescriptionCheck pdfile
     -- convert parse warnings into PackageChecks
     -- Note: we /could/ pick different levels, based on warning type.
     let ws' = [ PackageDistSuspicious (showPWarning pdfile w) | w <- ws ]
@@ -66,7 +67,7 @@ check verbosity = do
     --      Hovever, this is the same way hackage does it, so we will yield
     --      the exact same errors as it will.
     let pkg_desc = flattenPackageDescription ppd
-    ioChecks <- checkPackageFiles pkg_desc "."
+    ioChecks <- liftIO $ checkPackageFiles pkg_desc "."
     let packageChecks = ioChecks ++ checkPackage ppd (Just pkg_desc) ++ ws'
         buildImpossible = [ x | x@PackageBuildImpossible {} <- packageChecks ]
         buildWarning    = [ x | x@PackageBuildWarning {}    <- packageChecks ]
@@ -74,36 +75,37 @@ check verbosity = do
                           ++ [ x | x@PackageDistSuspiciousWarn {}  <- packageChecks ]
         distInexusable  = [ x | x@PackageDistInexcusable {} <- packageChecks ]
 
-    unless (null buildImpossible) $ do
-        putStrLn "The package will not build sanely due to these errors:"
-        printCheckMessages buildImpossible
+    liftIO $ do
+      unless (null buildImpossible) $ do
+          putStrLn "The package will not build sanely due to these errors:"
+          printCheckMessages buildImpossible
 
-    unless (null buildWarning) $ do
-        putStrLn "The following warnings are likely to affect your build negatively:"
-        printCheckMessages buildWarning
+      unless (null buildWarning) $ do
+          putStrLn "The following warnings are likely to affect your build negatively:"
+          printCheckMessages buildWarning
 
-    unless (null distSuspicious) $ do
-        putStrLn "These warnings may cause trouble when distributing the package:"
-        printCheckMessages distSuspicious
+      unless (null distSuspicious) $ do
+          putStrLn "These warnings may cause trouble when distributing the package:"
+          printCheckMessages distSuspicious
 
-    unless (null distInexusable) $ do
-        putStrLn "The following errors will cause portability problems on other environments:"
-        printCheckMessages distInexusable
+      unless (null distInexusable) $ do
+          putStrLn "The following errors will cause portability problems on other environments:"
+          printCheckMessages distInexusable
 
-    let isDistError (PackageDistSuspicious     {}) = False
-        isDistError (PackageDistSuspiciousWarn {}) = False
-        isDistError _                              = True
-        isCheckError (PackageDistSuspiciousWarn {}) = False
-        isCheckError _                              = True
-        errors = filter isDistError packageChecks
+      let isDistError (PackageDistSuspicious     {}) = False
+          isDistError (PackageDistSuspiciousWarn {}) = False
+          isDistError _                              = True
+          isCheckError (PackageDistSuspiciousWarn {}) = False
+          isCheckError _                              = True
+          errors = filter isDistError packageChecks
 
-    unless (null errors) $
-        putStrLn "Hackage would reject this package."
+      unless (null errors) $
+          putStrLn "Hackage would reject this package."
 
-    when (null packageChecks) $
-        putStrLn "No errors or warnings could be found in the package."
+      when (null packageChecks) $
+          putStrLn "No errors or warnings could be found in the package."
 
-    return (not . any isCheckError $ packageChecks)
+      return (not . any isCheckError $ packageChecks)
 
   where
     printCheckMessages = traverse_ (putStrLn . format . explanation)

@@ -51,7 +51,7 @@ import Distribution.Simple.Test.LibV09
 import Distribution.System
 import Distribution.Text
 import Distribution.Version
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Types.ForeignLib
 import Distribution.Types.UnqualComponentName
 
@@ -63,7 +63,7 @@ import System.FilePath (splitExtension, dropExtensions, (</>), (<.>),
 
 -- |The interface to a preprocessor, which may be implemented using an
 -- external program, but need not be.  The arguments are the name of
--- the input file, the name of the output file and a verbosity level.
+-- the input file and the name of the output file.
 -- Here is a simple example that merely prepends a comment to the given
 -- source file:
 --
@@ -71,8 +71,8 @@ import System.FilePath (splitExtension, dropExtensions, (</>), (<.>),
 -- > ppTestHandler =
 -- >   PreProcessor {
 -- >     platformIndependent = True,
--- >     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
--- >       do info verbosity (inFile++" has been preprocessed to "++outFile)
+-- >     runPreProcessor = mkSimplePreProcessor $ \inFile outFile ->
+-- >       do info (inFile++" has been preprocessed to "++outFile)
 -- >          stuff <- readFile inFile
 -- >          writeFile outFile ("-- preprocessed as a test\n\n" ++ stuff)
 -- >          return ExitSuccess
@@ -111,8 +111,7 @@ data PreProcessor = PreProcessor {
 
   runPreProcessor :: (FilePath, FilePath) -- Location of the source file relative to a base dir
                   -> (FilePath, FilePath) -- Output file name, relative to an output base dir
-                  -> Verbosity -- verbosity
-                  -> IO ()     -- Should exit if the preprocessor fails
+                  -> CabalM ()     -- Should exit if the preprocessor fails
   }
 
 -- | Function to determine paths to possible extra C sources for a
@@ -122,19 +121,19 @@ data PreProcessor = PreProcessor {
 type PreProcessorExtras = FilePath -> IO [FilePath]
 
 
-mkSimplePreProcessor :: (FilePath -> FilePath -> Verbosity -> IO ())
+mkSimplePreProcessor :: (FilePath -> FilePath -> CabalM ())
                       -> (FilePath, FilePath)
-                      -> (FilePath, FilePath) -> Verbosity -> IO ()
+                      -> (FilePath, FilePath) -> CabalM ()
 mkSimplePreProcessor simplePP
   (inBaseDir, inRelativeFile)
-  (outBaseDir, outRelativeFile) verbosity = simplePP inFile outFile verbosity
+  (outBaseDir, outRelativeFile) = simplePP inFile outFile
   where inFile  = normalise (inBaseDir  </> inRelativeFile)
         outFile = normalise (outBaseDir </> outRelativeFile)
 
-runSimplePreProcessor :: PreProcessor -> FilePath -> FilePath -> Verbosity
-                      -> IO ()
-runSimplePreProcessor pp inFile outFile verbosity =
-  runPreProcessor pp (".", inFile) (".", outFile) verbosity
+runSimplePreProcessor :: PreProcessor -> FilePath -> FilePath
+                      -> CabalM ()
+runSimplePreProcessor pp inFile outFile =
+  runPreProcessor pp (".", inFile) (".", outFile)
 
 -- |A preprocessor for turning non-Haskell files with the given extension
 -- into plain Haskell source files.
@@ -148,13 +147,12 @@ preprocessComponent :: PackageDescription
                     -> LocalBuildInfo
                     -> ComponentLocalBuildInfo
                     -> Bool
-                    -> Verbosity
                     -> [PPSuffixHandler]
-                    -> IO ()
-preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
+                    -> CabalM ()
+preprocessComponent pd comp lbi clbi isSrcDist handlers = do
  -- NB: never report instantiation here; we'll report it properly when
  -- building.
- setupMessage' verbosity "Preprocessing" (packageId pd)
+ setupMessage' "Preprocessing" (packageId pd)
     (componentLocalName clbi) (Nothing :: Maybe [(ModuleName, Module)])
  case comp of
   (CLib lib@Library{ libBuildInfo = bi }) -> do
@@ -186,10 +184,10 @@ preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
       TestSuiteLibV09 _ _ -> do
           let testDir = buildDir lbi </> stubName test
                   </> stubName test ++ "-tmp"
-          writeSimpleTestStub test testDir
+          liftIO $ writeSimpleTestStub test testDir
           preProcessTest test (stubFilePath test) testDir
       TestSuiteUnsupported tt ->
-          die' verbosity $ "No support for preprocessing test "
+          die' $ "No support for preprocessing test "
                         ++ "suite type " ++ display tt
   CBench bm@Benchmark{ benchmarkName = nm } -> do
     let nm' = unUnqualComponentName nm
@@ -197,7 +195,7 @@ preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
       BenchmarkExeV10 _ f ->
           preProcessBench bm f $ buildDir lbi </> nm' </> nm' ++ "-tmp"
       BenchmarkUnsupported tt ->
-          die' verbosity $ "No support for preprocessing benchmark "
+          die' $ "No support for preprocessing benchmark "
                         ++ "type " ++ display tt
   where
     builtinHaskellSuffixes = ["hs", "lhs", "hsig", "lhsig"]
@@ -205,7 +203,7 @@ preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
     builtinSuffixes        = builtinHaskellSuffixes ++ builtinCSuffixes
     localHandlers bi = [(ext, h bi lbi clbi) | (ext, h) <- handlers]
     pre dirs dir lhndlrs fp =
-      preprocessFile dirs dir isSrcDist fp verbosity builtinSuffixes lhndlrs
+      preprocessFile dirs dir isSrcDist fp builtinSuffixes lhndlrs
     preProcessTest test = preProcessComponent (testBuildInfo test)
                           (testModules test)
     preProcessBench bm = preProcessComponent (benchmarkBuildInfo bm)
@@ -215,11 +213,11 @@ preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
             sourceDirs = hsSourceDirs bi ++ [ autogenComponentModulesDir lbi clbi
                                             , autogenPackageModulesDir lbi ]
         sequence_ [ preprocessFile sourceDirs dir isSrcDist
-                (ModuleName.toFilePath modu) verbosity builtinSuffixes
+                (ModuleName.toFilePath modu) builtinSuffixes
                 biHandlers
                 | modu <- modules ]
         preprocessFile (dir : (hsSourceDirs bi)) dir isSrcDist
-            (dropExtensions $ exePath) verbosity
+            (dropExtensions $ exePath)
             builtinSuffixes biHandlers
 
 --TODO: try to list all the modules that could not be found
@@ -233,14 +231,13 @@ preprocessFile
     -> FilePath                 -- ^build directory
     -> Bool                     -- ^preprocess for sdist
     -> FilePath                 -- ^module file name
-    -> Verbosity                -- ^verbosity
     -> [String]                 -- ^builtin suffixes
     -> [(String, PreProcessor)] -- ^possible preprocessors
-    -> IO ()
-preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes handlers = do
+    -> CabalM ()
+preprocessFile searchLoc buildLoc forSDist baseFile builtinSuffixes handlers = do
     -- look for files in the various source dirs with this module name
     -- and a file extension of a known preprocessor
-    psrcFiles <- findFileWithExtension' (map fst handlers) searchLoc baseFile
+    psrcFiles <- liftIO $ findFileWithExtension' (map fst handlers) searchLoc baseFile
     case psrcFiles of
         -- no preprocessor file exists, look for an ordinary source file
         -- just to make sure one actually exists at all for this module.
@@ -250,10 +247,10 @@ preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes ha
         -- files generate source modules directly into the build dir without
         -- the rest of the build system being aware of it (somewhat dodgy)
       Nothing -> do
-                 bsrcFiles <- findFileWithExtension builtinSuffixes (buildLoc : searchLoc) baseFile
+                 bsrcFiles <- liftIO $ findFileWithExtension builtinSuffixes (buildLoc : searchLoc) baseFile
                  case bsrcFiles of
                   Nothing ->
-                    die' verbosity $ "can't find source for " ++ baseFile
+                    die' $ "can't find source for " ++ baseFile
                                   ++ " in " ++ intercalate ", " searchLoc
                   _       -> return ()
         -- found a pre-processable file in one of the source dirs
@@ -274,14 +271,14 @@ preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes ha
             when (not forSDist || forSDist && platformIndependent pp) $ do
               -- look for existing pre-processed source file in the dest dir to
               -- see if we really have to re-run the preprocessor.
-              ppsrcFiles <- findFileWithExtension builtinSuffixes [buildLoc] baseFile
+              ppsrcFiles <- liftIO $ findFileWithExtension builtinSuffixes [buildLoc] baseFile
               recomp <- case ppsrcFiles of
                           Nothing -> return True
-                          Just ppsrcFile ->
+                          Just ppsrcFile -> liftIO $
                               psrcFile `moreRecentFile` ppsrcFile
               when recomp $ do
                 let destDir = buildLoc </> dirName srcStem
-                createDirectoryIfMissingVerbose verbosity True destDir
+                createDirectoryIfMissingVerbose True destDir
                 runPreProcessorWithHsBootHack pp
                    (psrcLoc, psrcRelFile)
                    (buildLoc, srcStem <.> "hs")
@@ -301,10 +298,10 @@ preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes ha
       (outBaseDir, outRelativeFile) = do
         runPreProcessor pp
           (inBaseDir, inRelativeFile)
-          (outBaseDir, outRelativeFile) verbosity
+          (outBaseDir, outRelativeFile)
 
-        exists <- doesFileExist inBoot
-        when exists $ copyFileVerbose verbosity inBoot outBoot
+        exists <- liftIO $ doesFileExist inBoot
+        when exists $ copyFileVerbose inBoot outBoot
 
       where
         inBoot  = replaceExtension inFile  "hs-boot"
@@ -321,8 +318,8 @@ ppGreenCard :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProc
 ppGreenCard _ lbi _
     = PreProcessor {
         platformIndependent = False,
-        runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
-          runDbProgram verbosity greencardProgram (withPrograms lbi)
+        runPreProcessor = mkSimplePreProcessor $ \inFile outFile ->
+          runDbProgram greencardProgram (withPrograms lbi)
               (["-tffi", "-o" ++ outFile, inFile])
       }
 
@@ -332,9 +329,10 @@ ppUnlit :: PreProcessor
 ppUnlit =
   PreProcessor {
     platformIndependent = True,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
-      withUTF8FileContents inFile $ \contents ->
-        either (writeUTF8File outFile) (die' verbosity) (unlit inFile contents)
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile ->
+      runCabalMInIO $ \liftC ->
+        withUTF8FileContents inFile $ \contents ->
+          either (writeUTF8File outFile) (liftC . die') (unlit inFile contents)
   }
 
 ppCpp :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
@@ -354,10 +352,10 @@ ppGhcCpp :: Program -> (Version -> Bool)
 ppGhcCpp program xHs extraArgs _bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
-      (prog, version, _) <- requireProgramVersion verbosity
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile -> do
+      (prog, version, _) <- requireProgramVersion
                               program anyVersion (withPrograms lbi)
-      runProgram verbosity prog $
+      runProgram prog $
           ["-E", "-cpp"]
           -- This is a bit of an ugly hack. We're going to
           -- unlit the file ourselves later on if appropriate,
@@ -374,10 +372,10 @@ ppCpphs :: [String] -> BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo ->
 ppCpphs extraArgs _bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
-      (cpphsProg, cpphsVersion, _) <- requireProgramVersion verbosity
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile -> do
+      (cpphsProg, cpphsVersion, _) <- requireProgramVersion
                                         cpphsProgram anyVersion (withPrograms lbi)
-      runProgram verbosity cpphsProg $
+      runProgram cpphsProg $
           ("-O" ++ outFile) : inFile
         : "--noline" : "--strip"
         : (if cpphsVersion >= mkVersion [1,6]
@@ -390,9 +388,9 @@ ppHsc2hs :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcess
 ppHsc2hs bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
-      (gccProg, _) <- requireProgram verbosity gccProgram (withPrograms lbi)
-      runDbProgram verbosity hsc2hsProgram (withPrograms lbi) $
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile -> do
+      (gccProg, _) <- requireProgram gccProgram (withPrograms lbi)
+      runDbProgram hsc2hsProgram (withPrograms lbi) $
           [ "--cc=" ++ programPath gccProg
           , "--ld=" ++ programPath gccProg ]
 
@@ -483,12 +481,12 @@ ppC2hs bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = \(inBaseDir, inRelativeFile)
-                       (outBaseDir, outRelativeFile) verbosity -> do
-      (c2hsProg, _, _) <- requireProgramVersion verbosity
+                       (outBaseDir, outRelativeFile) -> do
+      (c2hsProg, _, _) <- requireProgramVersion
                             c2hsProgram (orLaterVersion (mkVersion [0,15]))
                             (withPrograms lbi)
-      (gccProg, _) <- requireProgram verbosity gccProgram (withPrograms lbi)
-      runProgram verbosity c2hsProg $
+      (gccProg, _) <- requireProgram gccProgram (withPrograms lbi)
+      runProgram c2hsProg $
 
           -- Options from the current package:
            [ "--cpp=" ++ programPath gccProg, "--cppopts=-E" ]
@@ -629,8 +627,8 @@ standardPP :: LocalBuildInfo -> Program -> [String] -> PreProcessor
 standardPP lbi prog args =
   PreProcessor {
     platformIndependent = False,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
-      runDbProgram verbosity prog (withPrograms lbi)
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile ->
+      runDbProgram prog (withPrograms lbi)
                            (args ++ ["-o", outFile, inFile])
   }
 
@@ -656,34 +654,33 @@ knownExtrasHandlers = [ ppC2hsExtras, ppHsc2hsExtras ]
 
 -- | Find any extra C sources generated by preprocessing that need to
 -- be added to the component (addresses issue #238).
-preprocessExtras :: Verbosity
-                 -> Component
+preprocessExtras :: Component
                  -> LocalBuildInfo
-                 -> IO [FilePath]
-preprocessExtras verbosity comp lbi = case comp of
-  CLib _ -> pp $ buildDir lbi
+                 -> CabalM [FilePath]
+preprocessExtras comp lbi = case comp of
+  CLib _ -> liftIO $ pp $ buildDir lbi
   (CExe Executable { exeName = nm }) -> do
     let nm' = unUnqualComponentName nm
-    pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+    liftIO $ pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
   (CFLib ForeignLib { foreignLibName = nm }) -> do
     let nm' = unUnqualComponentName nm
-    pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+    liftIO $ pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
   CTest test -> do
     let nm' = unUnqualComponentName $ testName test
     case testInterface test of
       TestSuiteExeV10 _ _ ->
-          pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+          liftIO $ pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
       TestSuiteLibV09 _ _ ->
-          pp $ buildDir lbi </> stubName test </> stubName test ++ "-tmp"
-      TestSuiteUnsupported tt -> die' verbosity $ "No support for preprocessing test "
+          liftIO $ pp $ buildDir lbi </> stubName test </> stubName test ++ "-tmp"
+      TestSuiteUnsupported tt -> die' $ "No support for preprocessing test "
                                     ++ "suite type " ++ display tt
   CBench bm -> do
     let nm' = unUnqualComponentName $ benchmarkName bm
     case benchmarkInterface bm of
       BenchmarkExeV10 _ _ ->
-          pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+          liftIO $ pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
       BenchmarkUnsupported tt ->
-          die' verbosity $ "No support for preprocessing benchmark "
+          die' $ "No support for preprocessing benchmark "
                         ++ "type " ++ display tt
   where
     pp :: FilePath -> IO [FilePath]

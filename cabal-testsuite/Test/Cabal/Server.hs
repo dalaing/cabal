@@ -33,6 +33,7 @@ import Data.IORef
 import Data.Maybe
 
 import Distribution.Verbosity
+import Distribution.Monad
 
 import System.Process.Internals
 #if mingw32_HOST_OS
@@ -208,39 +209,41 @@ runMain ref m = do
 
 -- | Start a new GHCi session.
 startServer :: Chan ServerLogMsg -> ScriptEnv -> IO Server
-startServer chan senv = do
-    (prog, _) <- requireProgram verbosity ghcProgram (runnerProgramDb senv)
-    let ghc_args = runnerGhcArgs senv ++ ["--interactive", "-v0", "-ignore-dot-ghci"]
-        proc_spec = (proc (programPath prog) ghc_args) {
-                        create_group = True,
-                        -- Closing fds is VERY important to avoid
-                        -- deadlock; we won't see the end of a
-                        -- stream until everyone gives up.
-                        close_fds = True,
-                        std_in  = CreatePipe,
-                        std_out = CreatePipe,
-                        std_err = CreatePipe
-                    }
-    -- printRawCommandAndArgsAndEnv (runnerVerbosity senv) (programPath prog) ghc_args Nothing
-    when (verbosity >= verbose) $
-        writeChan chan (ServerLogMsg AllServers (showCommandForUser (programPath prog) ghc_args))
-    (Just hin, Just hout, Just herr, proch) <- createProcess proc_spec
-    out_acc <- newMVar []
-    err_acc <- newMVar []
-    tid <- myThreadId
-    return Server {
-                serverStdin     = hin,
-                serverStdout    = hout,
-                serverStderr    = herr,
-                serverProcessHandle = proch,
-                serverProcessId = show tid,
-                serverLogChan   = chan,
-                serverStdoutAccum = out_acc,
-                serverStderrAccum = err_acc,
-                serverScriptEnv = senv
-              }
-  where
-    verbosity = runnerVerbosity senv
+startServer chan senv =
+    let verbosity = runnerVerbosity senv
+    in flip runCabalM verbosity $ do
+      (prog, _) <- requireProgram ghcProgram (runnerProgramDb senv)
+      let ghc_args = runnerGhcArgs senv ++ ["--interactive", "-v0", "-ignore-dot-ghci"]
+          proc_spec = (proc (programPath prog) ghc_args) {
+                          create_group = True,
+                          -- Closing fds is VERY important to avoid
+                          -- deadlock; we won't see the end of a
+                          -- stream until everyone gives up.
+                          close_fds = True,
+                          std_in  = CreatePipe,
+                          std_out = CreatePipe,
+                          std_err = CreatePipe
+                      }
+      -- printRawCommandAndArgsAndEnv (runnerVerbosity senv) (programPath prog) ghc_args Nothing
+      verbosity' <- askVerbosity
+      liftIO $ do
+        when (verbosity' >= verbose) $
+            writeChan chan (ServerLogMsg AllServers (showCommandForUser (programPath prog) ghc_args))
+        (Just hin, Just hout, Just herr, proch) <- createProcess proc_spec
+        out_acc <- newMVar []
+        err_acc <- newMVar []
+        tid <- myThreadId
+        return Server {
+                    serverStdin     = hin,
+                    serverStdout    = hout,
+                    serverStderr    = herr,
+                    serverProcessHandle = proch,
+                    serverProcessId = show tid,
+                    serverLogChan   = chan,
+                    serverStdoutAccum = out_acc,
+                    serverStderrAccum = err_acc,
+                    serverScriptEnv = senv
+                  }
 
 -- | Unmasked initialization for the server
 initServer :: Server -> IO Server

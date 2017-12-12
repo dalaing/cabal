@@ -58,6 +58,7 @@ import Distribution.Text
 import Distribution.Utils.NubList
 import Distribution.Version
 import Distribution.Verbosity
+import Distribution.Monad
 import Language.Haskell.Extension
 
 import Distribution.Compat.Semigroup (All (..), Any (..))
@@ -131,53 +132,38 @@ haddock pkg_descr _ _ haddockFlags
     && not (fromFlag $ haddockTestSuites  haddockFlags)
     && not (fromFlag $ haddockBenchmarks  haddockFlags)
     && not (fromFlag $ haddockForeignLibs haddockFlags)
-    =
-      warn (fromFlag $ haddockVerbosity haddockFlags) $
+    = flip runCabalM (fromFlag $ haddockVerbosity haddockFlags) $
+      warn $
            "No documentation was generated as this package does not contain "
         ++ "a library. Perhaps you want to use the --executables, --tests,"
         ++ " --benchmarks or --foreign-libraries flags."
 
-haddock pkg_descr lbi suffixes flags' = do
-    let verbosity     = flag haddockVerbosity
-        comp          = compiler lbi
+haddock pkg_descr lbi suffixes flags' = flip runCabalM verbosity $ do
+    let comp          = compiler lbi
         platform      = hostPlatform lbi
-
-        flags = case haddockTarget of
-          ForDevelopment -> flags'
-          ForHackage -> flags'
-            { haddockHoogle       = Flag True
-            , haddockHtml         = Flag True
-            , haddockHtmlLocation = Flag (pkg_url ++ "/docs")
-            , haddockContents     = Flag (toPathTemplate pkg_url)
-            , haddockHscolour     = Flag True
-            }
-        pkg_url       = "/package/$pkg-$version"
-        flag f        = fromFlag $ f flags
 
         tmpFileOpts   = defaultTempFileOptions
                        { optKeepTempFiles = flag haddockKeepTempFiles }
         htmlTemplate  = fmap toPathTemplate . flagToMaybe . haddockHtmlLocation
                         $ flags
-        haddockTarget =
-          fromFlagOrDefault ForDevelopment (haddockForHackage flags')
 
     (haddockProg, version, _) <-
-      requireProgramVersion verbosity haddockProgram
+      requireProgramVersion haddockProgram
         (orLaterVersion (mkVersion [2,0])) (withPrograms lbi)
 
     -- various sanity checks
-    when ( flag haddockHoogle
+    when (flag haddockHoogle
            && version < mkVersion [2,2]) $
-         die' verbosity "haddock 2.0 and 2.1 do not support the --hoogle flag."
+         die' "haddock 2.0 and 2.1 do not support the --hoogle flag."
 
-    haddockGhcVersionStr <- getProgramOutput verbosity haddockProg
+    haddockGhcVersionStr <- getProgramOutput haddockProg
                               ["--ghc-version"]
     case (simpleParse haddockGhcVersionStr, compilerCompatVersion GHC comp) of
-      (Nothing, _) -> die' verbosity "Could not get GHC version from Haddock"
-      (_, Nothing) -> die' verbosity "Could not get GHC version from compiler"
+      (Nothing, _) -> die' "Could not get GHC version from Haddock"
+      (_, Nothing) -> die' "Could not get GHC version from compiler"
       (Just haddockGhcVersion, Just ghcVersion)
         | haddockGhcVersion == ghcVersion -> return ()
-        | otherwise -> die' verbosity $
+        | otherwise -> die' $
                "Haddock's internal GHC version must match the configured "
             ++ "GHC version.\n"
             ++ "The GHC version is " ++ display ghcVersion ++ " but "
@@ -186,62 +172,76 @@ haddock pkg_descr lbi suffixes flags' = do
     -- the tools match the requests, we can proceed
 
     when (flag haddockHscolour) $
-      hscolour' (warn verbosity) haddockTarget pkg_descr lbi suffixes
+      hscolour' warn haddockTarget pkg_descr lbi suffixes
       (defaultHscolourFlags `mappend` haddockToHscolour flags)
 
-    libdirArgs <- getGhcLibDir  verbosity lbi
+    libdirArgs <- getGhcLibDir lbi
     let commonArgs = mconcat
             [ libdirArgs
             , fromFlags (haddockTemplateEnv lbi (packageId pkg_descr)) flags
             , fromPackageDescription haddockTarget pkg_descr ]
 
     withAllComponentsInBuildOrder pkg_descr lbi $ \component clbi -> do
-      componentInitialBuildSteps (flag haddockDistPref) pkg_descr lbi clbi verbosity
-      preprocessComponent pkg_descr component lbi clbi False verbosity suffixes
+      componentInitialBuildSteps (flag haddockDistPref) pkg_descr lbi clbi
+      preprocessComponent pkg_descr component lbi clbi False suffixes
       let
         doExe com = case (compToExe com) of
           Just exe -> do
-            withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+            withTempDirectoryEx tmpFileOpts (buildDir lbi) "tmp" $
               \tmp -> do
-                exeArgs <- fromExecutable verbosity tmp lbi clbi htmlTemplate
+                exeArgs <- fromExecutable tmp lbi clbi htmlTemplate
                              version exe
                 let exeArgs' = commonArgs `mappend` exeArgs
-                runHaddock verbosity tmpFileOpts comp platform
+                runHaddock tmpFileOpts comp platform
                   haddockProg exeArgs'
           Nothing -> do
-           warn (fromFlag $ haddockVerbosity flags)
-             "Unsupported component, skipping..."
+           warn "Unsupported component, skipping..."
            return ()
         -- We define 'smsg' once and then reuse it inside the case, so that
         -- we don't say we are running Haddock when we actually aren't
         -- (e.g., Haddock is not run on non-libraries)
-        smsg :: IO ()
-        smsg = setupMessage' verbosity "Running Haddock on" (packageId pkg_descr)
+        smsg :: CabalM ()
+        smsg = setupMessage' "Running Haddock on" (packageId pkg_descr)
                 (componentLocalName clbi) (maybeComponentInstantiatedWith clbi)
       case component of
         CLib lib -> do
-          withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+          withTempDirectoryEx tmpFileOpts (buildDir lbi) "tmp" $
             \tmp -> do
               smsg
-              libArgs <- fromLibrary verbosity tmp lbi clbi htmlTemplate
+              libArgs <- fromLibrary tmp lbi clbi htmlTemplate
                            version lib
               let libArgs' = commonArgs `mappend` libArgs
-              runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs'
+              runHaddock tmpFileOpts comp platform haddockProg libArgs'
         CFLib flib -> when (flag haddockForeignLibs) $ do
-          withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+          withTempDirectoryEx tmpFileOpts (buildDir lbi) "tmp" $
             \tmp -> do
               smsg
-              flibArgs <- fromForeignLib verbosity tmp lbi clbi htmlTemplate
+              flibArgs <- fromForeignLib tmp lbi clbi htmlTemplate
                             version flib
               let libArgs' = commonArgs `mappend` flibArgs
-              runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs'
+              runHaddock tmpFileOpts comp platform haddockProg libArgs'
         CExe   _ -> when (flag haddockExecutables) $ smsg >> doExe component
         CTest  _ -> when (flag haddockTestSuites)  $ smsg >> doExe component
         CBench _ -> when (flag haddockBenchmarks)  $ smsg >> doExe component
 
     for_ (extraDocFiles pkg_descr) $ \ fpath -> do
-      files <- matchFileGlob fpath
-      for_ files $ copyFileTo verbosity (unDir $ argOutputDir commonArgs)
+      files <- liftIO $ matchFileGlob fpath
+      for_ files $ copyFileTo (unDir $ argOutputDir commonArgs)
+  where
+    verbosity     = flag haddockVerbosity
+    haddockTarget =
+      fromFlagOrDefault ForDevelopment (haddockForHackage flags')
+    flags = case haddockTarget of
+      ForDevelopment -> flags'
+      ForHackage -> flags'
+        { haddockHoogle       = Flag True
+        , haddockHtml         = Flag True
+        , haddockHtmlLocation = Flag (pkg_url ++ "/docs")
+        , haddockContents     = Flag (toPathTemplate pkg_url)
+        , haddockHscolour     = Flag True
+        }
+    pkg_url       = "/package/$pkg-$version"
+    flag f        = fromFlag $ f flags
 
 -- ------------------------------------------------------------------------------
 -- Contributions to HaddockArgs (see also Doctest.hs for very similar code).
@@ -297,17 +297,16 @@ componentGhcOptions verbosity lbi bi clbi odir =
                        "haddock only supports GHC and GHCJS"
   in f verbosity lbi bi clbi odir
 
-mkHaddockArgs :: Verbosity
-              -> FilePath
+mkHaddockArgs :: FilePath
               -> LocalBuildInfo
               -> ComponentLocalBuildInfo
               -> Maybe PathTemplate -- ^ template for HTML location
               -> Version
               -> [FilePath]
               -> BuildInfo
-              -> IO HaddockArgs
-mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
-    ifaceArgs <- getInterfaces verbosity lbi clbi htmlTemplate
+              -> CabalM HaddockArgs
+mkHaddockArgs tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
+    ifaceArgs <- getInterfaces lbi clbi htmlTemplate
     let vanillaOpts = (componentGhcOptions normal lbi bi clbi (buildDir lbi)) {
                           -- Noooooooooo!!!!!111
                           -- haddock stomps on our precious .hi
@@ -330,9 +329,9 @@ mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
             then return vanillaOpts
             else if withSharedLib lbi
             then return sharedOpts
-            else die' verbosity $ "Must have vanilla or shared libraries "
+            else die' $ "Must have vanilla or shared libraries "
                        ++ "enabled in order to run haddock"
-    ghcVersion <- maybe (die' verbosity "Compiler has no GHC version")
+    ghcVersion <- maybe (die' "Compiler has no GHC version")
                         return
                         (compilerCompatVersion GHC (compiler lbi))
 
@@ -341,50 +340,47 @@ mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
       argTargets     = inFiles
     }
 
-fromLibrary :: Verbosity
-            -> FilePath
+fromLibrary :: FilePath
             -> LocalBuildInfo
             -> ComponentLocalBuildInfo
             -> Maybe PathTemplate -- ^ template for HTML location
             -> Version
             -> Library
-            -> IO HaddockArgs
-fromLibrary verbosity tmp lbi clbi htmlTemplate haddockVersion lib = do
-    inFiles <- map snd `fmap` getLibSourceFiles verbosity lbi lib clbi
-    args    <- mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion
+            -> CabalM HaddockArgs
+fromLibrary tmp lbi clbi htmlTemplate haddockVersion lib = do
+    inFiles <- map snd `fmap` getLibSourceFiles lbi lib clbi
+    args    <- mkHaddockArgs tmp lbi clbi htmlTemplate haddockVersion
                  inFiles (libBuildInfo lib)
     return args {
       argHideModules = (mempty, otherModules (libBuildInfo lib))
     }
 
-fromExecutable :: Verbosity
-               -> FilePath
+fromExecutable :: FilePath
                -> LocalBuildInfo
                -> ComponentLocalBuildInfo
                -> Maybe PathTemplate -- ^ template for HTML location
                -> Version
                -> Executable
-               -> IO HaddockArgs
-fromExecutable verbosity tmp lbi clbi htmlTemplate haddockVersion exe = do
-    inFiles <- map snd `fmap` getExeSourceFiles verbosity lbi exe clbi
-    args    <- mkHaddockArgs verbosity tmp lbi clbi htmlTemplate
+               -> CabalM HaddockArgs
+fromExecutable tmp lbi clbi htmlTemplate haddockVersion exe = do
+    inFiles <- map snd `fmap` getExeSourceFiles lbi exe clbi
+    args    <- mkHaddockArgs tmp lbi clbi htmlTemplate
                  haddockVersion inFiles (buildInfo exe)
     return args {
       argOutputDir  = Dir  $ unUnqualComponentName $ exeName exe,
       argTitle      = Flag $ unUnqualComponentName $ exeName exe
     }
 
-fromForeignLib :: Verbosity
-               -> FilePath
+fromForeignLib :: FilePath
                -> LocalBuildInfo
                -> ComponentLocalBuildInfo
                -> Maybe PathTemplate -- ^ template for HTML location
                -> Version
                -> ForeignLib
-               -> IO HaddockArgs
-fromForeignLib verbosity tmp lbi clbi htmlTemplate haddockVersion flib = do
-    inFiles <- map snd `fmap` getFLibSourceFiles verbosity lbi flib clbi
-    args    <- mkHaddockArgs verbosity tmp lbi clbi htmlTemplate
+               -> CabalM HaddockArgs
+fromForeignLib tmp lbi clbi htmlTemplate haddockVersion flib = do
+    inFiles <- map snd `fmap` getFLibSourceFiles lbi flib clbi
+    args    <- mkHaddockArgs tmp lbi clbi htmlTemplate
                  haddockVersion inFiles (foreignLibBuildInfo flib)
     return args {
       argOutputDir  = Dir  $ unUnqualComponentName $ foreignLibName flib,
@@ -411,14 +407,13 @@ compToExe comp =
     CExe exe -> Just exe
     _ -> Nothing
 
-getInterfaces :: Verbosity
-              -> LocalBuildInfo
+getInterfaces :: LocalBuildInfo
               -> ComponentLocalBuildInfo
               -> Maybe PathTemplate -- ^ template for HTML location
-              -> IO HaddockArgs
-getInterfaces verbosity lbi clbi htmlTemplate = do
-    (packageFlags, warnings) <- haddockPackageFlags verbosity lbi clbi htmlTemplate
-    traverse_ (warn (verboseUnmarkOutput verbosity)) warnings
+              -> CabalM HaddockArgs
+getInterfaces lbi clbi htmlTemplate = do
+    (packageFlags, warnings) <- haddockPackageFlags lbi clbi htmlTemplate
+    traverse_ (localVerbosity verboseUnmarkOutput . warn) warnings
     return $ mempty {
                  argInterfaces = packageFlags
                }
@@ -439,59 +434,57 @@ getGhcCppOpts haddockVersion bi =
       where
         [v1, v2, v3] = take 3 $ versionNumbers haddockVersion ++ [0,0]
 
-getGhcLibDir :: Verbosity -> LocalBuildInfo
-             -> IO HaddockArgs
-getGhcLibDir verbosity lbi = do
+getGhcLibDir :: LocalBuildInfo
+             -> CabalM HaddockArgs
+getGhcLibDir lbi = do
     l <- case compilerFlavor (compiler lbi) of
-            GHC   -> GHC.getLibDir   verbosity lbi
-            GHCJS -> GHCJS.getLibDir verbosity lbi
+            GHC   -> GHC.getLibDir   lbi
+            GHCJS -> GHCJS.getLibDir lbi
             _     -> error "haddock only supports GHC and GHCJS"
     return $ mempty { argGhcLibDir = Flag l }
 
 -- ------------------------------------------------------------------------------
 -- | Call haddock with the specified arguments.
-runHaddock :: Verbosity
-              -> TempFileOptions
+runHaddock ::   TempFileOptions
               -> Compiler
               -> Platform
               -> ConfiguredProgram
               -> HaddockArgs
-              -> IO ()
-runHaddock verbosity tmpFileOpts comp platform haddockProg args = do
+              -> CabalM ()
+runHaddock tmpFileOpts comp platform haddockProg args = do
   let haddockVersion = fromMaybe (error "unable to determine haddock version")
                        (programVersion haddockProg)
-  renderArgs verbosity tmpFileOpts haddockVersion comp platform args $
+  renderArgs tmpFileOpts haddockVersion comp platform args $
     \(flags,result)-> do
 
-      runProgram verbosity haddockProg flags
+      runProgram haddockProg flags
 
-      notice verbosity $ "Documentation created: " ++ result
+      notice $ "Documentation created: " ++ result
 
 
-renderArgs :: Verbosity
-              -> TempFileOptions
+renderArgs ::    TempFileOptions
               -> Version
               -> Compiler
               -> Platform
               -> HaddockArgs
-              -> (([String], FilePath) -> IO a)
-              -> IO a
-renderArgs verbosity tmpFileOpts version comp platform args k = do
+              -> (([String], FilePath) -> CabalM a)
+              -> CabalM a
+renderArgs tmpFileOpts version comp platform args k = do
   let haddockSupportsUTF8          = version >= mkVersion [2,14,4]
       haddockSupportsResponseFiles = version >  mkVersion [2,16,2]
-  createDirectoryIfMissingVerbose verbosity True outputDir
+  createDirectoryIfMissingVerbose True outputDir
   withTempFileEx tmpFileOpts outputDir "haddock-prologue.txt" $
     \prologueFileName h -> do
           do
-             when haddockSupportsUTF8 (hSetEncoding h utf8)
-             hPutStrLn h $ fromFlag $ argPrologue args
-             hClose h
+             liftIO $ do
+              when haddockSupportsUTF8 (hSetEncoding h utf8)
+              hPutStrLn h $ fromFlag $ argPrologue args
+              hClose h
              let pflag = "--prologue=" ++ prologueFileName
                  renderedArgs = pflag : renderPureArgs version comp platform args
              if haddockSupportsResponseFiles
                then
                  withResponseFile
-                   verbosity
                    tmpFileOpts
                    outputDir
                    "haddock-response.txt"
@@ -621,19 +614,18 @@ haddockPackagePaths ipkgs mkHtmlPath = do
         fixFileUrl f | isAbsolute f = "file://" ++ f
                      | otherwise    = f
 
-haddockPackageFlags :: Verbosity
-                    -> LocalBuildInfo
+haddockPackageFlags :: LocalBuildInfo
                     -> ComponentLocalBuildInfo
                     -> Maybe PathTemplate
-                    -> IO ([(FilePath, Maybe FilePath)], Maybe String)
-haddockPackageFlags verbosity lbi clbi htmlTemplate = do
+                    -> CabalM ([(FilePath, Maybe FilePath)], Maybe String)
+haddockPackageFlags lbi clbi htmlTemplate = do
   let allPkgs = installedPkgs lbi
       directDeps = map fst (componentPackageDeps clbi)
   transitiveDeps <- case PackageIndex.dependencyClosure allPkgs directDeps of
     Left x    -> return x
-    Right inf -> die' verbosity $ "internal error when calculating transitive "
+    Right inf -> die' $ "internal error when calculating transitive "
                     ++ "package dependencies.\nDebug info: " ++ show inf
-  haddockPackagePaths (PackageIndex.allPackages transitiveDeps) mkHtmlPath
+  liftIO $ haddockPackagePaths (PackageIndex.allPackages transitiveDeps) mkHtmlPath
     where
       mkHtmlPath                  = fmap expandTemplateVars htmlTemplate
       expandTemplateVars tmpl pkg =
@@ -660,68 +652,68 @@ hscolour :: PackageDescription
          -> [PPSuffixHandler]
          -> HscolourFlags
          -> IO ()
-hscolour = hscolour' dieNoVerbosity ForDevelopment
+hscolour pkg_descr lbi suffixes flags =
+  flip runCabalM (fromFlag $ hscolourVerbosity flags) $
+    hscolour' die' ForDevelopment pkg_descr lbi suffixes flags
 
-hscolour' :: (String -> IO ()) -- ^ Called when the 'hscolour' exe is not found.
+hscolour' :: (String -> CabalM ()) -- ^ Called when the 'hscolour' exe is not found.
           -> HaddockTarget
           -> PackageDescription
           -> LocalBuildInfo
           -> [PPSuffixHandler]
           -> HscolourFlags
-          -> IO ()
+          -> CabalM ()
 hscolour' onNoHsColour haddockTarget pkg_descr lbi suffixes flags =
     either onNoHsColour (\(hscolourProg, _, _) -> go hscolourProg) =<<
-      lookupProgramVersion verbosity hscolourProgram
+      lookupProgramVersion hscolourProgram
       (orLaterVersion (mkVersion [1,8])) (withPrograms lbi)
   where
-    go :: ConfiguredProgram -> IO ()
+    go :: ConfiguredProgram -> CabalM ()
     go hscolourProg = do
-      setupMessage verbosity "Running hscolour for" (packageId pkg_descr)
-      createDirectoryIfMissingVerbose verbosity True $
+      setupMessage "Running hscolour for" (packageId pkg_descr)
+      createDirectoryIfMissingVerbose True $
         hscolourPref haddockTarget distPref pkg_descr
 
       withAllComponentsInBuildOrder pkg_descr lbi $ \comp clbi -> do
-        componentInitialBuildSteps distPref pkg_descr lbi clbi verbosity
-        preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
+        componentInitialBuildSteps distPref pkg_descr lbi clbi
+        preprocessComponent pkg_descr comp lbi clbi False suffixes
         let
           doExe com = case (compToExe com) of
             Just exe -> do
               let outputDir = hscolourPref haddockTarget distPref pkg_descr
                               </> unUnqualComponentName (exeName exe) </> "src"
-              runHsColour hscolourProg outputDir =<< getExeSourceFiles verbosity lbi exe clbi
+              runHsColour hscolourProg outputDir =<< getExeSourceFiles lbi exe clbi
             Nothing -> do
-              warn (fromFlag $ hscolourVerbosity flags)
-                "Unsupported component, skipping..."
+              warn "Unsupported component, skipping..."
               return ()
         case comp of
           CLib lib -> do
             let outputDir = hscolourPref haddockTarget distPref pkg_descr </> "src"
-            runHsColour hscolourProg outputDir =<< getLibSourceFiles verbosity lbi lib clbi
+            runHsColour hscolourProg outputDir =<< getLibSourceFiles lbi lib clbi
           CFLib flib -> do
             let outputDir = hscolourPref haddockTarget distPref pkg_descr
                               </> unUnqualComponentName (foreignLibName flib) </> "src"
-            runHsColour hscolourProg outputDir =<< getFLibSourceFiles verbosity lbi flib clbi
+            runHsColour hscolourProg outputDir =<< getFLibSourceFiles lbi flib clbi
           CExe   _ -> when (fromFlag (hscolourExecutables flags)) $ doExe comp
           CTest  _ -> when (fromFlag (hscolourTestSuites  flags)) $ doExe comp
           CBench _ -> when (fromFlag (hscolourBenchmarks  flags)) $ doExe comp
 
     stylesheet = flagToMaybe (hscolourCSS flags)
 
-    verbosity  = fromFlag (hscolourVerbosity flags)
     distPref   = fromFlag (hscolourDistPref flags)
 
     runHsColour prog outputDir moduleFiles = do
-         createDirectoryIfMissingVerbose verbosity True outputDir
+         createDirectoryIfMissingVerbose True outputDir
 
          case stylesheet of -- copy the CSS file
            Nothing | programVersion prog >= Just (mkVersion [1,9]) ->
-                       runProgram verbosity prog
+                       runProgram prog
                           ["-print-css", "-o" ++ outputDir </> "hscolour.css"]
                    | otherwise -> return ()
-           Just s -> copyFileVerbose verbosity s (outputDir </> "hscolour.css")
+           Just s -> copyFileVerbose s (outputDir </> "hscolour.css")
 
          for_ moduleFiles $ \(m, inFile) ->
-             runProgram verbosity prog
+             runProgram prog
                     ["-css", "-anchor", "-o" ++ outFile m, inFile]
         where
           outFile m = outputDir </>

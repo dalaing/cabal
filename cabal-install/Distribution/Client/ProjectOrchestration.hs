@@ -139,6 +139,7 @@ import           Distribution.Simple.Utils
                    ( die'
                    , notice, noticeNoWrap, debugNoWrap )
 import           Distribution.Verbosity
+import           Distribution.Monad
 import           Distribution.Text
 import           Distribution.Simple.Compiler
                    ( showCompilerId
@@ -166,22 +167,22 @@ data ProjectBaseContext = ProjectBaseContext {
        buildSettings  :: BuildTimeSettings
      }
 
-establishProjectBaseContext :: Verbosity
-                            -> ProjectConfig
-                            -> IO ProjectBaseContext
-establishProjectBaseContext verbosity cliConfig = do
+establishProjectBaseContext :: ProjectConfig
+                            -> CabalM ProjectBaseContext
+establishProjectBaseContext cliConfig = do
 
-    cabalDir <- defaultCabalDir
-    projectRoot <- either throwIO return =<<
+    cabalDir <- liftIO $ defaultCabalDir
+    projectRoot <- liftIO $ either throwIO return =<<
                    findProjectRoot Nothing mprojectFile
 
     let distDirLayout  = defaultDistDirLayout projectRoot
                                               mdistDirectory
 
     (projectConfig, localPackages) <-
-      rebuildProjectConfig verbosity
-                           distDirLayout
+      rebuildProjectConfig distDirLayout
                            cliConfig
+
+    verbosity <- askVerbosity
 
     let ProjectConfigBuildOnly {
           projectConfigLogsDir,
@@ -192,8 +193,8 @@ establishProjectBaseContext verbosity cliConfig = do
         mstoreDir = Setup.flagToMaybe projectConfigStoreDir
         cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
 
-        buildSettings = resolveBuildTimeSettings
-                          verbosity cabalDirLayout
+        buildSettings = resolveBuildTimeSettings verbosity
+                          cabalDirLayout
                           projectConfig
 
     return ProjectBaseContext {
@@ -244,12 +245,10 @@ data ProjectBuildContext = ProjectBuildContext {
 -- | Pre-build phase: decide what to do.
 --
 runProjectPreBuildPhase
-    :: Verbosity
-    -> ProjectBaseContext
-    -> (ElaboratedInstallPlan -> IO (ElaboratedInstallPlan, TargetsMap))
-    -> IO ProjectBuildContext
+    :: ProjectBaseContext
+    -> (ElaboratedInstallPlan -> CabalM (ElaboratedInstallPlan, TargetsMap))
+    -> CabalM ProjectBuildContext
 runProjectPreBuildPhase
-    verbosity
     ProjectBaseContext {
       distDirLayout,
       cabalDirLayout,
@@ -263,8 +262,7 @@ runProjectPreBuildPhase
     -- the user has asked for.
     --
     (elaboratedPlan, _, elaboratedShared) <-
-      rebuildInstallPlan verbosity
-                         distDirLayout cabalDirLayout
+      rebuildInstallPlan distDirLayout cabalDirLayout
                          projectConfig
                          localPackages
 
@@ -278,14 +276,14 @@ runProjectPreBuildPhase
     -- Check which packages need rebuilding.
     -- This also gives us more accurate reasons for the --dry-run output.
     --
-    pkgsBuildStatus <- rebuildTargetsDryRun distDirLayout elaboratedShared
+    pkgsBuildStatus <- liftIO $ rebuildTargetsDryRun distDirLayout elaboratedShared
                                             elaboratedPlan'
 
     -- Improve the plan by marking up-to-date packages as installed.
     --
     let elaboratedPlan'' = improveInstallPlanWithUpToDatePackages
                              pkgsBuildStatus elaboratedPlan'
-    debugNoWrap verbosity (InstallPlan.showInstallPlan elaboratedPlan'')
+    debugNoWrap (InstallPlan.showInstallPlan elaboratedPlan'')
 
     return ProjectBuildContext {
       elaboratedPlanOriginal = elaboratedPlan,
@@ -301,19 +299,16 @@ runProjectPreBuildPhase
 -- Execute all or parts of the description of what to do to build or
 -- rebuild the various packages needed.
 --
-runProjectBuildPhase :: Verbosity
-                     -> ProjectBaseContext
+runProjectBuildPhase :: ProjectBaseContext
                      -> ProjectBuildContext
-                     -> IO BuildOutcomes
-runProjectBuildPhase _ ProjectBaseContext{buildSettings} _
+                     -> CabalM BuildOutcomes
+runProjectBuildPhase ProjectBaseContext{buildSettings} _
   | buildSettingDryRun buildSettings
   = return Map.empty
 
-runProjectBuildPhase verbosity
-                     ProjectBaseContext{..} ProjectBuildContext {..} =
+runProjectBuildPhase ProjectBaseContext{..} ProjectBuildContext {..} =
     fmap (Map.union (previousBuildOutcomes pkgsBuildStatus)) $
-    rebuildTargets verbosity
-                   distDirLayout
+    rebuildTargets distDirLayout
                    (cabalStoreDirLayout cabalDirLayout)
                    elaboratedPlanToExecute
                    elaboratedShared
@@ -331,17 +326,15 @@ runProjectBuildPhase verbosity
 --
 -- Update bits of state based on the build outcomes and report any failures.
 --
-runProjectPostBuildPhase :: Verbosity
-                         -> ProjectBaseContext
+runProjectPostBuildPhase :: ProjectBaseContext
                          -> ProjectBuildContext
                          -> BuildOutcomes
-                         -> IO ()
-runProjectPostBuildPhase _ ProjectBaseContext{buildSettings} _ _
+                         -> CabalM ()
+runProjectPostBuildPhase ProjectBaseContext{buildSettings} _ _
   | buildSettingDryRun buildSettings
   = return ()
 
-runProjectPostBuildPhase verbosity
-                         ProjectBaseContext {..} ProjectBuildContext {..}
+runProjectPostBuildPhase ProjectBaseContext {..} ProjectBuildContext {..}
                          buildOutcomes = do
     -- Update other build artefacts
     -- TODO: currently none, but could include:
@@ -351,13 +344,12 @@ runProjectPostBuildPhase verbosity
     --        - delete stale package dirs
 
     postBuildStatus <- updatePostBuildProjectStatus
-                         verbosity
                          distDirLayout
                          elaboratedPlanOriginal
                          pkgsBuildStatus
                          buildOutcomes
 
-    void $ writePlanGhcEnvironment (distProjectRootDirectory
+    void $ liftIO $ writePlanGhcEnvironment (distProjectRootDirectory
                                       distDirLayout)
                                    elaboratedPlanOriginal
                                    elaboratedShared
@@ -365,7 +357,7 @@ runProjectPostBuildPhase verbosity
 
     -- Finally if there were any build failures then report them and throw
     -- an exception to terminate the program
-    dieOnBuildFailures verbosity elaboratedPlanToExecute buildOutcomes
+    dieOnBuildFailures elaboratedPlanToExecute buildOutcomes
 
     -- Note that it is a deliberate design choice that the 'buildTargets' is
     -- not passed to phase 1, and the various bits of input config is not
@@ -748,12 +740,10 @@ distinctTargetComponents targetsMap =
 -- | Print a user-oriented presentation of the install plan, indicating what
 -- will be built.
 --
-printPlan :: Verbosity
-          -> ProjectBaseContext
+printPlan :: ProjectBaseContext
           -> ProjectBuildContext
-          -> IO ()
-printPlan verbosity
-          ProjectBaseContext {
+          -> CabalM ()
+printPlan ProjectBaseContext {
             buildSettings = BuildTimeSettings{buildSettingDryRun},
             projectConfig = ProjectConfig {
               projectConfigLocalPackages = PackageConfig {packageConfigOptimization}
@@ -766,40 +756,40 @@ printPlan verbosity
           }
 
   | null pkgs
-  = notice verbosity "Up to date"
+  = notice "Up to date"
 
   | otherwise
-  = noticeNoWrap verbosity $ unlines $
+  = askVerbosity >>= \verbosity -> noticeNoWrap $ unlines $
       (showBuildProfile ++ "In order, the following " ++ wouldWill ++ " be built" ++
-      ifNormal " (use -v for more details)" ++ ":")
-    : map showPkgAndReason pkgs
+      ifNormal verbosity " (use -v for more details)" ++ ":")
+    : map (showPkgAndReason verbosity) pkgs
 
   where
     pkgs = InstallPlan.executionOrder elaboratedPlan
 
-    ifVerbose s | verbosity >= verbose = s
+    ifVerbose verbosity s | verbosity >= verbose = s
                 | otherwise            = ""
 
-    ifNormal s | verbosity >= verbose = ""
+    ifNormal verbosity s | verbosity >= verbose = ""
                | otherwise            = s
 
     wouldWill | buildSettingDryRun = "would"
               | otherwise          = "will"
 
-    showPkgAndReason :: ElaboratedReadyPackage -> String
-    showPkgAndReason (ReadyPackage elab) =
+    showPkgAndReason :: Verbosity -> ElaboratedReadyPackage -> String
+    showPkgAndReason verbosity (ReadyPackage elab) =
       " - " ++
       (if verbosity >= deafening
         then display (installedUnitId elab)
         else display (packageId elab)
         ) ++
       (case elabPkgOrComp elab of
-          ElabPackage pkg -> showTargets elab ++ ifVerbose (showStanzas pkg)
+          ElabPackage pkg -> showTargets elab ++ ifVerbose verbosity (showStanzas pkg)
           ElabComponent comp ->
             " (" ++ showComp elab comp ++ ")"
             ) ++
       showFlagAssignment (nonDefaultFlags elab) ++
-      showConfigureFlags elab ++
+      showConfigureFlags verbosity elab ++
       let buildStatus = pkgsBuildStatus Map.! installedUnitId elab in
       " (" ++ showBuildStatus buildStatus ++ ")"
 
@@ -831,7 +821,7 @@ printPlan verbosity
     showFlagAssignment :: FlagAssignment -> String
     showFlagAssignment = concatMap ((' ' :) . showFlagValue) . unFlagAssignment
 
-    showConfigureFlags elab =
+    showConfigureFlags verbosity elab =
         let fullConfigureFlags
               = setupHsConfigureFlags
                     (ReadyPackage elab)
@@ -894,46 +884,46 @@ printPlan verbosity
 
 -- | If there are build failures then report them and throw an exception.
 --
-dieOnBuildFailures :: Verbosity
-                   -> ElaboratedInstallPlan -> BuildOutcomes -> IO ()
-dieOnBuildFailures verbosity plan buildOutcomes
+dieOnBuildFailures :: ElaboratedInstallPlan -> BuildOutcomes -> CabalM ()
+dieOnBuildFailures plan buildOutcomes
   | null failures = return ()
 
-  | isSimpleCase  = exitFailure
+  | isSimpleCase  = liftIO exitFailure
 
   | otherwise = do
+       verbosity <- askVerbosity
       -- For failures where we have a build log, print the log plus a header
        sequence_
-         [ do notice verbosity $
-                '\n' : renderFailureDetail False pkg reason
+         [ do notice $
+                '\n' : renderFailureDetail verbosity False pkg reason
                     ++ "\nBuild log ( " ++ logfile ++ " ):"
-              readFile logfile >>= noticeNoWrap verbosity
+              liftIO (readFile logfile) >>= noticeNoWrap
          | (pkg, ShowBuildSummaryAndLog reason logfile)
-             <- failuresClassification
+             <- failuresClassification verbosity
          ]
 
        -- For all failures, print either a short summary (if we showed the
        -- build log) or all details
-       die' verbosity $ unlines
+       die' $ unlines
          [ case failureClassification of
              ShowBuildSummaryAndLog reason _
                | verbosity > normal
-              -> renderFailureDetail mentionDepOf pkg reason
+              -> renderFailureDetail verbosity mentionDepOf pkg reason
 
                | otherwise
-              -> renderFailureSummary mentionDepOf pkg reason
+              -> renderFailureSummary verbosity mentionDepOf pkg reason
               ++ ". See the build log above for details."
 
              ShowBuildSummaryOnly reason ->
-               renderFailureDetail mentionDepOf pkg reason
+               renderFailureDetail verbosity mentionDepOf pkg reason
 
          | let mentionDepOf = verbosity <= normal
-         , (pkg, failureClassification) <- failuresClassification ]
+         , (pkg, failureClassification) <- failuresClassification verbosity ]
   where
     failures =  [ (pkgid, failure)
                 | (pkgid, Left failure) <- Map.toList buildOutcomes ]
 
-    failuresClassification =
+    failuresClassification verbosity =
       [ (pkg, classifyBuildFailure failure)
       | (pkgid, failure) <- failures
       , case buildFailureReason failure of
@@ -998,12 +988,12 @@ dieOnBuildFailures verbosity plan buildOutcomes
     hasNoDependents :: HasUnitId pkg => pkg -> Bool
     hasNoDependents = null . InstallPlan.revDirectDeps plan . installedUnitId
 
-    renderFailureDetail mentionDepOf pkg reason =
-        renderFailureSummary mentionDepOf pkg reason ++ "."
+    renderFailureDetail verbosity mentionDepOf pkg reason =
+        renderFailureSummary verbosity mentionDepOf pkg reason ++ "."
      ++ renderFailureExtraDetail reason
      ++ maybe "" showException (buildFailureException reason)
 
-    renderFailureSummary mentionDepOf pkg reason =
+    renderFailureSummary verbosity mentionDepOf pkg reason =
         case reason of
           DownloadFailed  _ -> "Failed to download " ++ pkgstr
           UnpackFailed    _ -> "Failed to unpack "   ++ pkgstr
@@ -1021,7 +1011,7 @@ dieOnBuildFailures verbosity plan buildOutcomes
       where
         pkgstr = elabConfiguredName verbosity pkg
               ++ if mentionDepOf
-                   then renderDependencyOf (installedUnitId pkg)
+                   then renderDependencyOf verbosity (installedUnitId pkg)
                    else ""
 
     renderFailureExtraDetail reason =
@@ -1030,7 +1020,7 @@ dieOnBuildFailures verbosity plan buildOutcomes
         InstallFailed   _ -> " The failure occurred during the final install step."
         _                 -> ""
 
-    renderDependencyOf pkgid =
+    renderDependencyOf verbosity pkgid =
       case ultimateDeps pkgid of
         []         -> ""
         (p1:[])    -> " (which is required by " ++ elabPlanPackageName verbosity p1 ++ ")"

@@ -31,7 +31,9 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Utils
          ( die', notice, wrapText, writeFileAtomic, noticeNoWrap, intercalate )
 import Distribution.Verbosity
-         ( Verbosity, normal, lessVerbose )
+         ( normal, lessVerbose )
+import Distribution.Monad
+         ( CabalM, runCabalM, runCabalMInIO, liftIO, localVerbosity )
 import Distribution.Client.IndexUtils.Timestamp
 import Distribution.Client.IndexUtils
          ( updateRepoIndexCache, Index(..), writeIndexTimestamp
@@ -108,21 +110,21 @@ instance Text UpdateRequest where
 updateAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
              -> [String] -> GlobalFlags -> IO ()
 updateAction (configFlags, configExFlags, installFlags, haddockFlags)
-             extraArgs globalFlags = do
+             extraArgs globalFlags = flip runCabalM verbosity $ do
 
   ProjectBaseContext {
     projectConfig
-  } <- establishProjectBaseContext verbosity cliConfig
+  } <- establishProjectBaseContext cliConfig
 
-  projectConfigWithSolverRepoContext verbosity
+  projectConfigWithSolverRepoContext
     (projectConfigShared projectConfig) (projectConfigBuildOnly projectConfig)
     $ \repoCtxt -> do
     let repos       = filter isRepoRemote $ repoContextRepos repoCtxt
         repoName    = remoteRepoName . repoRemote
-        parseArg :: String -> IO UpdateRequest
+        parseArg :: String -> CabalM UpdateRequest
         parseArg s = case simpleParse s of
           Just r -> return r
-          Nothing -> die' verbosity $
+          Nothing -> die' $
                      "'new-update' unable to parse repo: \"" ++ s ++ "\""
     updateRepoRequests <- mapM parseArg extraArgs
 
@@ -131,10 +133,10 @@ updateAction (configFlags, configExFlags, installFlags, haddockFlags)
           unknownRepos = [r | (UpdateRequest r _) <- updateRepoRequests
                             , not (r `elem` remoteRepoNames)]
       unless (null unknownRepos) $
-        die' verbosity $ "'new-update' repo(s): \""
-                         ++ intercalate "\", \"" unknownRepos
-                         ++ "\" can not be found in known remote repo(s): "
-                         ++ intercalate ", " remoteRepoNames
+        die' $ "'new-update' repo(s): \""
+               ++ intercalate "\", \"" unknownRepos
+               ++ "\" can not be found in known remote repo(s): "
+               ++ intercalate ", " remoteRepoNames
 
     let reposToUpdate :: [(Repo, IndexState)]
         reposToUpdate = case updateRepoRequests of
@@ -149,16 +151,17 @@ updateAction (configFlags, configExFlags, installFlags, haddockFlags)
     case reposToUpdate of
       [] -> return ()
       [(remoteRepo, _)] ->
-        notice verbosity $ "Downloading the latest package list from "
+        notice $ "Downloading the latest package list from "
                         ++ repoName remoteRepo
-      _ -> notice verbosity . unlines
+      _ -> notice . unlines
               $ "Downloading the latest package lists from: "
               : map (("- " ++) . repoName . fst) reposToUpdate
 
-    jobCtrl <- newParallelJobControl (length reposToUpdate)
-    mapM_ (spawnJob jobCtrl . updateRepo verbosity defaultUpdateFlags repoCtxt)
-      reposToUpdate
-    mapM_ (\_ -> collectJob jobCtrl) reposToUpdate
+    jobCtrl <- liftIO $ newParallelJobControl (length reposToUpdate)
+    runCabalMInIO $ \liftC -> 
+      mapM_ (spawnJob jobCtrl . liftC . updateRepo defaultUpdateFlags repoCtxt) 
+        reposToUpdate
+    liftIO $ mapM_ (\_ -> collectJob jobCtrl) reposToUpdate
 
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
@@ -167,8 +170,8 @@ updateAction (configFlags, configExFlags, installFlags, haddockFlags)
                   installFlags haddockFlags
 
 updateRepo :: Verbosity -> UpdateFlags -> RepoContext -> (Repo, IndexState)
-           -> IO ()
-updateRepo verbosity _updateFlags repoCtxt (repo, indexState) = do
+           -> CabalM ()
+updateRepo _updateFlags repoCtxt (repo, indexState) = do
   transport <- repoContextGetTransport repoCtxt
   case repo of
     RepoLocal{..} -> return ()
@@ -180,20 +183,21 @@ updateRepo verbosity _updateFlags repoCtxt (repo, indexState) = do
           setModificationTime (indexBaseName repo <.> "tar")
           =<< getCurrentTime
         FileDownloaded indexPath -> do
-          writeFileAtomic (dropExtension indexPath) . maybeDecompress
+          liftIO $ writeFileAtomic (dropExtension indexPath) . maybeDecompress
                                                   =<< BS.readFile indexPath
-          updateRepoIndexCache verbosity (RepoIndex repoCtxt repo)
+          updateRepoIndexCache (RepoIndex repoCtxt repo)
     RepoSecure{} -> repoContextWithSecureRepo repoCtxt repo $ \repoSecure -> do
       let index = RepoIndex repoCtxt repo
       -- NB: This may be a nullTimestamp if we've never updated before
-      current_ts <- currentIndexTimestamp (lessVerbose verbosity) repoCtxt repo
+      current_ts <- localVerbosity lessVerbose $ currentIndexTimestamp repoCtxt repo
       -- NB: always update the timestamp, even if we didn't actually
       -- download anything
-      writeIndexTimestamp index indexState
-      ce <- if repoContextIgnoreExpiry repoCtxt
-              then Just `fmap` getCurrentTime
-              else return Nothing
-      updated <- Sec.uncheckClientErrors $ Sec.checkForUpdates repoSecure ce
+      updated <- liftIO $ do
+        writeIndexTimestamp index indexState
+        ce <- if repoContextIgnoreExpiry repoCtxt
+                then Just `fmap` getCurrentTime
+                else return Nothing
+        Sec.uncheckClientErrors $ Sec.checkForUpdates repoSecure ce
       -- Update cabal's internal index as well so that it's not out of sync
       -- (If all access to the cache goes through hackage-security this can go)
       case updated of
@@ -201,12 +205,12 @@ updateRepo verbosity _updateFlags repoCtxt (repo, indexState) = do
           setModificationTime (indexBaseName repo <.> "tar")
           =<< getCurrentTime
         Sec.HasUpdates ->
-          updateRepoIndexCache verbosity index
+          updateRepoIndexCache index
       -- TODO: This will print multiple times if there are multiple
       -- repositories: main problem is we don't have a way of updating
       -- a specific repo.  Once we implement that, update this.
       when (current_ts /= nullTimestamp) $
-        noticeNoWrap verbosity $
+        noticeNoWrap $
           "To revert to previous state run:\n" ++
           "    cabal new-update '" ++ remoteRepoName (repoRemote repo)
           ++ "," ++ display current_ts ++ "'\n"

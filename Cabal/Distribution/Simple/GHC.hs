@@ -95,6 +95,7 @@ import Distribution.Simple.Compiler hiding (Flag)
 import Distribution.Version
 import Distribution.System
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Text
 import Distribution.Types.ForeignLib
 import Distribution.Types.ForeignLibType
@@ -120,13 +121,13 @@ import System.Posix (createSymbolicLink)
 -- -----------------------------------------------------------------------------
 -- Configuring
 
-configure :: Verbosity -> Maybe FilePath -> Maybe FilePath
+configure :: Maybe FilePath -> Maybe FilePath
           -> ProgramDb
-          -> IO (Compiler, Maybe Platform, ProgramDb)
-configure verbosity hcPath hcPkgPath conf0 = do
+          -> CabalM (Compiler, Maybe Platform, ProgramDb)
+configure hcPath hcPkgPath conf0 = do
 
   (ghcProg, ghcVersion, progdb1) <-
-    requireProgramVersion verbosity ghcProgram
+    requireProgramVersion ghcProgram
       (orLaterVersion (mkVersion [6,11]))
       (userMaybeSpecifyPath "ghc" hcPath conf0)
   let implInfo = ghcVersionImplInfo ghcVersion
@@ -135,12 +136,12 @@ configure verbosity hcPath hcPkgPath conf0 = do
   -- location of ghc to help find ghc-pkg in the case that the user did not
   -- specify the location of ghc-pkg directly:
   (ghcPkgProg, ghcPkgVersion, progdb2) <-
-    requireProgramVersion verbosity ghcPkgProgram {
+    requireProgramVersion ghcPkgProgram {
       programFindLocation = guessGhcPkgFromGhcPath ghcProg
     }
     anyVersion (userMaybeSpecifyPath "ghc-pkg" hcPkgPath progdb1)
 
-  when (ghcVersion /= ghcPkgVersion) $ die' verbosity $
+  when (ghcVersion /= ghcPkgVersion) $ die' $
        "Version mismatch between ghc and ghc-pkg: "
     ++ programPath ghcProg ++ " is version " ++ display ghcVersion ++ " "
     ++ programPath ghcPkgProg ++ " is version " ++ display ghcPkgVersion
@@ -163,10 +164,10 @@ configure verbosity hcPath hcPkgPath conf0 = do
               addKnownProgram hpcProgram' $
               addKnownProgram runghcProgram' progdb2
 
-  languages  <- Internal.getLanguages verbosity implInfo ghcProg
-  extensions0 <- Internal.getExtensions verbosity implInfo ghcProg
+  languages  <- Internal.getLanguages implInfo ghcProg
+  extensions0 <- Internal.getExtensions implInfo ghcProg
 
-  ghcInfo <- Internal.getGhcInfo verbosity implInfo ghcProg
+  ghcInfo <- Internal.getGhcInfo implInfo ghcProg
   let ghcInfoMap = Map.fromList ghcInfo
       extensions = -- workaround https://ghc.haskell.org/ticket/11214
                    filterExt JavaScriptFFI $
@@ -206,13 +207,13 @@ configure verbosity hcPath hcPkgPath conf0 = do
 -- > /usr/local/bin/ghc-pkg(.exe)
 --
 guessToolFromGhcPath :: Program -> ConfiguredProgram
-                     -> Verbosity -> ProgramSearchPath
-                     -> IO (Maybe (FilePath, [FilePath]))
-guessToolFromGhcPath tool ghcProg verbosity searchpath
+                     -> ProgramSearchPath
+                     -> CabalM (Maybe (FilePath, [FilePath]))
+guessToolFromGhcPath tool ghcProg searchpath
   = do let toolname          = programName tool
            given_path        = programPath ghcProg
            given_dir         = takeDirectory given_path
-       real_path <- canonicalizePath given_path
+       real_path <- liftIO $ canonicalizePath given_path
        let real_dir           = takeDirectory real_path
            versionSuffix path = takeVersionSuffix (dropExeExtension path)
            given_suf = versionSuffix given_path
@@ -230,15 +231,15 @@ guessToolFromGhcPath tool ghcProg verbosity searchpath
                             if real_path == given_path
                                 then []
                                 else mkGuesses real_dir real_suf
-       info verbosity $ "looking for tool " ++ toolname
+       info $ "looking for tool " ++ toolname
          ++ " near compiler in " ++ given_dir
-       debug verbosity $ "candidate locations: " ++ show guesses
-       exists <- traverse doesFileExist guesses
+       debug $ "candidate locations: " ++ show guesses
+       exists <- liftIO $ traverse doesFileExist guesses
        case [ file | (file, True) <- zip guesses exists ] of
                    -- If we can't find it near ghc, fall back to the usual
                    -- method.
-         []     -> programFindLocation tool verbosity searchpath
-         (fp:_) -> do info verbosity $ "found " ++ toolname ++ " in " ++ fp
+         []     -> programFindLocation tool searchpath
+         (fp:_) -> do info $ "found " ++ toolname ++ " in " ++ fp
                       let lookedAt = map fst
                                    . takeWhile (\(_file, exist) -> not exist)
                                    $ zip guesses exists
@@ -259,8 +260,8 @@ guessToolFromGhcPath tool ghcProg verbosity searchpath
 -- > /usr/local/bin/ghc-pkg(.exe)
 --
 guessGhcPkgFromGhcPath :: ConfiguredProgram
-                       -> Verbosity -> ProgramSearchPath
-                       -> IO (Maybe (FilePath, [FilePath]))
+                       -> ProgramSearchPath
+                       -> CabalM (Maybe (FilePath, [FilePath]))
 guessGhcPkgFromGhcPath = guessToolFromGhcPath ghcPkgProgram
 
 -- | Given something like /usr/local/bin/ghc-6.6.1(.exe) we try and find a
@@ -272,8 +273,8 @@ guessGhcPkgFromGhcPath = guessToolFromGhcPath ghcPkgProgram
 -- > /usr/local/bin/hsc2hs(.exe)
 --
 guessHsc2hsFromGhcPath :: ConfiguredProgram
-                       -> Verbosity -> ProgramSearchPath
-                       -> IO (Maybe (FilePath, [FilePath]))
+                       -> ProgramSearchPath
+                       -> CabalM (Maybe (FilePath, [FilePath]))
 guessHsc2hsFromGhcPath = guessToolFromGhcPath hsc2hsProgram
 
 -- | Given something like /usr/local/bin/ghc-6.6.1(.exe) we try and find a
@@ -285,43 +286,43 @@ guessHsc2hsFromGhcPath = guessToolFromGhcPath hsc2hsProgram
 -- > /usr/local/bin/haddock(.exe)
 --
 guessHaddockFromGhcPath :: ConfiguredProgram
-                       -> Verbosity -> ProgramSearchPath
-                       -> IO (Maybe (FilePath, [FilePath]))
+                       -> ProgramSearchPath
+                       -> CabalM (Maybe (FilePath, [FilePath]))
 guessHaddockFromGhcPath = guessToolFromGhcPath haddockProgram
 
 guessHpcFromGhcPath :: ConfiguredProgram
-                       -> Verbosity -> ProgramSearchPath
-                       -> IO (Maybe (FilePath, [FilePath]))
+                       -> ProgramSearchPath
+                       -> CabalM (Maybe (FilePath, [FilePath]))
 guessHpcFromGhcPath = guessToolFromGhcPath hpcProgram
 
 guessRunghcFromGhcPath :: ConfiguredProgram
-                       -> Verbosity -> ProgramSearchPath
-                       -> IO (Maybe (FilePath, [FilePath]))
+                       -> ProgramSearchPath
+                       -> CabalM (Maybe (FilePath, [FilePath]))
 guessRunghcFromGhcPath = guessToolFromGhcPath runghcProgram
 
 
-getGhcInfo :: Verbosity -> ConfiguredProgram -> IO [(String, String)]
-getGhcInfo verbosity ghcProg = Internal.getGhcInfo verbosity implInfo ghcProg
+getGhcInfo :: ConfiguredProgram -> CabalM [(String, String)]
+getGhcInfo ghcProg = Internal.getGhcInfo implInfo ghcProg
   where
     Just version = programVersion ghcProg
     implInfo = ghcVersionImplInfo version
 
 -- | Given a single package DB, return all installed packages.
-getPackageDBContents :: Verbosity -> PackageDB -> ProgramDb
-                        -> IO InstalledPackageIndex
-getPackageDBContents verbosity packagedb progdb = do
-  pkgss <- getInstalledPackages' verbosity [packagedb] progdb
-  toPackageIndex verbosity pkgss progdb
+getPackageDBContents :: PackageDB -> ProgramDb
+                        -> CabalM InstalledPackageIndex
+getPackageDBContents packagedb progdb = do
+  pkgss <- getInstalledPackages' [packagedb] progdb
+  toPackageIndex pkgss progdb
 
 -- | Given a package DB stack, return all installed packages.
-getInstalledPackages :: Verbosity -> Compiler -> PackageDBStack
+getInstalledPackages :: Compiler -> PackageDBStack
                      -> ProgramDb
-                     -> IO InstalledPackageIndex
-getInstalledPackages verbosity comp packagedbs progdb = do
-  checkPackageDbEnvVar verbosity
-  checkPackageDbStack verbosity comp packagedbs
-  pkgss <- getInstalledPackages' verbosity packagedbs progdb
-  index <- toPackageIndex verbosity pkgss progdb
+                     -> CabalM InstalledPackageIndex
+getInstalledPackages comp packagedbs progdb = do
+  checkPackageDbEnvVar
+  checkPackageDbStack comp packagedbs
+  pkgss <- getInstalledPackages' packagedbs progdb
+  index <- toPackageIndex pkgss progdb
   return $! hackRtsPackage index
 
   where
@@ -335,15 +336,14 @@ getInstalledPackages verbosity comp packagedbs progdb = do
 -- | Given a list of @(PackageDB, InstalledPackageInfo)@ pairs, produce a
 -- @PackageIndex@. Helper function used by 'getPackageDBContents' and
 -- 'getInstalledPackages'.
-toPackageIndex :: Verbosity
-               -> [(PackageDB, [InstalledPackageInfo])]
+toPackageIndex :: [(PackageDB, [InstalledPackageInfo])]
                -> ProgramDb
-               -> IO InstalledPackageIndex
-toPackageIndex verbosity pkgss progdb = do
+               -> CabalM InstalledPackageIndex
+toPackageIndex pkgss progdb = do
   -- On Windows, various fields have $topdir/foo rather than full
   -- paths. We need to substitute the right value in so that when
   -- we, for example, call gcc, we have proper paths to give it.
-  topDir <- getLibDir' verbosity ghcProg
+  topDir <- getLibDir' ghcProg
   let indices = [ PackageIndex.fromList (map (Internal.substTopDir topDir) pkgs)
                 | (_, pkgs) <- pkgss ]
   return $! mconcat indices
@@ -351,31 +351,31 @@ toPackageIndex verbosity pkgss progdb = do
   where
     Just ghcProg = lookupProgram ghcProgram progdb
 
-getLibDir :: Verbosity -> LocalBuildInfo -> IO FilePath
-getLibDir verbosity lbi =
+getLibDir :: LocalBuildInfo -> CabalM FilePath
+getLibDir lbi =
     dropWhileEndLE isSpace `fmap`
-     getDbProgramOutput verbosity ghcProgram
+     getDbProgramOutput ghcProgram
      (withPrograms lbi) ["--print-libdir"]
 
-getLibDir' :: Verbosity -> ConfiguredProgram -> IO FilePath
-getLibDir' verbosity ghcProg =
+getLibDir' :: ConfiguredProgram -> CabalM FilePath
+getLibDir' ghcProg =
     dropWhileEndLE isSpace `fmap`
-     getProgramOutput verbosity ghcProg ["--print-libdir"]
+     getProgramOutput ghcProg ["--print-libdir"]
 
 
 -- | Return the 'FilePath' to the global GHC package database.
-getGlobalPackageDB :: Verbosity -> ConfiguredProgram -> IO FilePath
-getGlobalPackageDB verbosity ghcProg =
+getGlobalPackageDB :: ConfiguredProgram -> CabalM FilePath
+getGlobalPackageDB ghcProg =
     dropWhileEndLE isSpace `fmap`
-     getProgramOutput verbosity ghcProg ["--print-global-package-db"]
+     getProgramOutput ghcProg ["--print-global-package-db"]
 
 -- | Return the 'FilePath' to the per-user GHC package database.
-getUserPackageDB :: Verbosity -> ConfiguredProgram -> Platform -> NoCallStackIO FilePath
-getUserPackageDB _verbosity ghcProg platform = do
+getUserPackageDB :: ConfiguredProgram -> Platform -> CabalM FilePath
+getUserPackageDB ghcProg platform = do
     -- It's rather annoying that we have to reconstruct this, because ghc
     -- hides this information from us otherwise. But for certain use cases
     -- like change monitoring it really can't remain hidden.
-    appdir <- getAppUserDataDirectory "ghc"
+    appdir <- liftIO $ getAppUserDataDirectory "ghc"
     return (appdir </> platformAndVersion </> packageConfFileName)
   where
     platformAndVersion = Internal.ghcPlatformAndVersionString
@@ -385,36 +385,36 @@ getUserPackageDB _verbosity ghcProg platform = do
       | otherwise                        = "package.conf"
     Just ghcVersion = programVersion ghcProg
 
-checkPackageDbEnvVar :: Verbosity -> IO ()
-checkPackageDbEnvVar verbosity =
-    Internal.checkPackageDbEnvVar verbosity "GHC" "GHC_PACKAGE_PATH"
+checkPackageDbEnvVar :: CabalM ()
+checkPackageDbEnvVar =
+    Internal.checkPackageDbEnvVar "GHC" "GHC_PACKAGE_PATH"
 
-checkPackageDbStack :: Verbosity -> Compiler -> PackageDBStack -> IO ()
-checkPackageDbStack verbosity comp =
+checkPackageDbStack :: Compiler -> PackageDBStack -> CabalM ()
+checkPackageDbStack comp =
     if flagPackageConf implInfo
-      then checkPackageDbStackPre76 verbosity
-      else checkPackageDbStackPost76 verbosity
+      then checkPackageDbStackPre76
+      else checkPackageDbStackPost76
   where implInfo = ghcVersionImplInfo (compilerVersion comp)
 
-checkPackageDbStackPost76 :: Verbosity -> PackageDBStack -> IO ()
-checkPackageDbStackPost76 _ (GlobalPackageDB:rest)
+checkPackageDbStackPost76 :: PackageDBStack -> CabalM ()
+checkPackageDbStackPost76 (GlobalPackageDB:rest)
   | GlobalPackageDB `notElem` rest = return ()
-checkPackageDbStackPost76 verbosity rest
+checkPackageDbStackPost76 rest
   | GlobalPackageDB `elem` rest =
-  die' verbosity $ "If the global package db is specified, it must be "
+  die' $ "If the global package db is specified, it must be "
      ++ "specified first and cannot be specified multiple times"
-checkPackageDbStackPost76 _ _ = return ()
+checkPackageDbStackPost76 _ = return ()
 
-checkPackageDbStackPre76 :: Verbosity -> PackageDBStack -> IO ()
-checkPackageDbStackPre76 _ (GlobalPackageDB:rest)
+checkPackageDbStackPre76 :: PackageDBStack -> CabalM ()
+checkPackageDbStackPre76 (GlobalPackageDB:rest)
   | GlobalPackageDB `notElem` rest = return ()
-checkPackageDbStackPre76 verbosity rest
+checkPackageDbStackPre76 rest
   | GlobalPackageDB `notElem` rest =
-  die' verbosity $ "With current ghc versions the global package db is always used "
+  die' $ "With current ghc versions the global package db is always used "
      ++ "and must be listed first. This ghc limitation is lifted in GHC 7.6,"
      ++ "see http://hackage.haskell.org/trac/ghc/ticket/5977"
-checkPackageDbStackPre76 verbosity _ =
-  die' verbosity $ "If the global package db is specified, it must be "
+checkPackageDbStackPre76 _ =
+  die' $ "If the global package db is specified, it must be "
      ++ "specified first and cannot be specified multiple times"
 
 -- GHC < 6.10 put "$topdir/include/mingw" in rts's installDirs. This
@@ -428,12 +428,12 @@ removeMingwIncludeDir pkg =
 
 -- | Get the packages from specific PackageDBs, not cumulative.
 --
-getInstalledPackages' :: Verbosity -> [PackageDB] -> ProgramDb
-                     -> IO [(PackageDB, [InstalledPackageInfo])]
-getInstalledPackages' verbosity packagedbs progdb
+getInstalledPackages' :: [PackageDB] -> ProgramDb
+                     -> CabalM [(PackageDB, [InstalledPackageInfo])]
+getInstalledPackages' packagedbs progdb
   | ghcVersion >= mkVersion [6,9] =
   sequenceA
-    [ do pkgs <- HcPkg.dump (hcPkgInfo progdb) verbosity packagedb
+    [ do pkgs <- HcPkg.dump (hcPkgInfo progdb) packagedb
          return (packagedb, pkgs)
     | packagedb <- packagedbs ]
 
@@ -441,20 +441,20 @@ getInstalledPackages' verbosity packagedbs progdb
     Just ghcProg    = lookupProgram ghcProgram progdb
     Just ghcVersion = programVersion ghcProg
 
-getInstalledPackages' verbosity packagedbs progdb = do
-    str <- getDbProgramOutput verbosity ghcPkgProgram progdb ["list"]
+getInstalledPackages' packagedbs progdb = do
+    str <- getDbProgramOutput ghcPkgProgram progdb ["list"]
     let pkgFiles = [ init line | line <- lines str, last line == ':' ]
         dbFile packagedb = case (packagedb, pkgFiles) of
           (GlobalPackageDB, global:_)      -> return $ Just global
           (UserPackageDB,  _global:user:_) -> return $ Just user
           (UserPackageDB,  _global:_)      -> return $ Nothing
           (SpecificPackageDB specific, _)  -> return $ Just specific
-          _ -> die' verbosity "cannot read ghc-pkg package listing"
+          _ -> die' "cannot read ghc-pkg package listing"
     pkgFiles' <- traverse dbFile packagedbs
-    sequenceA [ withFileContents file $ \content -> do
-                  pkgs <- readPackages file content
-                  return (db, pkgs)
-              | (db , Just file) <- zip packagedbs pkgFiles' ]
+    runCabalMInIO $ \liftC -> sequenceA [ withFileContents file $ \content -> do
+                         pkgs <- liftC $ readPackages file content
+                         return (db, pkgs)
+                       | (db , Just file) <- zip packagedbs pkgFiles' ]
   where
     -- Depending on the version of ghc we use a different type's Read
     -- instance to parse the package file and then convert.
@@ -469,23 +469,23 @@ getInstalledPackages' verbosity packagedbs progdb = do
       = \file _ -> failToRead file
     Just ghcProg = lookupProgram ghcProgram progdb
     Just ghcVersion = programVersion ghcProg
-    failToRead file = die' verbosity $ "cannot read ghc package database " ++ file
+    failToRead file = die' $ "cannot read ghc package database " ++ file
 
-getInstalledPackagesMonitorFiles :: Verbosity -> Platform
+getInstalledPackagesMonitorFiles :: Platform
                                  -> ProgramDb
                                  -> [PackageDB]
-                                 -> IO [FilePath]
-getInstalledPackagesMonitorFiles verbosity platform progdb =
+                                 -> CabalM [FilePath]
+getInstalledPackagesMonitorFiles platform progdb =
     traverse getPackageDBPath
   where
-    getPackageDBPath :: PackageDB -> IO FilePath
+    getPackageDBPath :: PackageDB -> CabalM FilePath
     getPackageDBPath GlobalPackageDB =
-      selectMonitorFile =<< getGlobalPackageDB verbosity ghcProg
+      liftIO . selectMonitorFile =<< getGlobalPackageDB ghcProg
 
     getPackageDBPath UserPackageDB =
-      selectMonitorFile =<< getUserPackageDB verbosity ghcProg platform
+      liftIO . selectMonitorFile =<< getUserPackageDB ghcProg platform
 
-    getPackageDBPath (SpecificPackageDB path) = selectMonitorFile path
+    getPackageDBPath (SpecificPackageDB path) = liftIO $ selectMonitorFile path
 
     -- GHC has old style file dbs, and new style directory dbs.
     -- Note that for dir style dbs, we only need to monitor the cache file, not
@@ -502,16 +502,17 @@ getInstalledPackagesMonitorFiles verbosity platform progdb =
 -- -----------------------------------------------------------------------------
 -- Building a library
 
-buildLib, replLib :: Verbosity          -> Cabal.Flag (Maybe Int)
+buildLib, replLib :: Cabal.Flag (Maybe Int)
                   -> PackageDescription -> LocalBuildInfo
-                  -> Library            -> ComponentLocalBuildInfo -> IO ()
+                  -> Library            -> ComponentLocalBuildInfo -> CabalM ()
 buildLib = buildOrReplLib False
 replLib  = buildOrReplLib True
 
-buildOrReplLib :: Bool -> Verbosity  -> Cabal.Flag (Maybe Int)
+buildOrReplLib :: Bool -> Cabal.Flag (Maybe Int)
                -> PackageDescription -> LocalBuildInfo
-               -> Library            -> ComponentLocalBuildInfo -> IO ()
-buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
+               -> Library            -> ComponentLocalBuildInfo -> CabalM ()
+buildOrReplLib forRepl numJobs pkg_descr lbi lib clbi = do
+  verbosity <- askVerbosity
   let uid = componentUnitId clbi
       libTargetDir = componentBuildDir lbi clbi
       whenVanillaLib forceVanilla =
@@ -529,10 +530,10 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
       platform@(Platform _hostArch hostOS) = hostPlatform lbi
       has_code = not (componentIsIndefinite clbi)
 
-  (ghcProg, _) <- requireProgram verbosity ghcProgram (withPrograms lbi)
-  let runGhcProg = runGHC verbosity ghcProg comp platform
+  (ghcProg, _) <- requireProgram ghcProgram (withPrograms lbi)
+  let runGhcProg = runGHC ghcProg comp platform
 
-  libBi <- hackThreadedFlag verbosity
+  libBi <- hackThreadedFlag
              comp (withProfLib lbi) (libBuildInfo lib)
 
   let isGhcDynamic        = isDynamic comp
@@ -556,7 +557,7 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
         | isCoverageEnabled = toFlag $ Hpc.mixDir distPref way pkg_name
         | otherwise = mempty
 
-  createDirectoryIfMissingVerbose verbosity True libTargetDir
+  createDirectoryIfMissingVerbose True libTargetDir
   -- TODO: do we need to put hs-boot files into place for mutually recursive
   -- modules?
   let cLikeFiles  = fromNubListR $ toNubListR (cSources libBi) <> toNubListR (cxxSources libBi)
@@ -638,7 +639,7 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
                     -- static and dynamically linked executables. We copy
                     -- the modules interfaces so they are available under
                     -- both ways.
-                    copyDirectoryRecursive verbosity dynDir vanillaDir
+                    copyDirectoryRecursive dynDir vanillaDir
                 _ -> return ()
           else if isGhcDynamic
             then do shared;  vanilla
@@ -647,7 +648,7 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
 
   -- build any C++ sources seperately
   unless (not has_code || null (cxxSources libBi)) $ do
-    info verbosity "Building C++ Sources..."
+    info "Building C++ Sources..."
     sequence_
       [ do let baseCxxOpts    = Internal.componentCxxGhcOptions verbosity implInfo
                                lbi libBi clbi libTargetDir filename
@@ -664,9 +665,9 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
                                  ghcOptObjSuffix   = toFlag "dyn_o"
                                }
                odir           = fromFlag (ghcOptObjDir vanillaCxxOpts)
-           createDirectoryIfMissingVerbose verbosity True odir
+           createDirectoryIfMissingVerbose True odir
            let runGhcProgIfNeeded cxxOpts = do
-                 needsRecomp <- checkNeedsRecompilation filename cxxOpts
+                 needsRecomp <- liftIO $ checkNeedsRecompilation filename cxxOpts
                  when needsRecomp $ runGhcProg cxxOpts
            runGhcProgIfNeeded vanillaCxxOpts
            unless forRepl $
@@ -675,13 +676,13 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
       | filename <- cxxSources libBi]
 
   when has_code . ifReplLib $ do
-    when (null (allLibModules lib clbi)) $ warn verbosity "No exposed modules"
+    when (null (allLibModules lib clbi)) $ warn "No exposed modules"
     ifReplLib (runGhcProg replOpts)
 
   -- build any C sources
   -- TODO: Add support for S and CMM files.
   unless (not has_code || null (cSources libBi)) $ do
-    info verbosity "Building C Sources..."
+    info "Building C Sources..."
     sequence_
       [ do let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
                                lbi libBi clbi libTargetDir filename
@@ -700,9 +701,9 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
                                  ghcOptObjSuffix   = toFlag "dyn_o"
                                }
                odir          = fromFlag (ghcOptObjDir vanillaCcOpts)
-           createDirectoryIfMissingVerbose verbosity True odir
+           createDirectoryIfMissingVerbose True odir
            let runGhcProgIfNeeded ccOpts = do
-                 needsRecomp <- checkNeedsRecompilation filename ccOpts
+                 needsRecomp <- liftIO $ checkNeedsRecompilation filename ccOpts
                  when needsRecomp $ runGhcProg ccOpts
            runGhcProgIfNeeded vanillaCcOpts
            unless forRepl $
@@ -716,7 +717,7 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
 
   -- link:
   when has_code . unless forRepl $ do
-    info verbosity "Linking..."
+    info "Linking..."
     let cProfObjs   = map (`replaceExtension` ("p_" ++ objExtension))
                       (cSources libBi ++ cxxSources libBi)
         cSharedObjs = map (`replaceExtension` ("dyn_" ++ objExtension))
@@ -731,36 +732,36 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
         sharedLibInstallPath = libInstallPath </> mkSharedLibName compiler_id uid
 
     stubObjs <- catMaybes <$> sequenceA
-      [ findFileWithExtension [objExtension] [libTargetDir]
+      [ liftIO $ findFileWithExtension [objExtension] [libTargetDir]
           (ModuleName.toFilePath x ++"_stub")
       | ghcVersion < mkVersion [7,2] -- ghc-7.2+ does not make _stub.o files
       , x <- allLibModules lib clbi ]
     stubProfObjs <- catMaybes <$> sequenceA
-      [ findFileWithExtension ["p_" ++ objExtension] [libTargetDir]
+      [ liftIO $ findFileWithExtension ["p_" ++ objExtension] [libTargetDir]
           (ModuleName.toFilePath x ++"_stub")
       | ghcVersion < mkVersion [7,2] -- ghc-7.2+ does not make _stub.o files
       , x <- allLibModules lib clbi ]
     stubSharedObjs <- catMaybes <$> sequenceA
-      [ findFileWithExtension ["dyn_" ++ objExtension] [libTargetDir]
+      [ liftIO $ findFileWithExtension ["dyn_" ++ objExtension] [libTargetDir]
           (ModuleName.toFilePath x ++"_stub")
       | ghcVersion < mkVersion [7,2] -- ghc-7.2+ does not make _stub.o files
       , x <- allLibModules lib clbi ]
 
-    hObjs     <- Internal.getHaskellObjects implInfo lib lbi clbi
+    hObjs     <- liftIO $ Internal.getHaskellObjects implInfo lib lbi clbi
                       libTargetDir objExtension True
     hProfObjs <-
       if withProfLib lbi
-              then Internal.getHaskellObjects implInfo lib lbi clbi
+              then liftIO $ Internal.getHaskellObjects implInfo lib lbi clbi
                       libTargetDir ("p_" ++ objExtension) True
               else return []
     hSharedObjs <-
       if withSharedLib lbi
-              then Internal.getHaskellObjects implInfo lib lbi clbi
+              then liftIO $ Internal.getHaskellObjects implInfo lib lbi clbi
                       libTargetDir ("dyn_" ++ objExtension) False
               else return []
 
     unless (null hObjs && null cObjs && null stubObjs) $ do
-      rpaths <- getRPaths lbi clbi
+      rpaths <- liftIO $ getRPaths lbi clbi
 
       let staticObjectFiles =
                  hObjs
@@ -852,17 +853,17 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
                 ghcOptLinkLibPath        = toNubListR $ extraLibDirs libBi
               }
 
-      info verbosity (show (ghcOptPackages ghcSharedLinkArgs))
+      info (show (ghcOptPackages ghcSharedLinkArgs))
 
       whenVanillaLib False $
-        Ar.createArLibArchive verbosity lbi vanillaLibFilePath staticObjectFiles
+        Ar.createArLibArchive lbi vanillaLibFilePath staticObjectFiles
 
       whenProfLib $
-        Ar.createArLibArchive verbosity lbi profileLibFilePath profObjectFiles
+        Ar.createArLibArchive lbi profileLibFilePath profObjectFiles
 
       whenGHCiLib $ do
-        (ldProg, _) <- requireProgram verbosity ldProgram (withPrograms lbi)
-        Ld.combineObjectFiles verbosity lbi ldProg
+        (ldProg, _) <- requireProgram ldProgram (withPrograms lbi)
+        Ld.combineObjectFiles lbi ldProg
           ghciLibFilePath ghciObjFiles
 
       whenSharedLib False $
@@ -872,36 +873,36 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
         runGhcProg ghcStaticLinkArgs
 
 -- | Start a REPL without loading any source files.
-startInterpreter :: Verbosity -> ProgramDb -> Compiler -> Platform
-                 -> PackageDBStack -> IO ()
-startInterpreter verbosity progdb comp platform packageDBs = do
+startInterpreter :: ProgramDb -> Compiler -> Platform
+                 -> PackageDBStack -> CabalM ()
+startInterpreter progdb comp platform packageDBs = do
   let replOpts = mempty {
         ghcOptMode       = toFlag GhcModeInteractive,
         ghcOptPackageDBs = packageDBs
         }
-  checkPackageDbStack verbosity comp packageDBs
-  (ghcProg, _) <- requireProgram verbosity ghcProgram progdb
-  runGHC verbosity ghcProg comp platform replOpts
+  checkPackageDbStack comp packageDBs
+  (ghcProg, _) <- requireProgram ghcProgram progdb
+  runGHC ghcProg comp platform replOpts
 
 -- -----------------------------------------------------------------------------
 -- Building an executable or foreign library
 
 -- | Build a foreign library
 buildFLib, replFLib
-  :: Verbosity          -> Cabal.Flag (Maybe Int)
+  :: Cabal.Flag (Maybe Int)
   -> PackageDescription -> LocalBuildInfo
-  -> ForeignLib         -> ComponentLocalBuildInfo -> IO ()
-buildFLib v njobs pkg lbi = gbuild v njobs pkg lbi . GBuildFLib
-replFLib  v njobs pkg lbi = gbuild v njobs pkg lbi . GReplFLib
+  -> ForeignLib         -> ComponentLocalBuildInfo -> CabalM ()
+buildFLib njobs pkg lbi = gbuild njobs pkg lbi . GBuildFLib
+replFLib  njobs pkg lbi = gbuild njobs pkg lbi . GReplFLib
 
 -- | Build an executable with GHC.
 --
 buildExe, replExe
-  :: Verbosity          -> Cabal.Flag (Maybe Int)
+  :: Cabal.Flag (Maybe Int)
   -> PackageDescription -> LocalBuildInfo
-  -> Executable         -> ComponentLocalBuildInfo -> IO ()
-buildExe v njobs pkg lbi = gbuild v njobs pkg lbi . GBuildExe
-replExe  v njobs pkg lbi = gbuild v njobs pkg lbi . GReplExe
+  -> Executable         -> ComponentLocalBuildInfo -> CabalM ()
+buildExe njobs pkg lbi = gbuild njobs pkg lbi . GBuildExe
+replExe  njobs pkg lbi = gbuild njobs pkg lbi . GReplExe
 
 -- | Building an executable, starting the REPL, and building foreign
 -- libraries are all very similar and implemented in 'gbuild'. The
@@ -1077,21 +1078,20 @@ decodeMainIsArg arg
       where (r_suf, r_pre) = break pred' (reverse str)
 
 -- | Return C sources, GHC input files and GHC input modules
-gbuildSources :: Verbosity
-              -> Version -- ^ specVersion
+gbuildSources :: Version -- ^ specVersion
               -> FilePath
               -> GBuildMode
-              -> IO ([FilePath], [FilePath], [ModuleName])
-gbuildSources verbosity specVer tmpDir bm =
+              -> CabalM ([FilePath], [FilePath], [ModuleName])
+gbuildSources specVer tmpDir bm =
     case bm of
       GBuildExe  exe  -> exeSources exe
       GReplExe   exe  -> exeSources exe
       GBuildFLib flib -> return $ flibSources flib
       GReplFLib  flib -> return $ flibSources flib
   where
-    exeSources :: Executable -> IO ([FilePath], [FilePath], [ModuleName])
+    exeSources :: Executable -> CabalM ([FilePath], [FilePath], [ModuleName])
     exeSources exe@Executable{buildInfo = bnfo, modulePath = modPath} = do
-      main <- findFile (tmpDir : hsSourceDirs bnfo) modPath
+      main <- liftIO $ findFile (tmpDir : hsSourceDirs bnfo) modPath
       let mainModName = fromMaybe ModuleName.main $ exeMainModuleName exe
           otherModNames = exeModules exe
 
@@ -1110,7 +1110,7 @@ gbuildSources verbosity specVer tmpDir bm =
              -- Finally, we only enable this workaround for
              -- specVersion < 2, as 'cabal-version:>=2.0' cabal files
              -- have no excuse anymore to keep doing it wrong... ;-)
-             warn verbosity $ "Enabling workaround for Main module '"
+             warn $ "Enabling workaround for Main module '"
                             ++ display mainModName
                             ++ "' listed in 'other-modules' illegally!"
 
@@ -1128,25 +1128,26 @@ gbuildSources verbosity specVer tmpDir bm =
     isHaskell fp = elem (takeExtension fp) [".hs", ".lhs"]
 
 -- | Generic build function. See comment for 'GBuildMode'.
-gbuild :: Verbosity          -> Cabal.Flag (Maybe Int)
+gbuild :: Cabal.Flag (Maybe Int)
        -> PackageDescription -> LocalBuildInfo
-       -> GBuildMode         -> ComponentLocalBuildInfo -> IO ()
-gbuild verbosity numJobs pkg_descr lbi bm clbi = do
-  (ghcProg, _) <- requireProgram verbosity ghcProgram (withPrograms lbi)
+       -> GBuildMode         -> ComponentLocalBuildInfo -> CabalM ()
+gbuild numJobs pkg_descr lbi bm clbi = do
+  verbosity <- askVerbosity
+  (ghcProg, _) <- requireProgram ghcProgram (withPrograms lbi)
   let comp       = compiler lbi
       platform   = hostPlatform lbi
       implInfo   = getImplInfo comp
-      runGhcProg = runGHC verbosity ghcProg comp platform
+      runGhcProg = runGHC ghcProg comp platform
 
-  bnfo <- hackThreadedFlag verbosity
+  bnfo <- hackThreadedFlag
             comp (withProfExe lbi) (gbuildInfo bm)
 
   -- the name that GHC really uses (e.g., with .exe on Windows for executables)
   let targetName = gbuildTargetName lbi bm
   let targetDir  = buildDir lbi </> (gbuildName bm)
   let tmpDir     = targetDir    </> (gbuildName bm ++ "-tmp")
-  createDirectoryIfMissingVerbose verbosity True targetDir
-  createDirectoryIfMissingVerbose verbosity True tmpDir
+  createDirectoryIfMissingVerbose True targetDir
+  createDirectoryIfMissingVerbose True tmpDir
 
   -- TODO: do we need to put hs-boot files into place for mutually recursive
   -- modules?  FIX: what about exeName.hi-boot?
@@ -1160,8 +1161,8 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
         | isCoverageEnabled = toFlag $ Hpc.mixDir distPref way (gbuildName bm)
         | otherwise         = mempty
 
-  rpaths <- getRPaths lbi clbi
-  (cSrcs, inputFiles, inputModules) <- gbuildSources verbosity
+  rpaths <- liftIO $ getRPaths lbi clbi
+  (cSrcs, inputFiles, inputModules) <- gbuildSources
                                        (specVersion pkg_descr) tmpDir bm
 
   let isGhcDynamic        = isDynamic comp
@@ -1278,7 +1279,7 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
 
   -- build any C sources
   unless (null cSrcs) $ do
-   info verbosity "Building C Sources..."
+   info "Building C Sources..."
    sequence_
      [ do let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
                               lbi bnfo clbi tmpDir filename
@@ -1298,8 +1299,8 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
                    | needDynamic   = sharedCcOpts
                    | otherwise     = vanillaCcOpts
               odir = fromFlag (ghcOptObjDir opts)
-          createDirectoryIfMissingVerbose verbosity True odir
-          needsRecomp <- checkNeedsRecompilation filename opts
+          createDirectoryIfMissingVerbose True odir
+          needsRecomp <- liftIO $ checkNeedsRecompilation filename opts
           when needsRecomp $
             runGhcProg opts
      | filename <- cSrcs ]
@@ -1318,11 +1319,11 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
                      }
                    `mappend` (if withDynExe lbi then dynLinkerOpts else mempty)
 
-      info verbosity "Linking..."
+      info "Linking..."
       -- Work around old GHCs not relinking in this
       -- situation, see #3294
       let target = targetDir </> targetName
-      when (compilerVersion comp < mkVersion [7,7]) $ do
+      when (compilerVersion comp < mkVersion [7,7]) $ liftIO $ do
         e <- doesFileExist target
         when e (removeFile target)
       runGhcProg linkOpts { ghcOptOutputFile = toFlag target }
@@ -1360,10 +1361,10 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
       -- We build under a (potentially) different filename to set a
       -- soname on supported platforms.  See also the note for
       -- @flibBuildName@.
-      info verbosity "Linking..."
+      info "Linking..."
       let buildName = flibBuildName lbi flib
       runGhcProg linkOpts { ghcOptOutputFile = toFlag (targetDir </> buildName) }
-      renameFile (targetDir </> buildName) (targetDir </> targetName)
+      liftIO $ renameFile (targetDir </> buildName) (targetDir </> targetName)
 
 {-
 Note [RPATH]
@@ -1533,11 +1534,11 @@ getRPaths _ _ = return mempty
 
 -- | Filter the "-threaded" flag when profiling as it does not
 --   work with ghc-6.8 and older.
-hackThreadedFlag :: Verbosity -> Compiler -> Bool -> BuildInfo -> IO BuildInfo
-hackThreadedFlag verbosity comp prof bi
+hackThreadedFlag :: Compiler -> Bool -> BuildInfo -> CabalM BuildInfo
+hackThreadedFlag comp prof bi
   | not mustFilterThreaded = return bi
   | otherwise              = do
-    warn verbosity $ "The ghc flag '-threaded' is not compatible with "
+    warn $ "The ghc flag '-threaded' is not compatible with "
                   ++ "profiling in ghc-6.8 and older. It will be disabled."
     return bi { options = filterHcOptions (/= "-threaded") (options bi) }
   where
@@ -1551,10 +1552,11 @@ hackThreadedFlag verbosity comp prof bi
 -- | Extracts a String representing a hash of the ABI of a built
 -- library.  It can fail if the library has not yet been built.
 --
-libAbiHash :: Verbosity -> PackageDescription -> LocalBuildInfo
-           -> Library -> ComponentLocalBuildInfo -> IO String
-libAbiHash verbosity _pkg_descr lbi lib clbi = do
-  libBi <- hackThreadedFlag verbosity
+libAbiHash :: PackageDescription -> LocalBuildInfo
+           -> Library -> ComponentLocalBuildInfo -> CabalM String
+libAbiHash _pkg_descr lbi lib clbi = do
+  verbosity <- askVerbosity
+  libBi <- hackThreadedFlag
              (compiler lbi) (withProfLib lbi) (libBuildInfo lib)
   let
       comp        = compiler lbi
@@ -1592,8 +1594,8 @@ libAbiHash verbosity _pkg_descr lbi lib clbi = do
         | withProfLib lbi = profArgs
         | otherwise = error "libAbiHash: Can't find an enabled library way"
 
-  (ghcProg, _) <- requireProgram verbosity ghcProgram (withPrograms lbi)
-  hash <- getProgramInvocationOutput verbosity
+  (ghcProg, _) <- requireProgram ghcProgram (withPrograms lbi)
+  hash <- getProgramInvocationOutput
           (ghcInvocation ghcProg comp platform ghcArgs)
   return (takeWhile (not . isSpace) hash)
 
@@ -1620,38 +1622,36 @@ componentCcGhcOptions verbosity lbi =
 -- Installing
 
 -- |Install executables for GHC.
-installExe :: Verbosity
-           -> LocalBuildInfo
+installExe :: LocalBuildInfo
            -> FilePath -- ^Where to copy the files to
            -> FilePath  -- ^Build location
            -> (FilePath, FilePath)  -- ^Executable (prefix,suffix)
            -> PackageDescription
            -> Executable
-           -> IO ()
-installExe verbosity lbi binDir buildPref
+           -> CabalM ()
+installExe lbi binDir buildPref
   (progprefix, progsuffix) _pkg exe = do
-  createDirectoryIfMissingVerbose verbosity True binDir
+  createDirectoryIfMissingVerbose True binDir
   let exeName' = unUnqualComponentName $ exeName exe
       exeFileName = exeTargetName exe
       fixedExeBaseName = progprefix ++ exeName' ++ progsuffix
       installBinary dest = do
-          installExecutableFile verbosity
+          installExecutableFile
             (buildPref </> exeName' </> exeFileName)
             (dest <.> exeExtension)
           when (stripExes lbi) $
-            Strip.stripExe verbosity (hostPlatform lbi) (withPrograms lbi)
+            Strip.stripExe (hostPlatform lbi) (withPrograms lbi)
                            (dest <.> exeExtension)
   installBinary (binDir </> fixedExeBaseName)
 
 -- |Install foreign library for GHC.
-installFLib :: Verbosity
-            -> LocalBuildInfo
+installFLib :: LocalBuildInfo
             -> FilePath  -- ^install location
             -> FilePath  -- ^Build location
             -> PackageDescription
             -> ForeignLib
-            -> IO ()
-installFLib verbosity lbi targetDir builtDir _pkg flib =
+            -> CabalM ()
+installFLib lbi targetDir builtDir _pkg flib =
     install (foreignLibIsShared flib)
             builtDir
             targetDir
@@ -1660,15 +1660,15 @@ installFLib verbosity lbi targetDir builtDir _pkg flib =
     install isShared srcDir dstDir name = do
       let src = srcDir </> name
           dst = dstDir </> name
-      createDirectoryIfMissingVerbose verbosity True targetDir
+      createDirectoryIfMissingVerbose True targetDir
       -- TODO: Should we strip? (stripLibs lbi)
       if isShared
-        then installExecutableFile verbosity src dst
-        else installOrdinaryFile   verbosity src dst
+        then installExecutableFile src dst
+        else installOrdinaryFile   src dst
       -- Now install appropriate symlinks if library is versioned
       let (Platform _ os) = hostPlatform lbi
       when (not (null (foreignLibVersion flib os))) $ do
-          when (os /= Linux) $ die' verbosity
+          when (os /= Linux) $ die'
             -- It should be impossible to get here.
             "Can't install foreign-library symlink on non-Linux OS"
 #ifndef mingw32_HOST_OS
@@ -1679,7 +1679,7 @@ installFLib verbosity lbi targetDir builtDir _pkg flib =
           -- directory it's created in.
           -- Finally, we first create the symlinks in a temporary
           -- directory and then rename to simulate 'ln --force'.
-          withTempDirectory verbosity dstDir nm $ \tmpDir -> do
+          withTempDirectory dstDir nm $ \tmpDir -> liftIO $ do
               let link1 = flibBuildName lbi flib
                   link2 = "lib" ++ nm <.> "so"
               createSymbolicLink name (tmpDir </> link1)
@@ -1693,16 +1693,15 @@ installFLib verbosity lbi targetDir builtDir _pkg flib =
 
 
 -- |Install for ghc, .hi, .a and, if --with-ghci given, .o
-installLib    :: Verbosity
-              -> LocalBuildInfo
+installLib    :: LocalBuildInfo
               -> FilePath  -- ^install location
               -> FilePath  -- ^install location for dynamic libraries
               -> FilePath  -- ^Build location
               -> PackageDescription
               -> Library
               -> ComponentLocalBuildInfo
-              -> IO ()
-installLib verbosity lbi targetDir dynlibTargetDir _builtDir _pkg lib clbi = do
+              -> CabalM ()
+installLib lbi targetDir dynlibTargetDir _builtDir _pkg lib clbi = do
   -- copy .hi files over:
   whenVanilla $ copyModuleFiles "hi"
   whenProf    $ copyModuleFiles "p_hi"
@@ -1726,21 +1725,21 @@ installLib verbosity lbi targetDir dynlibTargetDir _builtDir _pkg lib clbi = do
       let src = srcDir </> name
           dst = dstDir </> name
 
-      createDirectoryIfMissingVerbose verbosity True dstDir
+      createDirectoryIfMissingVerbose True dstDir
 
       if isShared
-        then installExecutableFile verbosity src dst
-        else installOrdinaryFile   verbosity src dst
+        then installExecutableFile src dst
+        else installOrdinaryFile   src dst
 
-      when (stripLibs lbi) $ Strip.stripLib verbosity
+      when (stripLibs lbi) $ Strip.stripLib
                              (hostPlatform lbi) (withPrograms lbi) dst
 
     installOrdinary = install False
     installShared   = install True
 
     copyModuleFiles ext =
-      findModuleFiles [builtDir] [ext] (allLibModules lib clbi)
-      >>= installOrdinaryFiles verbosity targetDir
+      liftIO (findModuleFiles [builtDir] [ext] (allLibModules lib clbi))
+      >>= installOrdinaryFiles targetDir
 
     compiler_id = compilerId (compiler lbi)
     uid = componentUnitId clbi
@@ -1777,24 +1776,23 @@ hcPkgInfo progdb = HcPkg.HcPkgInfo { HcPkg.hcPkgProgram    = ghcPkgProg
     Just ver        = programVersion ghcPkgProg
 
 registerPackage
-  :: Verbosity
-  -> ProgramDb
+  :: ProgramDb
   -> PackageDBStack
   -> InstalledPackageInfo
   -> HcPkg.RegisterOptions
-  -> IO ()
-registerPackage verbosity progdb packageDbs installedPkgInfo registerOptions =
-    HcPkg.register (hcPkgInfo progdb) verbosity packageDbs
+  -> CabalM ()
+registerPackage progdb packageDbs installedPkgInfo registerOptions =
+    HcPkg.register (hcPkgInfo progdb) packageDbs
                    installedPkgInfo registerOptions
 
-pkgRoot :: Verbosity -> LocalBuildInfo -> PackageDB -> IO FilePath
-pkgRoot verbosity lbi = pkgRoot'
+pkgRoot :: LocalBuildInfo -> PackageDB -> CabalM FilePath
+pkgRoot lbi = pkgRoot'
    where
     pkgRoot' GlobalPackageDB =
       let Just ghcProg = lookupProgram ghcProgram (withPrograms lbi)
-      in  fmap takeDirectory (getGlobalPackageDB verbosity ghcProg)
+      in  fmap takeDirectory (getGlobalPackageDB ghcProg)
     pkgRoot' UserPackageDB = do
-      appDir <- getAppUserDataDirectory "ghc"
+      appDir <- liftIO $ getAppUserDataDirectory "ghc"
       let ver      = compilerVersion (compiler lbi)
           subdir   = System.Info.arch ++ '-':System.Info.os
                      ++ '-':display ver
@@ -1803,7 +1801,7 @@ pkgRoot verbosity lbi = pkgRoot'
       -- does not yet exists. Otherwise '${pkgroot}' will resolve to a
       -- directory at the time of 'ghc-pkg register', and registration will
       -- fail.
-      createDirectoryIfMissing True rootDir
+      liftIO $ createDirectoryIfMissing True rootDir
       return rootDir
     pkgRoot' (SpecificPackageDB fp) = return (takeDirectory fp)
 

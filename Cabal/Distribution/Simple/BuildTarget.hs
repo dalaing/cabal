@@ -51,7 +51,7 @@ import Distribution.ModuleName
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Text
 import Distribution.Simple.Utils
-import Distribution.Verbosity
+import Distribution.Monad
 
 import qualified Distribution.Compat.ReadP as Parse
 import Distribution.Compat.ReadP ( (+++), (<++) )
@@ -68,10 +68,10 @@ import qualified Data.Map as Map
 
 -- | Take a list of 'String' build targets, and parse and validate them
 -- into actual 'TargetInfo's to be built/registered/whatever.
-readTargetInfos :: Verbosity -> PackageDescription -> LocalBuildInfo -> [String] -> IO [TargetInfo]
-readTargetInfos verbosity pkg_descr lbi args = do
-    build_targets <- readBuildTargets verbosity pkg_descr args
-    checkBuildTargets verbosity pkg_descr lbi build_targets
+readTargetInfos :: PackageDescription -> LocalBuildInfo -> [String] -> CabalM [TargetInfo]
+readTargetInfos pkg_descr lbi args = do
+    build_targets <- readBuildTargets pkg_descr args
+    checkBuildTargets pkg_descr lbi build_targets
 
 -- ------------------------------------------------------------
 -- * User build targets
@@ -142,15 +142,15 @@ buildTargetComponentName (BuildTargetFile      cn _) = cn
 -- 'BuildTarget's according to a 'PackageDescription'. If there are problems
 -- with any of the targets e.g. they don't exist or are misformatted, throw an
 -- 'IOException'.
-readBuildTargets :: Verbosity -> PackageDescription -> [String] -> IO [BuildTarget]
-readBuildTargets verbosity pkg targetStrs = do
+readBuildTargets :: PackageDescription -> [String] -> CabalM [BuildTarget]
+readBuildTargets pkg targetStrs = do
     let (uproblems, utargets) = readUserBuildTargets targetStrs
-    reportUserBuildTargetProblems verbosity uproblems
+    reportUserBuildTargetProblems uproblems
 
-    utargets' <- traverse checkTargetExistsAsFile utargets
+    utargets' <- liftIO $ traverse checkTargetExistsAsFile utargets
 
     let (bproblems, btargets) = resolveBuildTargets pkg utargets'
-    reportBuildTargetProblems verbosity bproblems
+    reportBuildTargetProblems bproblems
 
     return btargets
 
@@ -212,12 +212,12 @@ data UserBuildTargetProblem
    = UserBuildTargetUnrecognised String
   deriving Show
 
-reportUserBuildTargetProblems :: Verbosity -> [UserBuildTargetProblem] -> IO ()
-reportUserBuildTargetProblems verbosity problems = do
+reportUserBuildTargetProblems :: [UserBuildTargetProblem] -> CabalM ()
+reportUserBuildTargetProblems problems = do
     case [ target | UserBuildTargetUnrecognised target <- problems ] of
       []     -> return ()
       target ->
-        die' verbosity $ unlines
+        die' $ unlines
                 [ "Unrecognised build target '" ++ name ++ "'."
                 | name <- target ]
            ++ "Examples:\n"
@@ -360,13 +360,13 @@ renderBuildTarget ql target pkgid =
     dispCName = componentStringName pkgid
     dispKind  = showComponentKindShort . componentKind
 
-reportBuildTargetProblems :: Verbosity -> [BuildTargetProblem] -> IO ()
-reportBuildTargetProblems verbosity problems = do
+reportBuildTargetProblems :: [BuildTargetProblem] -> CabalM ()
+reportBuildTargetProblems problems = do
 
     case [ (t, e, g) | BuildTargetExpected t e g <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [    "Unrecognised build target '" ++ showUserBuildTarget target
             ++ "'.\n"
             ++ "Expected a " ++ intercalate " or " expected
@@ -376,7 +376,7 @@ reportBuildTargetProblems verbosity problems = do
     case [ (t, e) | BuildTargetNoSuch t e <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [    "Unknown build target '" ++ showUserBuildTarget target
             ++ "'.\nThere is no "
             ++ intercalate " or " [ mungeThing thing ++ " '" ++ got ++ "'"
@@ -389,7 +389,7 @@ reportBuildTargetProblems verbosity problems = do
     case [ (t, ts) | BuildTargetAmbiguous t ts <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [    "Ambiguous build target '" ++ showUserBuildTarget target
             ++ "'. It could be:\n "
             ++ unlines [ "   "++ showUserBuildTarget ut ++
@@ -982,12 +982,12 @@ caseFold = lowercase
 --
 -- Also swizzle into a more convenient form.
 --
-checkBuildTargets :: Verbosity -> PackageDescription -> LocalBuildInfo -> [BuildTarget]
-                  -> IO [TargetInfo]
-checkBuildTargets _ pkg_descr lbi []      =
+checkBuildTargets :: PackageDescription -> LocalBuildInfo -> [BuildTarget]
+                  -> CabalM [TargetInfo]
+checkBuildTargets pkg_descr lbi []      =
     return (allTargetsInBuildOrder' pkg_descr lbi)
 
-checkBuildTargets verbosity pkg_descr lbi targets = do
+checkBuildTargets pkg_descr lbi targets = do
 
     let (enabled, disabled) =
           partitionEithers
@@ -1000,10 +1000,10 @@ checkBuildTargets verbosity pkg_descr lbi targets = do
 
     case disabled of
       []                 -> return ()
-      ((cname,reason):_) -> die' verbosity $ formatReason (showComponentName cname) reason
+      ((cname,reason):_) -> die' $ formatReason (showComponentName cname) reason
 
     for_ [ (c, t) | (c, Just t) <- enabled ] $ \(c, t) ->
-      warn verbosity $ "Ignoring '" ++ either display id t ++ ". The whole "
+      warn $ "Ignoring '" ++ either display id t ++ ". The whole "
                     ++ showComponentName c ++ " will be processed. (Support for "
                     ++ "module and file targets has not been implemented yet.)"
 

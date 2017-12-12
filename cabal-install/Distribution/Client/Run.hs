@@ -34,7 +34,7 @@ import Distribution.Simple.Utils             (die', notice, warn,
                                               rawSystemExitWithEnv,
                                               addLibraryPath)
 import Distribution.System                   (Platform (..))
-import Distribution.Verbosity                (Verbosity)
+import Distribution.Monad                    (CabalM, liftIO)
 import Distribution.Text                     (display)
 
 import qualified Distribution.Simple.GHCJS as GHCJS
@@ -46,19 +46,19 @@ import System.FilePath                       ((<.>), (</>))
 
 -- | Return the executable to run and any extra arguments that should be
 -- forwarded to it. Die in case of error.
-splitRunArgs :: Verbosity -> LocalBuildInfo -> [String]
-             -> IO (Executable, [String])
-splitRunArgs verbosity lbi args =
+splitRunArgs :: LocalBuildInfo -> [String]
+             -> CabalM (Executable, [String])
+splitRunArgs lbi args =
   case whichExecutable of -- Either err (wasManuallyChosen, exe, paramsRest)
     Left err               -> do
-      warn verbosity `traverse_` maybeWarning -- If there is a warning, print it.
-      die' verbosity err
+      warn `traverse_` maybeWarning -- If there is a warning, print it.
+      die' err
     Right (True, exe, xs)  -> return (exe, xs)
     Right (False, exe, xs) -> do
       let addition = " Interpreting all parameters to `run` as a parameter to"
                      ++ " the default executable."
       -- If there is a warning, print it together with the addition.
-      warn verbosity `traverse_` fmap (++addition) maybeWarning
+      warn `traverse_` fmap (++addition) maybeWarning
       return (exe, xs)
   where
     pkg_descr = localPkgDescr lbi
@@ -106,9 +106,9 @@ splitRunArgs verbosity lbi args =
              , let name = benchmarkName b]
 
 -- | Run a given executable.
-run :: Verbosity -> LocalBuildInfo -> Executable -> [String] -> IO ()
-run verbosity lbi exe exeArgs = do
-  curDir <- getCurrentDirectory
+run :: LocalBuildInfo -> Executable -> [String] -> CabalM ()
+run lbi exe exeArgs = do
+  curDir <- liftIO getCurrentDirectory
   let buildPref     = buildDir lbi
       pkg_descr     = localPkgDescr lbi
       dataDirEnvVar = (pkgPathEnvVar pkg_descr "datadir",
@@ -121,23 +121,23 @@ run verbosity lbi exe exeArgs = do
         let (script, cmd, cmdArgs) =
               GHCJS.runCmd (withPrograms lbi)
                            (buildPref </> exeName' </> exeName')
-        script' <- tryCanonicalizePath script
+        script' <- liftIO $ tryCanonicalizePath script
         return (cmd, cmdArgs ++ [script'])
       _     -> do
-         p <- tryCanonicalizePath $
+         p <- liftIO . tryCanonicalizePath $
             buildPref </> exeName' </> (exeName' <.> exeExtension)
          return (p, [])
 
-  env  <- (dataDirEnvVar:) <$> getEnvironment
+  env  <- liftIO $ (dataDirEnvVar:) <$> getEnvironment
   -- Add (DY)LD_LIBRARY_PATH if needed
   env' <- if withDynExe lbi
              then do let (Platform _ os) = hostPlatform lbi
                      clbi <- case componentNameTargets' pkg_descr lbi (CExeName (exeName exe)) of
                                 [target] -> return (targetCLBI target)
-                                [] -> die' verbosity "run: Could not find executable in LocalBuildInfo"
-                                _ -> die' verbosity "run: Found multiple matching exes in LocalBuildInfo"
-                     paths <- depLibraryPaths True False lbi clbi
+                                [] -> die' "run: Could not find executable in LocalBuildInfo"
+                                _ -> die' "run: Found multiple matching exes in LocalBuildInfo"
+                     paths <- liftIO $ depLibraryPaths True False lbi clbi
                      return (addLibraryPath os paths env)
              else return env
-  notice verbosity $ "Running " ++ display (exeName exe) ++ "..."
-  rawSystemExitWithEnv verbosity path (runArgs++exeArgs) env'
+  notice $ "Running " ++ display (exeName exe) ++ "..."
+  rawSystemExitWithEnv path (runArgs++exeArgs) env'

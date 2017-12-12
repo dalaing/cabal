@@ -39,7 +39,7 @@ import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
 import Distribution.Version
          ( Version, mkVersion, versionNumbers, VersionRange, withinRange, anyVersion
          , intersectVersionRanges, simplifyVersionRange )
-import Distribution.Verbosity (Verbosity)
+import Distribution.Monad     ( CabalM, liftIO )
 import Distribution.Text
          ( Text(disp), display )
 
@@ -79,17 +79,16 @@ import System.Directory
 
 
 -- | Return a list of packages matching given search strings.
-getPkgList :: Verbosity
-           -> PackageDBStack
+getPkgList :: PackageDBStack
            -> RepoContext
            -> Compiler
            -> ProgramDb
            -> ListFlags
            -> [String]
-           -> IO [PackageDisplayInfo]
-getPkgList verbosity packageDBs repoCtxt comp progdb listFlags pats = do
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-    sourcePkgDb       <- getSourcePackages verbosity repoCtxt
+           -> CabalM [PackageDisplayInfo]
+getPkgList packageDBs repoCtxt comp progdb listFlags pats = do
+    installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+    sourcePkgDb       <- getSourcePackages repoCtxt
     let sourcePkgIndex = packageIndex sourcePkgDb
         prefs name = fromMaybe anyVersion
                        (Map.lookup name (packagePreferences sourcePkgDb))
@@ -135,19 +134,18 @@ getPkgList verbosity packageDBs repoCtxt comp progdb listFlags pats = do
 
 
 -- | Show information about packages.
-list :: Verbosity
-     -> PackageDBStack
+list :: PackageDBStack
      -> RepoContext
      -> Compiler
      -> ProgramDb
      -> ListFlags
      -> [String]
-     -> IO ()
-list verbosity packageDBs repos comp progdb listFlags pats = do
-    matches <- getPkgList verbosity packageDBs repos comp progdb listFlags pats
+     -> CabalM ()
+list packageDBs repos comp progdb listFlags pats = do
+    matches <- getPkgList packageDBs repos comp progdb listFlags pats
 
     if simpleOutput
-      then putStr $ unlines
+      then liftIO . putStr $ unlines
              [ display (pkgName pkg) ++ " " ++ display version
              | pkg <- matches
              , version <- if onlyInstalled
@@ -159,29 +157,28 @@ list verbosity packageDBs repos comp progdb listFlags pats = do
              -- and source ones works.
       else
         if null matches
-            then notice verbosity "No matches found."
-            else putStr $ unlines (map showPackageSummaryInfo matches)
+            then notice "No matches found."
+            else liftIO $ putStr $ unlines (map showPackageSummaryInfo matches)
   where
     onlyInstalled = fromFlag (listInstalled listFlags)
     simpleOutput  = fromFlag (listSimpleOutput listFlags)
 
-info :: Verbosity
-     -> PackageDBStack
+info :: PackageDBStack
      -> RepoContext
      -> Compiler
      -> ProgramDb
      -> GlobalFlags
      -> InfoFlags
      -> [UserTarget]
-     -> IO ()
-info verbosity _ _ _ _ _ _ [] =
-    notice verbosity "No packages requested. Nothing to do."
+     -> CabalM ()
+info _ _ _ _ _ _ [] =
+    notice "No packages requested. Nothing to do."
 
-info verbosity packageDBs repoCtxt comp progdb
+info packageDBs repoCtxt comp progdb
      globalFlags _listFlags userTargets = do
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-    sourcePkgDb       <- getSourcePackages verbosity repoCtxt
+    installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+    sourcePkgDb       <- getSourcePackages repoCtxt
     let sourcePkgIndex = packageIndex sourcePkgDb
         prefs name = fromMaybe anyVersion
                        (Map.lookup name (packagePreferences sourcePkgDb))
@@ -194,19 +191,19 @@ info verbosity packageDBs repoCtxt comp progdb
                       (InstalledPackageIndex.allPackages installedPkgIndex)
                    ++ map packageId
                       (PackageIndex.allPackages sourcePkgIndex)
-    pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
+    pkgSpecifiers <- resolveUserTargets repoCtxt
                        (fromFlag $ globalWorldFile globalFlags)
                        sourcePkgs' userTargets
 
     pkgsinfo      <- sequence
-                       [ do pkginfo <- either (die' verbosity) return $
+                       [ do pkginfo <- either (die') return $
                                          gatherPkgInfo prefs
                                            installedPkgIndex sourcePkgIndex
                                            pkgSpecifier
-                            updateFileSystemPackageDetails pkginfo
+                            liftIO $ updateFileSystemPackageDetails pkginfo
                        | pkgSpecifier <- pkgSpecifiers ]
 
-    putStr $ unlines (map showPackageDetailedInfo pkgsinfo)
+    liftIO . putStr $ unlines (map showPackageDetailedInfo pkgsinfo)
 
   where
     gatherPkgInfo :: (PackageName -> VersionRange) ->

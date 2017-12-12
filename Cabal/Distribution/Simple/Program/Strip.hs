@@ -19,25 +19,25 @@ import Distribution.Compat.Prelude
 import Distribution.Simple.Program
 import Distribution.Simple.Utils
 import Distribution.System
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Version
 
 import System.FilePath             (takeBaseName)
 
-runStrip :: Verbosity -> ProgramDb -> FilePath -> [String] -> IO ()
-runStrip verbosity progDb path args =
+runStrip :: ProgramDb -> FilePath -> [String] -> CabalM ()
+runStrip progDb path args =
   case lookupProgram stripProgram progDb of
-    Just strip -> runProgram verbosity strip (args ++ [path])
+    Just strip -> runProgram strip (args ++ [path])
     Nothing    -> unless (buildOS == Windows) $
                   -- Don't bother warning on windows, we don't expect them to
                   -- have the strip program anyway.
-                  warn verbosity $ "Unable to strip executable or library '"
+                  warn $ "Unable to strip executable or library '"
                                    ++ (takeBaseName path)
                                    ++ "' (missing the 'strip' program)"
 
-stripExe :: Verbosity -> Platform -> ProgramDb -> FilePath -> IO ()
-stripExe verbosity (Platform _arch os) progdb path =
-  runStrip verbosity progdb path args
+stripExe :: Platform -> ProgramDb -> FilePath -> CabalM ()
+stripExe (Platform _arch os) progdb path =
+  runStrip progdb path args
   where
     args = case os of
        OSX -> ["-x"] -- By default, stripping the ghc binary on at least
@@ -46,8 +46,8 @@ stripExe verbosity (Platform _arch os) progdb path =
                      -- The -x flag fixes that.
        _   -> []
 
-stripLib :: Verbosity -> Platform -> ProgramDb -> FilePath -> IO ()
-stripLib verbosity (Platform arch os) progdb path = do
+stripLib :: Platform -> ProgramDb -> FilePath -> CabalM ()
+stripLib (Platform arch os) progdb path = do
   case os of
     OSX -> -- '--strip-unneeded' is not supported on OS X, iOS, AIX, or
            -- Solaris. See #1630.
@@ -65,11 +65,11 @@ stripLib verbosity (Platform arch os) progdb path = do
       let okVersion = orLaterVersion (mkVersion [2,18])
       in case programVersion =<< lookupProgram stripProgram progdb of
           Just v | withinRange v okVersion ->
-            runStrip verbosity progdb path args
-          _ -> warn verbosity $ "Unable to strip library '"
+            runStrip progdb path args
+          _ -> warn $ "Unable to strip library '"
                                 ++ (takeBaseName path)
                                 ++ "' (version of 'strip' too old; "
                                 ++ "requires >= 2.18 on 32-bit Linux)"
-    _   -> runStrip verbosity progdb path args
+    _   -> runStrip progdb path args
   where
     args = ["--strip-unneeded"]

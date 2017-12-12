@@ -50,8 +50,8 @@ import Text.PrettyPrint hiding (mode, cat)
 import Distribution.Version
   ( Version, mkVersion, alterVersion
   , orLaterVersion, earlierVersion, intersectVersionRanges, VersionRange )
-import Distribution.Verbosity
-  ( Verbosity )
+import Distribution.Monad
+  ( CabalM, liftIO )
 import Distribution.ModuleName
   ( ModuleName )  -- And for the Text instance
 import Distribution.InstalledPackageInfo
@@ -99,32 +99,32 @@ import Distribution.Client.Types
 import Distribution.Client.Setup
   ( RepoContext(..) )
 
-initCabal :: Verbosity
-          -> PackageDBStack
+initCabal :: PackageDBStack
           -> RepoContext
           -> Compiler
           -> ProgramDb
           -> InitFlags
-          -> IO ()
-initCabal verbosity packageDBs repoCtxt comp progdb initFlags = do
+          -> CabalM ()
+initCabal packageDBs repoCtxt comp progdb initFlags = do
 
-  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-  sourcePkgDb <- getSourcePackages verbosity repoCtxt
+  installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+  sourcePkgDb <- getSourcePackages repoCtxt
 
-  hSetBuffering stdout NoBuffering
+  liftIO $ do
+    hSetBuffering stdout NoBuffering
 
-  initFlags' <- extendFlags installedPkgIndex sourcePkgDb initFlags
+    initFlags' <- extendFlags installedPkgIndex sourcePkgDb initFlags
 
-  case license initFlags' of
-    Flag PublicDomain -> return ()
-    _                 -> writeLicense initFlags'
-  writeSetupFile initFlags'
-  writeChangeLog initFlags'
-  createSourceDirectories initFlags'
-  createMainHs initFlags'
-  success <- writeCabalFile initFlags'
+    case license initFlags' of
+      Flag PublicDomain -> return ()
+      _                 -> writeLicense initFlags'
+    writeSetupFile initFlags'
+    writeChangeLog initFlags'
+    createSourceDirectories initFlags'
+    createMainHs initFlags'
+    success <- writeCabalFile initFlags'
 
-  when success $ generateWarnings initFlags'
+    when success $ generateWarnings initFlags'
 
 ---------------------------------------------------------------------------
 --  Flag acquisition  -----------------------------------------------------

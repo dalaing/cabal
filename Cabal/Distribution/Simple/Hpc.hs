@@ -41,7 +41,7 @@ import Distribution.Simple.Program
 import Distribution.Simple.Program.Hpc ( markup, union )
 import Distribution.Simple.Utils ( notice )
 import Distribution.Version ( anyVersion )
-import Distribution.Verbosity ( Verbosity() )
+import Distribution.Monad
 import System.Directory ( createDirectoryIfMissing, doesFileExist )
 import System.FilePath
 
@@ -95,53 +95,51 @@ guessWay lbi
   | otherwise = Vanilla
 
 -- | Generate the HTML markup for a test suite.
-markupTest :: Verbosity
-           -> LocalBuildInfo
+markupTest :: LocalBuildInfo
            -> FilePath     -- ^ \"dist/\" prefix
            -> String       -- ^ Library name
            -> TestSuite
-           -> IO ()
-markupTest verbosity lbi distPref libName suite = do
-    tixFileExists <- doesFileExist $ tixFilePath distPref way $ testName'
+           -> CabalM ()
+markupTest lbi distPref libName suite = do
+    tixFileExists <- liftIO . doesFileExist $ tixFilePath distPref way $ testName'
     when tixFileExists $ do
         -- behaviour of 'markup' depends on version, so we need *a* version
         -- but no particular one
-        (hpc, hpcVer, _) <- requireProgramVersion verbosity
+        (hpc, hpcVer, _) <- requireProgramVersion 
             hpcProgram anyVersion (withPrograms lbi)
         let htmlDir_ = htmlDir distPref way testName'
-        markup hpc hpcVer verbosity
+        markup hpc hpcVer
             (tixFilePath distPref way testName') mixDirs
             htmlDir_
             (testModules suite ++ [ main ])
-        notice verbosity $ "Test coverage report written to "
-                            ++ htmlDir_ </> "hpc_index" <.> "html"
+        notice $ "Test coverage report written to "
+                 ++ htmlDir_ </> "hpc_index" <.> "html"
   where
     way = guessWay lbi
     testName' = unUnqualComponentName $ testName suite
     mixDirs = map (mixDir distPref way) [ testName', libName ]
 
 -- | Generate the HTML markup for all of a package's test suites.
-markupPackage :: Verbosity
-              -> LocalBuildInfo
+markupPackage :: LocalBuildInfo
               -> FilePath       -- ^ \"dist/\" prefix
               -> String         -- ^ Library name
               -> [TestSuite]
-              -> IO ()
-markupPackage verbosity lbi distPref libName suites = do
+              -> CabalM ()
+markupPackage lbi distPref libName suites = do
     let tixFiles = map (tixFilePath distPref way) testNames
-    tixFilesExist <- traverse doesFileExist tixFiles
+    tixFilesExist <- liftIO $ traverse doesFileExist tixFiles
     when (and tixFilesExist) $ do
         -- behaviour of 'markup' depends on version, so we need *a* version
         -- but no particular one
-        (hpc, hpcVer, _) <- requireProgramVersion verbosity
+        (hpc, hpcVer, _) <- requireProgramVersion
             hpcProgram anyVersion (withPrograms lbi)
         let outFile = tixFilePath distPref way libName
             htmlDir' = htmlDir distPref way libName
             excluded = concatMap testModules suites ++ [ main ]
-        createDirectoryIfMissing True $ takeDirectory outFile
-        union hpc verbosity tixFiles outFile excluded
-        markup hpc hpcVer verbosity outFile mixDirs htmlDir' excluded
-        notice verbosity $ "Package coverage report written to "
+        liftIO $ createDirectoryIfMissing True $ takeDirectory outFile
+        union hpc tixFiles outFile excluded
+        markup hpc hpcVer outFile mixDirs htmlDir' excluded
+        notice $ "Package coverage report written to "
                            ++ htmlDir' </> "hpc_index.html"
   where
     way = guessWay lbi

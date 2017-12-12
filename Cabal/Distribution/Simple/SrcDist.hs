@@ -60,7 +60,7 @@ import Distribution.Simple.BuildPaths
 import Distribution.Simple.Program
 import Distribution.Text
 import Distribution.Types.ForeignLib
-import Distribution.Verbosity
+import Distribution.Monad
 
 import Data.List (partition)
 import qualified Data.Map as Map
@@ -77,47 +77,47 @@ sdist :: PackageDescription     -- ^information from the tarball
       -> (FilePath -> FilePath) -- ^build prefix (temp dir)
       -> [PPSuffixHandler]      -- ^ extra preprocessors (includes suffixes)
       -> IO ()
-sdist pkg mb_lbi flags mkTmpDir pps =
+sdist pkg mb_lbi flags mkTmpDir pps = flip runCabalM verbosity $
 
   -- When given --list-sources, just output the list of sources to a file.
   case (sDistListSources flags) of
-    Flag path -> withFile path WriteMode $ \outHandle -> do
-      (ordinary, maybeExecutable) <- listPackageSources verbosity pkg pps
+    Flag path -> runCabalMInIO $ \liftC -> withFile path WriteMode $ \outHandle -> do
+      (ordinary, maybeExecutable) <- liftC $ listPackageSources pkg pps
       traverse_ (hPutStrLn outHandle) ordinary
       traverse_ (hPutStrLn outHandle) maybeExecutable
-      notice verbosity $ "List of package sources written to file '"
+      liftC . notice $ "List of package sources written to file '"
                          ++ path ++ "'"
     NoFlag    -> do
       -- do some QA
-      printPackageProblems verbosity pkg
+      printPackageProblems pkg
 
       when (isNothing mb_lbi) $
-        warn verbosity "Cannot run preprocessors. Run 'configure' command first."
+        warn "Cannot run preprocessors. Run 'configure' command first."
 
-      date <- getCurrentTime
+      date <- liftIO getCurrentTime
       let pkg' | snapshot  = snapshotPackage date pkg
                | otherwise = pkg
 
       case flagToMaybe (sDistDirectory flags) of
         Just targetDir -> do
           generateSourceDir targetDir pkg'
-          info verbosity $ "Source directory created: " ++ targetDir
+          info $ "Source directory created: " ++ targetDir
 
         Nothing -> do
-          createDirectoryIfMissingVerbose verbosity True tmpTargetDir
-          withTempDirectory verbosity tmpTargetDir "sdist." $ \tmpDir -> do
+          createDirectoryIfMissingVerbose True tmpTargetDir
+          withTempDirectory tmpTargetDir "sdist." $ \tmpDir -> do
             let targetDir = tmpDir </> tarBallName pkg'
             generateSourceDir targetDir pkg'
-            targzFile <- createArchive verbosity pkg' mb_lbi tmpDir targetPref
-            notice verbosity $ "Source tarball created: " ++ targzFile
+            targzFile <- createArchive pkg' mb_lbi tmpDir targetPref
+            notice $ "Source tarball created: " ++ targzFile
 
   where
     generateSourceDir targetDir pkg' = do
 
-      setupMessage verbosity "Building source dist for" (packageId pkg')
-      prepareTree verbosity pkg' mb_lbi targetDir pps
+      setupMessage "Building source dist for" (packageId pkg')
+      prepareTree pkg' mb_lbi targetDir pps
       when snapshot $
-        overwriteSnapshotPackageDesc verbosity pkg' targetDir
+        overwriteSnapshotPackageDesc pkg' targetDir
 
     verbosity = fromFlag (sDistVerbosity flags)
     snapshot  = fromFlag (sDistSnapshot flags)
@@ -129,31 +129,29 @@ sdist pkg mb_lbi flags mkTmpDir pps =
 -- | List all source files of a package. Returns a tuple of lists: first
 -- component is a list of ordinary files, second one is a list of those files
 -- that may be executable.
-listPackageSources :: Verbosity          -- ^ verbosity
-                   -> PackageDescription -- ^ info from the cabal file
+listPackageSources :: PackageDescription -- ^ info from the cabal file
                    -> [PPSuffixHandler]  -- ^ extra preprocessors (include
                                          -- suffixes)
-                   -> IO ([FilePath], [FilePath])
-listPackageSources verbosity pkg_descr0 pps = do
+                   -> CabalM ([FilePath], [FilePath])
+listPackageSources pkg_descr0 pps = do
   -- Call helpers that actually do all work.
-  ordinary        <- listPackageSourcesOrdinary        verbosity pkg_descr pps
+  ordinary        <- listPackageSourcesOrdinary        pkg_descr pps
   maybeExecutable <- listPackageSourcesMaybeExecutable pkg_descr
   return (ordinary, maybeExecutable)
   where
     pkg_descr = filterAutogenModules pkg_descr0
 
 -- | List those source files that may be executable (e.g. the configure script).
-listPackageSourcesMaybeExecutable :: PackageDescription -> IO [FilePath]
+listPackageSourcesMaybeExecutable :: PackageDescription -> CabalM [FilePath]
 listPackageSourcesMaybeExecutable pkg_descr =
   -- Extra source files.
-  fmap concat . for (extraSrcFiles pkg_descr) $ \fpath -> matchFileGlob fpath
+  liftIO . fmap concat . for (extraSrcFiles pkg_descr) $ \fpath -> matchFileGlob fpath
 
 -- | List those source files that should be copied with ordinary permissions.
-listPackageSourcesOrdinary :: Verbosity
-                           -> PackageDescription
+listPackageSourcesOrdinary :: PackageDescription
                            -> [PPSuffixHandler]
-                           -> IO [FilePath]
-listPackageSourcesOrdinary verbosity pkg_descr pps =
+                           -> CabalM [FilePath]
+listPackageSourcesOrdinary pkg_descr pps =
   fmap concat . sequenceA $
   [
     -- Library sources.
@@ -163,20 +161,20 @@ listPackageSourcesOrdinary verbosity pkg_descr pps =
                       signatures     = sigs,
                       libBuildInfo   = libBi
                     } ->
-     allSourcesBuildInfo verbosity libBi pps (modules ++ sigs)
+     allSourcesBuildInfo libBi pps (modules ++ sigs)
 
     -- Executables sources.
   , fmap concat
     . withAllExe $ \Executable { modulePath = mainPath, buildInfo = exeBi } -> do
-       biSrcs  <- allSourcesBuildInfo verbosity exeBi pps []
-       mainSrc <- findMainExeFile exeBi pps mainPath
+       biSrcs  <- allSourcesBuildInfo exeBi pps []
+       mainSrc <- liftIO $ findMainExeFile exeBi pps mainPath
        return (mainSrc:biSrcs)
 
     -- Foreign library sources
   , fmap concat
     . withAllFLib $ \flib@(ForeignLib { foreignLibBuildInfo = flibBi }) -> do
-       biSrcs   <- allSourcesBuildInfo verbosity flibBi pps []
-       defFiles <- mapM (findModDefFile flibBi pps) (foreignLibModDefFile flib)
+       biSrcs   <- allSourcesBuildInfo flibBi pps []
+       defFiles <- liftIO $ mapM (findModDefFile flibBi pps) (foreignLibModDefFile flib)
        return (defFiles ++ biSrcs)
 
     -- Test suites sources.
@@ -185,12 +183,12 @@ listPackageSourcesOrdinary verbosity pkg_descr pps =
        let bi  = testBuildInfo t
        case testInterface t of
          TestSuiteExeV10 _ mainPath -> do
-           biSrcs <- allSourcesBuildInfo verbosity bi pps []
-           srcMainFile <- findMainExeFile bi pps mainPath
+           biSrcs <- allSourcesBuildInfo bi pps []
+           srcMainFile <- liftIO $ findMainExeFile bi pps mainPath
            return (srcMainFile:biSrcs)
          TestSuiteLibV09 _ m ->
-           allSourcesBuildInfo verbosity bi pps [m]
-         TestSuiteUnsupported tp -> die' verbosity $ "Unsupported test suite type: "
+           allSourcesBuildInfo bi pps [m]
+         TestSuiteUnsupported tp -> die' $ "Unsupported test suite type: "
                                    ++ show tp
 
     -- Benchmarks sources.
@@ -199,19 +197,19 @@ listPackageSourcesOrdinary verbosity pkg_descr pps =
        let  bi = benchmarkBuildInfo bm
        case benchmarkInterface bm of
          BenchmarkExeV10 _ mainPath -> do
-           biSrcs <- allSourcesBuildInfo verbosity bi pps []
-           srcMainFile <- findMainExeFile bi pps mainPath
+           biSrcs <- allSourcesBuildInfo bi pps []
+           srcMainFile <- liftIO $ findMainExeFile bi pps mainPath
            return (srcMainFile:biSrcs)
-         BenchmarkUnsupported tp -> die' verbosity $ "Unsupported benchmark type: "
+         BenchmarkUnsupported tp -> die' $ "Unsupported benchmark type: "
                                     ++ show tp
 
     -- Data files.
-  , fmap concat
+  , liftIO . fmap concat
     . for (dataFiles pkg_descr) $ \filename ->
        matchFileGlob (dataDir pkg_descr </> filename)
 
     -- Extra doc files.
-  , fmap concat
+  , liftIO . fmap concat
     . for (extraDocFiles pkg_descr) $ \ filename ->
       matchFileGlob filename
 
@@ -223,13 +221,13 @@ listPackageSourcesOrdinary verbosity pkg_descr pps =
     . withAllLib $ \ l -> do
        let lbi = libBuildInfo l
            relincdirs = "." : filter isRelative (includeDirs lbi)
-       traverse (fmap snd . findIncludeFile verbosity relincdirs) (installIncludes lbi)
+       traverse (fmap snd . findIncludeFile relincdirs) (installIncludes lbi)
 
     -- Setup script, if it exists.
-  , fmap (maybe [] (\f -> [f])) $ findSetupFile ""
+  , liftIO . fmap (maybe [] (\f -> [f])) $ findSetupFile ""
 
     -- The .cabal file itself.
-  , fmap (\d -> [d]) (defaultPackageDesc verbosity)
+  , fmap (\d -> [d]) defaultPackageDesc
 
   ]
   where
@@ -243,26 +241,25 @@ listPackageSourcesOrdinary verbosity pkg_descr pps =
 
 
 -- |Prepare a directory tree of source files.
-prepareTree :: Verbosity          -- ^verbosity
-            -> PackageDescription -- ^info from the cabal file
+prepareTree :: PackageDescription -- ^info from the cabal file
             -> Maybe LocalBuildInfo
             -> FilePath           -- ^source tree to populate
             -> [PPSuffixHandler]  -- ^extra preprocessors (includes suffixes)
-            -> IO ()
-prepareTree verbosity pkg_descr0 mb_lbi targetDir pps = do
+            -> CabalM ()
+prepareTree pkg_descr0 mb_lbi targetDir pps = do
   -- If the package was configured then we can run platform-independent
   -- pre-processors and include those generated files.
   case mb_lbi of
     Just lbi | not (null pps) -> do
       let lbi' = lbi{ buildDir = targetDir </> buildDir lbi }
       withAllComponentsInBuildOrder pkg_descr lbi' $ \c clbi ->
-        preprocessComponent pkg_descr c lbi' clbi True verbosity pps
+        preprocessComponent pkg_descr c lbi' clbi True pps
     _ -> return ()
 
-  (ordinary, mExecutable)  <- listPackageSources verbosity pkg_descr0 pps
-  installOrdinaryFiles        verbosity targetDir (zip (repeat []) ordinary)
-  installMaybeExecutableFiles verbosity targetDir (zip (repeat []) mExecutable)
-  maybeCreateDefaultSetupScript targetDir
+  (ordinary, mExecutable)  <- listPackageSources pkg_descr0 pps
+  installOrdinaryFiles        targetDir (zip (repeat []) ordinary)
+  installMaybeExecutableFiles targetDir (zip (repeat []) mExecutable)
+  liftIO $ maybeCreateDefaultSetupScript targetDir
 
   where
     pkg_descr = filterAutogenModules pkg_descr0
@@ -311,12 +308,12 @@ findModDefFile flibBi _pps modDefPath =
 -- | Given a list of include paths, try to find the include file named
 -- @f@. Return the name of the file and the full path, or exit with error if
 -- there's no such file.
-findIncludeFile :: Verbosity -> [FilePath] -> String -> IO (String, FilePath)
-findIncludeFile verbosity [] f = die' verbosity ("can't find include file " ++ f)
-findIncludeFile verbosity (d:ds) f = do
+findIncludeFile :: [FilePath] -> String -> CabalM (String, FilePath)
+findIncludeFile [] f = die' ("can't find include file " ++ f)
+findIncludeFile (d:ds) f = do
   let path = (d </> f)
-  b <- doesFileExist path
-  if b then return (f,path) else findIncludeFile verbosity ds f
+  b <- liftIO $ doesFileExist path
+  if b then return (f,path) else findIncludeFile ds f
 
 -- | Remove the auto-generated modules (like 'Paths_*') from 'exposed-modules' 
 -- and 'other-modules'.
@@ -341,26 +338,24 @@ filterAutogenModules pkg_descr0 = mapLib filterAutogenModuleLib $
 -- It is expected that the appropriate snapshot version has already been set
 -- in the package description, eg using 'snapshotPackage' or 'snapshotVersion'.
 --
-prepareSnapshotTree :: Verbosity          -- ^verbosity
-                    -> PackageDescription -- ^info from the cabal file
+prepareSnapshotTree :: PackageDescription -- ^info from the cabal file
                     -> Maybe LocalBuildInfo
                     -> FilePath           -- ^source tree to populate
                     -> [PPSuffixHandler]  -- ^extra preprocessors (includes
                                           -- suffixes)
-                    -> IO ()
-prepareSnapshotTree verbosity pkg mb_lbi targetDir pps = do
-  prepareTree verbosity pkg mb_lbi targetDir pps
-  overwriteSnapshotPackageDesc verbosity pkg targetDir
+                    -> CabalM ()
+prepareSnapshotTree pkg mb_lbi targetDir pps = do
+  prepareTree pkg mb_lbi targetDir pps
+  overwriteSnapshotPackageDesc pkg targetDir
 
-overwriteSnapshotPackageDesc :: Verbosity          -- ^verbosity
-                             -> PackageDescription -- ^info from the cabal file
+overwriteSnapshotPackageDesc :: PackageDescription -- ^info from the cabal file
                              -> FilePath           -- ^source tree
-                             -> IO ()
-overwriteSnapshotPackageDesc verbosity pkg targetDir = do
+                             -> CabalM ()
+overwriteSnapshotPackageDesc pkg targetDir = do
     -- We could just writePackageDescription targetDescFile pkg_descr,
     -- but that would lose comments and formatting.
-    descFile <- defaultPackageDesc verbosity
-    withUTF8FileContents descFile $
+    descFile <- defaultPackageDesc
+    liftIO $ withUTF8FileContents descFile $
       writeUTF8File (targetDir </> descFile)
         . unlines . map (replaceVersion (packageVersion pkg)) . lines
 
@@ -398,24 +393,23 @@ dateToSnapshotNumber date = case toGregorian (utctDay date) of
                               + day
 
 -- | Callback type for use by sdistWith.
-type CreateArchiveFun = Verbosity               -- ^verbosity
-                        -> PackageDescription   -- ^info from cabal file
+type CreateArchiveFun =    PackageDescription   -- ^info from cabal file
                         -> Maybe LocalBuildInfo -- ^info from configure
                         -> FilePath             -- ^source tree to archive
                         -> FilePath             -- ^name of archive to create
-                        -> IO FilePath
+                        -> CabalM FilePath
 
 -- | Create an archive from a tree of source files, and clean up the tree.
 createArchive :: CreateArchiveFun
-createArchive verbosity pkg_descr mb_lbi tmpDir targetPref = do
+createArchive pkg_descr mb_lbi tmpDir targetPref = do
   let tarBallFilePath = targetPref </> tarBallName pkg_descr <.> "tar.gz"
 
-  (tarProg, _) <- requireProgram verbosity tarProgram
+  (tarProg, _) <- requireProgram tarProgram
                     (maybe defaultProgramDb withPrograms mb_lbi)
   let formatOptSupported = maybe False (== "YES") $
                            Map.lookup "Supports --format"
                            (programProperties tarProg)
-  runProgram verbosity tarProg $
+  runProgram tarProg $
     -- Hmm: I could well be skating on thinner ice here by using the -C option
     -- (=> seems to be supported at least by GNU and *BSD tar) [The
     -- prev. solution used pipes and sub-command sequences to set up the paths
@@ -426,25 +420,24 @@ createArchive verbosity pkg_descr mb_lbi tmpDir targetPref = do
   return tarBallFilePath
 
 -- | Given a buildinfo, return the names of all source files.
-allSourcesBuildInfo :: Verbosity
-                       -> BuildInfo
+allSourcesBuildInfo ::    BuildInfo
                        -> [PPSuffixHandler] -- ^ Extra preprocessors
                        -> [ModuleName]      -- ^ Exposed modules
-                       -> IO [FilePath]
-allSourcesBuildInfo verbosity bi pps modules = do
+                       -> CabalM [FilePath]
+allSourcesBuildInfo bi pps modules = do
   let searchDirs = hsSourceDirs bi
   sources <- fmap concat $ sequenceA $
     [ let file = ModuleName.toFilePath module_
       -- NB: *Not* findFileWithExtension, because the same source
       -- file may show up in multiple paths due to a conditional;
       -- we need to package all of them.  See #367.
-      in findAllFilesWithExtension suffixes searchDirs file
+      in liftIO (findAllFilesWithExtension suffixes searchDirs file)
          >>= nonEmpty (notFound module_) return
     | module_ <- modules ++ otherModules bi ]
   bootFiles <- sequenceA
     [ let file = ModuleName.toFilePath module_
           fileExts = ["hs-boot", "lhs-boot"]
-      in findFileWithExtension fileExts (hsSourceDirs bi) file
+      in liftIO (findFileWithExtension fileExts (hsSourceDirs bi) file)
     | module_ <- modules ++ otherModules bi ]
 
   return $ sources ++ catMaybes bootFiles ++ cSources bi ++ jsSources bi
@@ -453,27 +446,27 @@ allSourcesBuildInfo verbosity bi pps modules = do
     nonEmpty x _ [] = x
     nonEmpty _ f xs = f xs
     suffixes = ppSuffixes pps ++ ["hs", "lhs", "hsig", "lhsig"]
-    notFound m = die' verbosity $ "Error: Could not find module: " ++ display m
+    notFound m = die' $ "Error: Could not find module: " ++ display m
                  ++ " with any suffix: " ++ show suffixes ++ ". If the module "
                  ++ "is autogenerated it should be added to 'autogen-modules'."
 
 
-printPackageProblems :: Verbosity -> PackageDescription -> IO ()
-printPackageProblems verbosity pkg_descr = do
-  ioChecks      <- checkPackageFiles pkg_descr "."
+printPackageProblems :: PackageDescription -> CabalM ()
+printPackageProblems pkg_descr = do
+  ioChecks      <- liftIO $ checkPackageFiles pkg_descr "."
   let pureChecks = checkConfiguredPackage pkg_descr
       isDistError (PackageDistSuspicious     _) = False
       isDistError (PackageDistSuspiciousWarn _) = False
       isDistError _                             = True
       (errors, warnings) = partition isDistError (pureChecks ++ ioChecks)
   unless (null errors) $
-      notice verbosity $ "Distribution quality errors:\n"
-                      ++ unlines (map explanation errors)
+      notice $ "Distribution quality errors:\n"
+               ++ unlines (map explanation errors)
   unless (null warnings) $
-      notice verbosity $ "Distribution quality warnings:\n"
-                      ++ unlines (map explanation warnings)
+      notice $ "Distribution quality warnings:\n"
+               ++ unlines (map explanation warnings)
   unless (null errors) $
-      notice verbosity
+      notice
         "Note: the public hackage server would reject this package."
 
 ------------------------------------------------------------

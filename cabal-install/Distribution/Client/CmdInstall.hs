@@ -57,7 +57,9 @@ import Distribution.Types.UnitId
 import Distribution.Types.UnqualComponentName
          ( UnqualComponentName, unUnqualComponentName )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, liftIO, askVerbosity )
 import Distribution.Simple.Utils
          ( wrapText, die', withTempDirectory, createDirectoryIfMissingVerbose )
 
@@ -119,21 +121,20 @@ installCommand = CommandUI
 installAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
             -> [String] -> GlobalFlags -> IO ()
 installAction (configFlags, configExFlags, installFlags, haddockFlags)
-            targetStrings globalFlags = do
+            targetStrings globalFlags = flip runCabalM verbosity $ do
   -- We never try to build tests/benchmarks for remote packages.
   -- So we set them as disabled by default and error if they are explicitly
   -- enabled.
   when (configTests configFlags' == Flag True) $
-    die' verbosity $ "--enable-tests was specified, but tests can't "
+    die' $ "--enable-tests was specified, but tests can't "
                   ++ "be enabled in a remote package"
   when (configBenchmarks configFlags' == Flag True) $
-    die' verbosity $ "--enable-benchmarks was specified, but benchmarks can't "
+    die' $ "--enable-benchmarks was specified, but benchmarks can't "
                   ++ "be enabled in a remote package"
 
   -- We need a place to put a temporary dist directory
-  globalTmp <- getTemporaryDirectory
+  globalTmp <- liftIO getTemporaryDirectory
   withTempDirectory
-    verbosity
     globalTmp
     "cabal-install."
     $ \tmpDir -> do
@@ -143,7 +144,6 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags)
           (\pname -> NamedPackage pname []) <$> packageNames
 
     baseCtx <- establishDummyProjectBaseContext
-                 verbosity
                  cliConfig
                  tmpDir
                  packageSpecifiers
@@ -152,10 +152,10 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags)
                           | pn <- packageNames ]
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan -> do
 
             -- Interpret the targets on the command line as build targets
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either reportTargetProblems return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
@@ -169,16 +169,16 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags)
                                     elaboratedPlan
             elaboratedPlan'' <-
               if buildSettingOnlyDeps (buildSettings baseCtx)
-                then either (reportCannotPruneDependencies verbosity) return $
+                then either reportCannotPruneDependencies return $
                      pruneInstallPlanToDependencies (Map.keysSet targets)
                                                     elaboratedPlan'
                 else return elaboratedPlan'
 
             return (elaboratedPlan'', targets)
 
-    printPlan verbosity baseCtx buildCtx
+    printPlan baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
+    buildOutcomes <- runProjectBuildPhase baseCtx buildCtx
 
     let compiler = pkgConfigCompiler $ elaboratedShared buildCtx
     let mkPkgBinDir = (</> "bin") .
@@ -190,11 +190,12 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags)
     let defaultSymlinkBindir = error $
           "TODO: how do I get the default ~/.cabal (or ~/.local) directory?"
           ++ " (use --symlink-bindir explicitly for now)" </> "bin"
-    symlinkBindir <- makeAbsolute $ fromFlagOrDefault defaultSymlinkBindir
-      (Client.installSymlinkBinDir installFlags)
-    traverse_ (symlinkBuiltPackage mkPkgBinDir symlinkBindir)
-          $ Map.toList $ targetsMap buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    liftIO $ do
+      symlinkBindir <- makeAbsolute $ fromFlagOrDefault defaultSymlinkBindir
+        (Client.installSymlinkBinDir installFlags)
+      traverse_ (symlinkBuiltPackage mkPkgBinDir symlinkBindir)
+        $ Map.toList $ targetsMap buildCtx
+    runProjectPostBuildPhase baseCtx buildCtx buildOutcomes
   where
     configFlags' = disableTestsBenchsByDefault configFlags
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags')
@@ -235,28 +236,28 @@ symlinkBuiltExe sourceDir destDir exe =
 -- | Create a dummy project context, without a .cabal or a .cabal.project file
 -- (a place where to put a temporary dist directory is still needed)
 establishDummyProjectBaseContext
-  :: Verbosity
-  -> ProjectConfig
+  :: ProjectConfig
   -> FilePath
      -- ^ Where to put the dist directory
   -> [PackageSpecifier UnresolvedSourcePackage]
      -- ^ The packages to be included in the project
-  -> IO ProjectBaseContext
-establishDummyProjectBaseContext verbosity cliConfig tmpDir localPackages = do
+  -> CabalM ProjectBaseContext
+establishDummyProjectBaseContext cliConfig tmpDir localPackages = do
 
-    cabalDir <- defaultCabalDir
+    cabalDir <- liftIO defaultCabalDir
 
     -- Create the dist directories
-    createDirectoryIfMissingVerbose verbosity True $ distDirectory distDirLayout
-    createDirectoryIfMissingVerbose verbosity True $
+    createDirectoryIfMissingVerbose True $ distDirectory distDirLayout
+    createDirectoryIfMissingVerbose True $
       distProjectCacheDirectory distDirLayout
 
     globalConfig <- runRebuild ""
-                  $ readGlobalConfig verbosity
+                  $ readGlobalConfig
                   $ projectConfigConfigFile
                   $ projectConfigShared cliConfig
     let projectConfig = globalConfig <> cliConfig
 
+    verbosity <- askVerbosity
     let ProjectConfigBuildOnly {
           projectConfigLogsDir,
           projectConfigStoreDir
@@ -346,9 +347,9 @@ data TargetProblem =
    | TargetProblemNoTargets   TargetSelector
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: [TargetProblem] -> CabalM a
+reportTargetProblems =
+    die' . unlines . map renderTargetProblem
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =
@@ -358,6 +359,6 @@ renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
 renderTargetProblem(TargetProblemNoTargets targetSelector) =
     renderTargetProblemNoTargets "build" targetSelector
 
-reportCannotPruneDependencies :: Verbosity -> CannotPruneDependencies -> IO a
-reportCannotPruneDependencies verbosity =
-    die' verbosity . renderCannotPruneDependencies
+reportCannotPruneDependencies :: CannotPruneDependencies -> CabalM a
+reportCannotPruneDependencies =
+    die' . renderCannotPruneDependencies

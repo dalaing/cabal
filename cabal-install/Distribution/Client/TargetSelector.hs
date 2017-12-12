@@ -47,7 +47,7 @@ import Distribution.Types.UnqualComponentName
 import Distribution.Client.Types
          ( PackageLocation(..), PackageSpecifier(..) )
 
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.PackageDescription
          ( PackageDescription
          , Executable(..)
@@ -637,20 +637,20 @@ internalError msg =
 
 -- | Throw an exception with a formatted message if there are any problems.
 --
-reportTargetSelectorProblems :: Verbosity -> [TargetSelectorProblem] -> IO a
-reportTargetSelectorProblems verbosity problems = do
+reportTargetSelectorProblems :: [TargetSelectorProblem] -> CabalM a
+reportTargetSelectorProblems problems = do
 
     case [ str | TargetSelectorUnrecognised str <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [ "Unrecognised target syntax for '" ++ name ++ "'."
           | name <- targets ]
 
     case [ (t, m, ms) | MatchingInternalError t m ms <- problems ] of
       [] -> return ()
       ((target, originalMatch, renderingsAndMatches):_) ->
-        die' verbosity $ "Internal error in target matching. It should always "
+        die' $ "Internal error in target matching. It should always "
            ++ "be possible to find a syntax that's sufficiently qualified to "
            ++ "give an unambiguous match. However when matching '"
            ++ showTargetString target ++ "'  we found "
@@ -669,7 +669,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ (t, e, g) | TargetSelectorExpected t e g <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [    "Unrecognised target '" ++ showTargetString target
             ++ "'.\n"
             ++ "Expected a " ++ intercalate " or " expected
@@ -679,7 +679,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ (t, e) | TargetSelectorNoSuch t e <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [ "Unknown target '" ++ showTargetString target ++
             "'.\n" ++ unlines
             [    (case inside of
@@ -714,7 +714,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ (t, ts) | TargetSelectorAmbiguous t ts <- problems ] of
       []      -> return ()
       targets ->
-        die' verbosity $ unlines
+        die' $ unlines
           [    "Ambiguous target '" ++ showTargetString target
             ++ "'. It could be:\n "
             ++ unlines [ "   "++ showTargetString ut ++
@@ -725,7 +725,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ t | TargetSelectorNoCurrentPackage t <- problems ] of
       []       -> return ()
       target:_ ->
-        die' verbosity $
+        die' $
             "The target '" ++ showTargetString target ++ "' refers to the "
          ++ "components in the package in the current directory, but there "
          ++ "is no package in the current directory (or at least not listed "
@@ -736,7 +736,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ () | TargetSelectorNoTargetsInCwd <- problems ] of
       []  -> return ()
       _:_ ->
-        die' verbosity $
+        die' $
             "No targets given and there is no package in the current "
          ++ "directory. Use the target 'all' for all packages in the "
          ++ "project or specify packages or components by name or location. "
@@ -745,7 +745,7 @@ reportTargetSelectorProblems verbosity problems = do
     case [ () | TargetSelectorNoTargetsInProject <- problems ] of
       []  -> return ()
       _:_ ->
-        die' verbosity $
+        die' $
             "There is no <pkgname>.cabal package file or cabal.project file. "
          ++ "To build packages locally you need at minimum a <pkgname>.cabal "
          ++ "file. You can use 'cabal init' to create one.\n"

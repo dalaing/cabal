@@ -32,7 +32,7 @@ import Distribution.Compat.Prelude
 
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Utils
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Compat.Environment
 
 import qualified Data.Map as Map
@@ -97,8 +97,8 @@ programInvocation prog args =
   }
 
 
-runProgramInvocation :: Verbosity -> ProgramInvocation -> IO ()
-runProgramInvocation verbosity
+runProgramInvocation :: ProgramInvocation -> CabalM ()
+runProgramInvocation
   ProgramInvocation {
     progInvokePath  = path,
     progInvokeArgs  = args,
@@ -107,9 +107,9 @@ runProgramInvocation verbosity
     progInvokeCwd   = Nothing,
     progInvokeInput = Nothing
   } =
-  rawSystemExit verbosity path args
+  rawSystemExit path args
 
-runProgramInvocation verbosity
+runProgramInvocation
   ProgramInvocation {
     progInvokePath  = path,
     progInvokeArgs  = args,
@@ -118,16 +118,16 @@ runProgramInvocation verbosity
     progInvokeCwd   = mcwd,
     progInvokeInput = Nothing
   } = do
-    pathOverride <- getExtraPathEnv envOverrides extraPath
-    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
-    exitCode <- rawSystemIOWithEnv verbosity
+    pathOverride <- liftIO $getExtraPathEnv envOverrides extraPath
+    menv <- liftIO $ getEffectiveEnvironment (envOverrides ++ pathOverride)
+    exitCode <- rawSystemIOWithEnv
                                    path args
                                    mcwd menv
                                    Nothing Nothing Nothing
     when (exitCode /= ExitSuccess) $
-      exitWith exitCode
+      liftIO $ exitWith exitCode
 
-runProgramInvocation verbosity
+runProgramInvocation
   ProgramInvocation {
     progInvokePath  = path,
     progInvokeArgs  = args,
@@ -137,28 +137,28 @@ runProgramInvocation verbosity
     progInvokeInput = Just inputStr,
     progInvokeInputEncoding = encoding
   } = do
-    pathOverride <- getExtraPathEnv envOverrides extraPath
-    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
-    (_, errors, exitCode) <- rawSystemStdInOut verbosity
+    pathOverride <- liftIO $ getExtraPathEnv envOverrides extraPath
+    menv <- liftIO $ getEffectiveEnvironment (envOverrides ++ pathOverride)
+    (_, errors, exitCode) <- rawSystemStdInOut
                                     path args
                                     mcwd menv
                                     (Just input) IODataModeBinary
     when (exitCode /= ExitSuccess) $
-      die' verbosity $ "'" ++ path ++ "' exited with an error:\n" ++ errors
+      die' $ "'" ++ path ++ "' exited with an error:\n" ++ errors
   where
     input = encodeToIOData encoding inputStr
 
-getProgramInvocationOutput :: Verbosity -> ProgramInvocation -> IO String
-getProgramInvocationOutput verbosity inv = do
-    (output, errors, exitCode) <- getProgramInvocationOutputAndErrors verbosity inv
+getProgramInvocationOutput :: ProgramInvocation -> CabalM String
+getProgramInvocationOutput inv = do
+    (output, errors, exitCode) <- getProgramInvocationOutputAndErrors inv
     when (exitCode /= ExitSuccess) $
-      die' verbosity $ "'" ++ progInvokePath inv ++ "' exited with an error:\n" ++ errors
+      die' $ "'" ++ progInvokePath inv ++ "' exited with an error:\n" ++ errors
     return output
 
 
-getProgramInvocationOutputAndErrors :: Verbosity -> ProgramInvocation
-                                    -> IO (String, String, ExitCode)
-getProgramInvocationOutputAndErrors verbosity
+getProgramInvocationOutputAndErrors :: ProgramInvocation
+                                    -> CabalM (String, String, ExitCode)
+getProgramInvocationOutputAndErrors
   ProgramInvocation {
     progInvokePath  = path,
     progInvokeArgs  = args,
@@ -174,9 +174,9 @@ getProgramInvocationOutputAndErrors verbosity
         decode (IODataBinary b) = normaliseLineEndings (fromUTF8LBS b)
         decode (IODataText   s) = s
 
-    pathOverride <- getExtraPathEnv envOverrides extraPath
-    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
-    (output, errors, exitCode) <- rawSystemStdInOut verbosity
+    pathOverride <- liftIO $ getExtraPathEnv envOverrides extraPath
+    menv <- liftIO $ getEffectiveEnvironment (envOverrides ++ pathOverride)
+    (output, errors, exitCode) <- rawSystemStdInOut
                                     path args
                                     mcwd menv
                                     input mode

@@ -26,7 +26,9 @@ import Distribution.Simple.Command
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, liftIO )
 import Distribution.Simple.Utils
          ( wrapText, die' )
 
@@ -79,25 +81,25 @@ testCommand = Client.installCommand {
 testAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
            -> [String] -> GlobalFlags -> IO ()
 testAction (configFlags, configExFlags, installFlags, haddockFlags)
-           targetStrings globalFlags = do
+           targetStrings globalFlags = flip runCabalM verbosity $ do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext cliConfig
 
-    targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+    targetSelectors <- either reportTargetSelectorProblems return
+                   =<< liftIO (readTargetSelectors (localPackages baseCtx) targetStrings)
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan -> do
 
             when (buildSettingOnlyDeps (buildSettings baseCtx)) $
-              die' verbosity $
+              die' $
                   "The test command does not support '--only-dependencies'. "
                ++ "You may wish to use 'build --only-dependencies' and then "
                ++ "use 'test'."
 
             -- Interpret the targets on the command line as test targets
             -- (as opposed to say build or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either reportTargetProblems return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
@@ -111,10 +113,10 @@ testAction (configFlags, configExFlags, installFlags, haddockFlags)
                                     elaboratedPlan
             return (elaboratedPlan', targets)
 
-    printPlan verbosity baseCtx buildCtx
+    printPlan baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    buildOutcomes <- runProjectBuildPhase baseCtx buildCtx
+    runProjectPostBuildPhase baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
@@ -200,9 +202,9 @@ data TargetProblem =
    | TargetProblemIsSubComponent   PackageId ComponentName SubComponentTarget
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: [TargetProblem] -> CabalM a
+reportTargetProblems =
+    die' . unlines . map renderTargetProblem
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =

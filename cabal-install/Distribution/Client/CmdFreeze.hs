@@ -38,6 +38,8 @@ import Distribution.Simple.Utils
          ( die', notice, wrapText )
 import Distribution.Verbosity
          ( normal )
+import Distribution.Monad
+         ( runCabalM, liftIO )
 
 import Data.Monoid as Monoid
 import qualified Data.Map as Map
@@ -102,10 +104,10 @@ freezeCommand = Client.installCommand {
 freezeAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
              -> [String] -> GlobalFlags -> IO ()
 freezeAction (configFlags, configExFlags, installFlags, haddockFlags)
-             extraArgs globalFlags = do
+             extraArgs globalFlags = flip runCabalM verbosity $ do
 
     unless (null extraArgs) $
-      die' verbosity $ "'freeze' doesn't take any extra arguments: "
+      die' $ "'freeze' doesn't take any extra arguments: "
          ++ unwords extraArgs
 
     ProjectBaseContext {
@@ -113,17 +115,16 @@ freezeAction (configFlags, configExFlags, installFlags, haddockFlags)
       cabalDirLayout,
       projectConfig,
       localPackages
-    } <- establishProjectBaseContext verbosity cliConfig
+    } <- establishProjectBaseContext cliConfig
 
     (_, elaboratedPlan, _) <-
-      rebuildInstallPlan verbosity
-                         distDirLayout cabalDirLayout
+      rebuildInstallPlan distDirLayout cabalDirLayout
                          projectConfig
                          localPackages
 
     let freezeConfig = projectFreezeConfig elaboratedPlan
-    writeProjectLocalFreezeConfig distDirLayout freezeConfig
-    notice verbosity $
+    liftIO $ writeProjectLocalFreezeConfig distDirLayout freezeConfig
+    notice $
       "Wrote freeze file: " ++ distProjectFile distDirLayout "freeze"
 
   where

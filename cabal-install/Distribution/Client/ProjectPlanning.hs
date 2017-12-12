@@ -144,6 +144,7 @@ import           Distribution.Types.ComponentInclude
 import           Distribution.Simple.Utils hiding (matchFileGlob)
 import           Distribution.Version
 import           Distribution.Verbosity
+import           Distribution.Monad
 import           Distribution.Text
 
 import qualified Distribution.Compat.Graph as Graph
@@ -290,12 +291,11 @@ sanityCheckElaboratedPackage ElaboratedConfiguredPackage{..}
 -- | Return the up-to-date project config and information about the local
 -- packages within the project.
 --
-rebuildProjectConfig :: Verbosity
-                     -> DistDirLayout
+rebuildProjectConfig :: DistDirLayout
                      -> ProjectConfig
-                     -> IO (ProjectConfig,
+                     -> CabalM (ProjectConfig,
                             [PackageSpecifier UnresolvedSourcePackage])
-rebuildProjectConfig verbosity
+rebuildProjectConfig
                      distDirLayout@DistDirLayout {
                        distProjectRootDirectory,
                        distDirectory,
@@ -306,7 +306,7 @@ rebuildProjectConfig verbosity
 
     (projectConfig, localPackages) <-
       runRebuild distProjectRootDirectory $
-      rerunIfChanged verbosity fileMonitorProjectConfig () $ do
+      rerunIfChanged fileMonitorProjectConfig () $ do
 
         projectConfig <- phaseReadProjectConfig
         localPackages <- phaseReadLocalPackages projectConfig
@@ -326,9 +326,8 @@ rebuildProjectConfig verbosity
     --
     phaseReadProjectConfig :: Rebuild ProjectConfig
     phaseReadProjectConfig = do
-      liftIO $ do
-        info verbosity "Project settings changed, reconfiguring..."
-      readProjectConfig verbosity projectConfigConfigFile distDirLayout
+      liftCabalM $ info "Project settings changed, reconfiguring..."
+      readProjectConfig projectConfigConfigFile distDirLayout
 
     -- Look for all the cabal packages in the project
     -- some of which may be local src dirs, tarballs etc
@@ -340,11 +339,11 @@ rebuildProjectConfig verbosity
 
       -- Create folder only if findProjectPackages did not throw a
       -- BadPackageLocations exception.
-      liftIO $ do
-        createDirectoryIfMissingVerbose verbosity True distDirectory
-        createDirectoryIfMissingVerbose verbosity True distProjectCacheDirectory
+      liftCabalM $ do
+        createDirectoryIfMissingVerbose True distDirectory
+        createDirectoryIfMissingVerbose True distProjectCacheDirectory
 
-      mapM (readSourcePackage verbosity) localCabalFiles
+      mapM readSourcePackage localCabalFiles
 
 
 -- | Return an up-to-date elaborated install plan.
@@ -360,15 +359,14 @@ rebuildProjectConfig verbosity
 -- command needs the source package info to know about flag choices and
 -- dependencies of executables and setup scripts.
 --
-rebuildInstallPlan :: Verbosity
-                   -> DistDirLayout -> CabalDirLayout
+rebuildInstallPlan :: DistDirLayout -> CabalDirLayout
                    -> ProjectConfig
                    -> [PackageSpecifier UnresolvedSourcePackage]
-                   -> IO ( ElaboratedInstallPlan  -- with store packages
+                   -> CabalM ( ElaboratedInstallPlan  -- with store packages
                          , ElaboratedInstallPlan  -- with source packages
                          , ElaboratedSharedConfig )
                       -- ^ @(improvedPlan, elaboratedPlan, _, _)@
-rebuildInstallPlan verbosity
+rebuildInstallPlan
                    distDirLayout@DistDirLayout {
                      distProjectRootDirectory,
                      distProjectCacheFile
@@ -381,14 +379,14 @@ rebuildInstallPlan verbosity
     let projectConfigMonitored = projectConfig { projectConfigBuildOnly = mempty }
 
     -- The overall improved plan is cached
-    rerunIfChanged verbosity fileMonitorImprovedPlan
+    rerunIfChanged fileMonitorImprovedPlan
                    -- react to changes in the project config,
                    -- the package .cabal files and the path
                    (projectConfigMonitored, localPackages, progsearchpath) $ do
 
       -- And so is the elaborated plan that the improved plan based on
       (elaboratedPlan, elaboratedShared) <-
-        rerunIfChanged verbosity fileMonitorElaboratedPlan
+        rerunIfChanged fileMonitorElaboratedPlan
                        (projectConfigMonitored, localPackages,
                         progsearchpath) $ do
 
@@ -445,17 +443,17 @@ rebuildInstallPlan verbosity
                              }
                            } = do
         progsearchpath <- liftIO $ getSystemSearchPath
-        rerunIfChanged verbosity fileMonitorCompiler
+        rerunIfChanged fileMonitorCompiler
                        (hcFlavor, hcPath, hcPkg, progsearchpath,
                         packageConfigProgramPaths,
                         packageConfigProgramArgs,
                         packageConfigProgramPathExtra) $ do
 
-          liftIO $ info verbosity "Compiler settings changed, reconfiguring..."
-          result@(_, _, progdb') <- liftIO $
+          liftCabalM $ info "Compiler settings changed, reconfiguring..."
+          result@(_, _, progdb') <- liftCabalM $
             Cabal.configCompilerEx
               hcFlavor hcPath hcPkg
-              progdb verbosity
+              progdb
 
         -- Note that we added the user-supplied program locations and args
         -- for /all/ programs, not just those for the compiler prog and
@@ -523,41 +521,42 @@ rebuildInstallPlan verbosity
                    }
                    (compiler, platform, progdb)
                    localPackages =
-        rerunIfChanged verbosity fileMonitorSolverPlan
+        rerunIfChanged fileMonitorSolverPlan
                        (solverSettings,
                         localPackages, localPackagesEnabledStanzas,
                         compiler, platform, programDbSignature progdb) $ do
 
-          installedPkgIndex <- getInstalledPackages verbosity
+          installedPkgIndex <- getInstalledPackages
                                                     compiler progdb platform
                                                     corePackageDbs
-          sourcePkgDb       <- getSourcePackages verbosity withRepoCtx
+          sourcePkgDb       <- getSourcePackages withRepoCtx
                                  (solverSettingIndexState solverSettings)
-          pkgConfigDB       <- getPkgConfigDb verbosity progdb
+          pkgConfigDB       <- getPkgConfigDb progdb
 
           --TODO: [code cleanup] it'd be better if the Compiler contained the
           -- ConfiguredPrograms that it needs, rather than relying on the progdb
           -- since we don't need to depend on all the programs here, just the
           -- ones relevant for the compiler.
 
-          liftIO $ do
-            solver <- chooseSolver verbosity
+          liftCabalM $ do
+            solver <- chooseSolver
                                    (solverSettingSolver solverSettings)
                                    (compilerInfo compiler)
 
-            notice verbosity "Resolving dependencies..."
-            plan <- foldProgress logMsg (die' verbosity) return $
+            notice "Resolving dependencies..."
+            verbosity <- askVerbosity
+            plan <- foldProgress logMsg die' return $
               planPackages verbosity compiler platform solver solverSettings
                            installedPkgIndex sourcePkgDb pkgConfigDB
                            localPackages localPackagesEnabledStanzas
             return (plan, pkgConfigDB)
       where
         corePackageDbs = [GlobalPackageDB]
-        withRepoCtx    = projectConfigWithSolverRepoContext verbosity
+        withRepoCtx    = projectConfigWithSolverRepoContext 
                            projectConfigShared
                            projectConfigBuildOnly
         solverSettings = resolveSolverSettings projectConfig
-        logMsg message rest = debugNoWrap verbosity message >> rest
+        logMsg message rest = debugNoWrap message >> rest
 
         localPackagesEnabledStanzas =
           Map.fromList
@@ -598,18 +597,17 @@ rebuildInstallPlan verbosity
                        (compiler, platform, progdb) pkgConfigDB
                        solverPlan localPackages = do
 
-        liftIO $ debug verbosity "Elaborating the install plan..."
+        liftCabalM $ debug "Elaborating the install plan..."
 
         sourcePackageHashes <-
-          rerunIfChanged verbosity fileMonitorSourceHashes
+          rerunIfChanged fileMonitorSourceHashes
                          (packageLocationsSignature solverPlan) $
-            getPackageSourceHashes verbosity withRepoCtx solverPlan
+            getPackageSourceHashes withRepoCtx solverPlan
 
         defaultInstallDirs <- liftIO $ userInstallDirTemplates compiler
         (elaboratedPlan, elaboratedShared)
-          <- liftIO . runLogProgress verbosity $
+          <- liftCabalM $ runLogProgress $
               elaborateInstallPlan
-                verbosity
                 platform compiler progdb pkgConfigDB
                 distDirLayout
                 cabalStoreDirLayout
@@ -622,10 +620,10 @@ rebuildInstallPlan verbosity
                 projectConfigLocalPackages
                 (getMapMappend projectConfigSpecificPackage)
         let instantiatedPlan = instantiateInstallPlan elaboratedPlan
-        liftIO $ debugNoWrap verbosity (InstallPlan.showInstallPlan instantiatedPlan)
+        liftCabalM $ debugNoWrap (InstallPlan.showInstallPlan instantiatedPlan)
         return (instantiatedPlan, elaboratedShared)
       where
-        withRepoCtx = projectConfigWithSolverRepoContext verbosity
+        withRepoCtx = projectConfigWithSolverRepoContext
                         projectConfigShared
                         projectConfigBuildOnly
 
@@ -637,9 +635,9 @@ rebuildInstallPlan verbosity
     phaseMaintainPlanOutputs :: ElaboratedInstallPlan
                              -> ElaboratedSharedConfig
                              -> Rebuild ()
-    phaseMaintainPlanOutputs elaboratedPlan elaboratedShared = liftIO $ do
-        debug verbosity "Updating plan.json"
-        writePlanExternalRepresentation
+    phaseMaintainPlanOutputs elaboratedPlan elaboratedShared = do
+        liftCabalM $ debug "Updating plan.json"
+        liftIO $ writePlanExternalRepresentation
           distDirLayout
           elaboratedPlan
           elaboratedShared
@@ -659,12 +657,12 @@ rebuildInstallPlan verbosity
                      -> Rebuild ElaboratedInstallPlan
     phaseImprovePlan elaboratedPlan elaboratedShared = do
 
-        liftIO $ debug verbosity "Improving the install plan..."
+        liftCabalM $ debug "Improving the install plan..."
         storePkgIdSet <- getStoreEntries cabalStoreDirLayout compid
         let improvedPlan = improveInstallPlanWithInstalledPackages
                              storePkgIdSet
                              elaboratedPlan
-        liftIO $ debugNoWrap verbosity (InstallPlan.showInstallPlan improvedPlan)
+        liftCabalM $ debugNoWrap (InstallPlan.showInstallPlan improvedPlan)
         -- TODO: [nice to have] having checked which packages from the store
         -- we're using, it may be sensible to sanity check those packages
         -- by loading up the compiler package db and checking everything
@@ -692,44 +690,40 @@ programDbSignature progdb =
                                           (programOverrideEnv prog) }
     | prog <- configuredPrograms progdb ]
 
-getInstalledPackages :: Verbosity
-                     -> Compiler -> ProgramDb -> Platform
+getInstalledPackages :: Compiler -> ProgramDb -> Platform
                      -> PackageDBStack
                      -> Rebuild InstalledPackageIndex
-getInstalledPackages verbosity compiler progdb platform packagedbs = do
+getInstalledPackages compiler progdb platform packagedbs = do
     monitorFiles . map monitorFileOrDirectory
-      =<< liftIO (IndexUtils.getInstalledPackagesMonitorFiles
-                    verbosity compiler
+      =<< liftCabalM (IndexUtils.getInstalledPackagesMonitorFiles
+                    compiler
                     packagedbs progdb platform)
-    liftIO $ IndexUtils.getInstalledPackages
-               verbosity compiler
+    liftCabalM $ IndexUtils.getInstalledPackages
+               compiler
                packagedbs progdb
 
 {-
 --TODO: [nice to have] use this but for sanity / consistency checking
-getPackageDBContents :: Verbosity
-                     -> Compiler -> ProgramDb -> Platform
+getPackageDBContents :: Compiler -> ProgramDb -> Platform
                      -> PackageDB
                      -> Rebuild InstalledPackageIndex
-getPackageDBContents verbosity compiler progdb platform packagedb = do
+getPackageDBContents compiler progdb platform packagedb = do
     monitorFiles . map monitorFileOrDirectory
-      =<< liftIO (IndexUtils.getInstalledPackagesMonitorFiles
-                    verbosity compiler
+      =<< liftCabalM (IndexUtils.getInstalledPackagesMonitorFiles
+                    compiler
                     [packagedb] progdb platform)
-    liftIO $ do
-      createPackageDBIfMissing verbosity compiler progdb packagedb
-      Cabal.getPackageDBContents verbosity compiler
+    liftCabalM $ do
+      createPackageDBIfMissing compiler progdb packagedb
+      Cabal.getPackageDBContents compiler
                                  packagedb progdb
 -}
 
-getSourcePackages :: Verbosity -> (forall a. (RepoContext -> IO a) -> IO a)
+getSourcePackages :: (forall a. (RepoContext -> CabalM a) -> CabalM a)
                   -> Maybe IndexUtils.IndexState -> Rebuild SourcePackageDb
-getSourcePackages verbosity withRepoCtx idxState = do
+getSourcePackages withRepoCtx idxState = do
     (sourcePkgDb, repos) <-
-      liftIO $
-        withRepoCtx $ \repoctx -> do
-          sourcePkgDb <- IndexUtils.getSourcePackagesAtIndexState verbosity
-                                                                  repoctx idxState
+        liftCabalM $ withRepoCtx $ \repoctx -> do
+          sourcePkgDb <- IndexUtils.getSourcePackagesAtIndexState repoctx idxState
           return (sourcePkgDb, repoContextRepos repoctx)
 
     mapM_ needIfExists
@@ -738,13 +732,13 @@ getSourcePackages verbosity withRepoCtx idxState = do
     return sourcePkgDb
 
 
-getPkgConfigDb :: Verbosity -> ProgramDb -> Rebuild PkgConfigDb
-getPkgConfigDb verbosity progdb = do
-    dirs <- liftIO $ getPkgConfigDbDirs verbosity progdb
+getPkgConfigDb :: ProgramDb -> Rebuild PkgConfigDb
+getPkgConfigDb progdb = do
+    dirs <- liftCabalM $ getPkgConfigDbDirs progdb
     -- Just monitor the dirs so we'll notice new .pc files.
     -- Alternatively we could monitor all the .pc files too.
     mapM_ monitorDirectoryStatus dirs
-    liftIO $ readPkgConfigDb verbosity progdb
+    liftCabalM $ readPkgConfigDb progdb
 
 
 -- | Select the config values to monitor for changes package source hashes.
@@ -762,11 +756,10 @@ packageLocationsSignature solverPlan =
 --
 -- Note that we don't get hashes for local unpacked packages.
 --
-getPackageSourceHashes :: Verbosity
-                       -> (forall a. (RepoContext -> IO a) -> IO a)
+getPackageSourceHashes :: (forall a. (RepoContext -> CabalM a) -> CabalM a)
                        -> SolverInstallPlan
                        -> Rebuild (Map PackageId PackageSourceHash)
-getPackageSourceHashes verbosity withRepoCtx solverPlan = do
+getPackageSourceHashes withRepoCtx solverPlan = do
 
     -- Determine if and where to get the package's source hash from.
     --
@@ -822,19 +815,21 @@ getPackageSourceHashes verbosity withRepoCtx solverPlan = do
       -- don't have to. (The main cost is configuring the http client.)
       if null repoTarballPkgsToDownload && null repoTarballPkgsWithMetadata
       then return (Map.empty, [])
-      else liftIO $ withRepoCtx $ \repoctx -> do
+      else liftCabalM $ withRepoCtx $ \repoctx -> do
 
       -- For tarballs from repos that do have hashes available as part of the
       -- repo metadata we now load up the index for each repo and retrieve
       -- the hashes for the packages
       --
       hashesFromRepoMetadata <-
+        runCabalMInIO $ \liftC ->
         Sec.uncheckClientErrors $ --TODO: [code cleanup] wrap in our own exceptions
+        liftC $
         fmap (Map.fromList . concat) $
         sequence
           -- Reading the repo index is expensive so we group the packages by repo
           [ repoContextWithSecureRepo repoctx repo $ \secureRepo ->
-              Sec.withIndex secureRepo $ \repoIndex ->
+              liftIO $ Sec.withIndex secureRepo $ \repoIndex ->
                 sequence
                   [ do hash <- Sec.trusted <$> -- strip off Trusted tag
                                Sec.indexLookupHash repoIndex pkgid
@@ -855,7 +850,7 @@ getPackageSourceHashes verbosity withRepoCtx solverPlan = do
       --
       repoTarballPkgsNewlyDownloaded <-
         sequence
-          [ do tarball <- fetchRepoTarball verbosity repoctx repo pkgid
+          [ do tarball <- fetchRepoTarball repoctx repo pkgid
                return (pkgid, tarball)
           | (pkgid, repo) <- repoTarballPkgsToDownload ]
 
@@ -901,7 +896,7 @@ planPackages :: Verbosity
              -> Progress String String SolverInstallPlan
 planPackages verbosity comp platform solver SolverSettings{..}
              installedPkgIndex sourcePkgDb pkgConfigDB
-             localPackages pkgStanzasEnable =
+             localPackages pkgStanzasEnable = do
 
     resolveDependencies
       platform (compilerInfo comp)
@@ -1135,7 +1130,7 @@ planPackages verbosity comp platform solver SolverSettings{..}
 -- matching that of the classic @cabal install --user@ or @--global@
 --
 elaborateInstallPlan
-  :: Verbosity -> Platform -> Compiler -> ProgramDb -> PkgConfigDb
+  :: Platform -> Compiler -> ProgramDb -> PkgConfigDb
   -> DistDirLayout
   -> StoreDirLayout
   -> SolverInstallPlan
@@ -1147,7 +1142,7 @@ elaborateInstallPlan
   -> PackageConfig
   -> Map PackageName PackageConfig
   -> LogProgress (ElaboratedInstallPlan, ElaboratedSharedConfig)
-elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
+elaborateInstallPlan platform compiler compilerprogdb pkgConfigDB
                      distDirLayout@DistDirLayout{..}
                      storeDirLayout@StoreDirLayout{storePackageDBStack}
                      solverPlan localPackages
@@ -1374,7 +1369,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                     case Map.lookup (unDefUnitId def_uid) preexistingInstantiatedPkgs of
                         Just full -> full
                         Nothing -> error ("lookup_uid: " ++ display def_uid)
-            lc <- toLinkedComponent verbosity lookup_uid (elabPkgSourceId elab0)
+            lc <- toLinkedComponent lookup_uid (elabPkgSourceId elab0)
                         (Map.union external_lc_map lc_map) cc
             infoProgress $ dispLinkedComponent lc
             -- NB: elab is setup to be the correct form for an

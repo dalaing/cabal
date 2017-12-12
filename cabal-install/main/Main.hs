@@ -174,6 +174,8 @@ import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
          ( Verbosity, normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, runCabalMInIO, liftIO )
 import Distribution.Version
          ( Version, mkVersion, orLaterVersion )
 import qualified Paths_cabal_install (version)
@@ -351,117 +353,121 @@ wrapperAction :: Monoid flags
               -> Command Action
 wrapperAction command verbosityFlag distPrefFlag =
   commandAddAction command
-    { commandDefaultFlags = mempty } $ \flags extraArgs globalFlags -> do
+    { commandDefaultFlags = mempty } $ \flags extraArgs globalFlags ->
     let verbosity = fromFlagOrDefault normal (verbosityFlag flags)
-    load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
-    let config = either (\(SomeException _) -> mempty) snd load
-    distPref <- findSavedDistPref config (distPrefFlag flags)
-    let setupScriptOptions = defaultSetupScriptOptions { useDistPref = distPref }
-    setupWrapper verbosity setupScriptOptions Nothing
-                 command (const flags) extraArgs
+    in flip runCabalM verbosity $ do
+      load <- runCabalMInIO $ \liftC -> try (liftC $ loadConfigOrSandboxConfig globalFlags)
+      let config = either (\(SomeException _) -> mempty) snd load
+      distPref <- liftIO $ findSavedDistPref config (distPrefFlag flags)
+      let setupScriptOptions = defaultSetupScriptOptions { useDistPref = distPref }
+      setupWrapper setupScriptOptions Nothing
+                  command (\_ _ -> flags) extraArgs
 
 configureAction :: (ConfigFlags, ConfigExFlags)
                 -> [String] -> Action
-configureAction (configFlags, configExFlags) extraArgs globalFlags = do
+configureAction (configFlags, configExFlags) extraArgs globalFlags =
   let verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-  (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
-                          <$> loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (configDistPref configFlags)
-  nixInstantiate verbosity distPref True globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    let configFlags'   = savedConfigureFlags   config `mappend` configFlags
-        configExFlags' = savedConfigureExFlags config `mappend` configExFlags
-        globalFlags'   = savedGlobalFlags      config `mappend` globalFlags
-    (comp, platform, progdb) <- configCompilerAuxEx configFlags'
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
+                            <$> loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (configDistPref configFlags)
+    nixInstantiate distPref True globalFlags config
+    nixShell distPref globalFlags config $ do
+      let configFlags'   = savedConfigureFlags   config `mappend` configFlags
+          configExFlags' = savedConfigureExFlags config `mappend` configExFlags
+          globalFlags'   = savedGlobalFlags      config `mappend` globalFlags
+      (comp, platform, progdb) <- liftIO $ configCompilerAuxEx configFlags'
 
-    -- If we're working inside a sandbox and the user has set the -w option, we
-    -- may need to create a sandbox-local package DB for this compiler and add a
-    -- timestamp record for this compiler to the timestamp file.
-    let configFlags''  = case useSandbox of
-          NoSandbox               -> configFlags'
-          (UseSandbox sandboxDir) -> setPackageDB sandboxDir
-                                    comp platform configFlags'
+      -- If we're working inside a sandbox and the user has set the -w option, we
+      -- may need to create a sandbox-local package DB for this compiler and add a
+      -- timestamp record for this compiler to the timestamp file.
+      let configFlags''  = case useSandbox of
+            NoSandbox               -> configFlags'
+            (UseSandbox sandboxDir) -> setPackageDB sandboxDir
+                                      comp platform configFlags'
 
-    writeConfigFlags verbosity distPref (configFlags'', configExFlags')
+      writeConfigFlags distPref (configFlags'', configExFlags')
 
-    -- What package database(s) to use
-    let packageDBs :: PackageDBStack
-        packageDBs
-          = interpretPackageDbFlags
-            (fromFlag (configUserInstall configFlags''))
-            (configPackageDBs configFlags'')
+      -- What package database(s) to use
+      let packageDBs :: PackageDBStack
+          packageDBs
+            = interpretPackageDbFlags
+              (fromFlag (configUserInstall configFlags''))
+              (configPackageDBs configFlags'')
 
-    whenUsingSandbox useSandbox $ \sandboxDir -> do
-      initPackageDBIfNeeded verbosity configFlags'' comp progdb
-      -- NOTE: We do not write the new sandbox package DB location to
-      -- 'cabal.sandbox.config' here because 'configure -w' must not affect
-      -- subsequent 'install' (for UI compatibility with non-sandboxed mode).
+      whenUsingSandbox useSandbox $ \sandboxDir -> do
+        initPackageDBIfNeeded configFlags'' comp progdb
+        -- NOTE: We do not write the new sandbox package DB location to
+        -- 'cabal.sandbox.config' here because 'configure -w' must not affect
+        -- subsequent 'install' (for UI compatibility with non-sandboxed mode).
 
-      indexFile     <- tryGetIndexFilePath verbosity config
-      maybeAddCompilerTimestampRecord verbosity sandboxDir indexFile
-        (compilerId comp) platform
+        indexFile     <- tryGetIndexFilePath config
+        maybeAddCompilerTimestampRecord sandboxDir indexFile
+          (compilerId comp) platform
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      withRepoContext verbosity globalFlags' $ \repoContext ->
-        configure verbosity packageDBs repoContext
-                  comp platform progdb configFlags'' configExFlags' extraArgs
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        withRepoContext globalFlags' $ \repoContext ->
+          configure packageDBs repoContext
+                    comp platform progdb configFlags'' configExFlags' extraArgs
 
 reconfigureAction :: (ConfigFlags, ConfigExFlags)
                   -> [String] -> Action
-reconfigureAction flags@(configFlags, _) _ globalFlags = do
+reconfigureAction flags@(configFlags, _) _ globalFlags =
   let verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-  (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
-                          <$> loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (configDistPref configFlags)
-  let checkFlags = Check $ \_ saved -> do
-        let flags' = saved <> flags
-        unless (saved == flags') $ info verbosity message
-        pure (Any True, flags')
-        where
-          -- This message is correct, but not very specific: it will list all
-          -- of the new flags, even if some have not actually changed. The
-          -- *minimal* set of changes is more difficult to determine.
-          message =
-            "flags changed: "
-            ++ unwords (commandShowOptions configureExCommand flags)
-  nixInstantiate verbosity distPref True globalFlags config
-  _ <-
-    reconfigure configureAction
-    verbosity distPref useSandbox DontSkipAddSourceDepsCheck NoFlag
-    checkFlags [] globalFlags config
-  pure ()
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
+                            <$> loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (configDistPref configFlags)
+    let checkFlags = Check $ \_ saved -> do
+          let flags' = saved <> flags
+          unless (saved == flags') $ info message
+          pure (Any True, flags')
+          where
+            -- This message is correct, but not very specific: it will list all
+            -- of the new flags, even if some have not actually changed. The
+            -- *minimal* set of changes is more difficult to determine.
+            message =
+              "flags changed: "
+              ++ unwords (commandShowOptions configureExCommand flags)
+    nixInstantiate distPref True globalFlags config
+    _ <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox DontSkipAddSourceDepsCheck NoFlag
+      checkFlags [] globalFlags config
+    pure ()
 
 buildAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-buildAction (buildFlags, buildExFlags) extraArgs globalFlags = do
+buildAction (buildFlags, buildExFlags) extraArgs globalFlags =
   let verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
       noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
                     (buildOnly buildExFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (buildDistPref buildFlags)
-  -- Calls 'configureAction' to do the real work, so nothing special has to be
-  -- done to support sandboxes.
-  config' <-
-    reconfigure configureAction
-    verbosity distPref useSandbox noAddSource (buildNumJobs buildFlags)
-    mempty [] globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      build verbosity config' distPref buildFlags extraArgs
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (buildDistPref buildFlags)
+    -- Calls 'configureAction' to do the real work, so nothing special has to be
+    -- done to support sandboxes.
+    config' <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox noAddSource (buildNumJobs buildFlags)
+      mempty [] globalFlags config
+    nixShell distPref globalFlags config $ do
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        build config' distPref buildFlags extraArgs
 
 
 -- | Actually do the work of building the package. This is separate from
 -- 'buildAction' so that 'testAction' and 'benchmarkAction' do not invoke
 -- 'reconfigure' twice.
-build :: Verbosity -> SavedConfig -> FilePath -> BuildFlags -> [String] -> IO ()
-build verbosity config distPref buildFlags extraArgs =
-  setupWrapper verbosity setupOptions Nothing
+build :: SavedConfig -> FilePath -> BuildFlags -> [String] -> CabalM ()
+build config distPref buildFlags extraArgs =
+  setupWrapper setupOptions Nothing
                (Cabal.buildCommand progDb) mkBuildFlags extraArgs
   where
     progDb       = defaultProgramDb
     setupOptions = defaultSetupScriptOptions { useDistPref = distPref }
 
-    mkBuildFlags version = filterBuildFlags version config buildFlags'
-    buildFlags' = buildFlags
+    mkBuildFlags verbosity version = filterBuildFlags version config (buildFlags' verbosity)
+    buildFlags' verbosity = buildFlags
       { buildVerbosity = toFlag verbosity
       , buildDistPref  = toFlag distPref
       }
@@ -487,216 +493,218 @@ filterBuildFlags version config buildFlags
 
 
 replAction :: (ReplFlags, BuildExFlags) -> [String] -> Action
-replAction (replFlags, buildExFlags) extraArgs globalFlags = do
+replAction (replFlags, buildExFlags) extraArgs globalFlags =
   let verbosity = fromFlagOrDefault normal (replVerbosity replFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (replDistPref replFlags)
-  cwd     <- getCurrentDirectory
-  pkgDesc <- findPackageDesc cwd
-  let
-    -- There is a .cabal file in the current directory: start a REPL and load
-    -- the project's modules.
-    onPkgDesc = do
-      let noAddSource = case replReload replFlags of
-            Flag True -> SkipAddSourceDepsCheck
-            _         -> fromFlagOrDefault DontSkipAddSourceDepsCheck
-                        (buildOnly buildExFlags)
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (replDistPref replFlags)
+    cwd     <- liftIO getCurrentDirectory
+    pkgDesc <- liftIO $ findPackageDesc cwd
+    let
+      -- There is a .cabal file in the current directory: start a REPL and load
+      -- the project's modules.
+      onPkgDesc = do
+        let noAddSource = case replReload replFlags of
+              Flag True -> SkipAddSourceDepsCheck
+              _         -> fromFlagOrDefault DontSkipAddSourceDepsCheck
+                          (buildOnly buildExFlags)
 
-      -- Calls 'configureAction' to do the real work, so nothing special has to
-      -- be done to support sandboxes.
-      _ <-
-        reconfigure configureAction
-        verbosity distPref useSandbox noAddSource NoFlag
-        mempty [] globalFlags config
-      let progDb = defaultProgramDb
-          setupOptions = defaultSetupScriptOptions
-            { useCabalVersion = orLaterVersion $ mkVersion [1,18,0]
-            , useDistPref     = distPref
-            }
-          replFlags'   = replFlags
-            { replVerbosity = toFlag verbosity
-            , replDistPref  = toFlag distPref
-            }
+        -- Calls 'configureAction' to do the real work, so nothing special has to
+        -- be done to support sandboxes.
+        _ <-
+          reconfigure (\x y -> liftIO . configureAction x y)
+          distPref useSandbox noAddSource NoFlag
+          mempty [] globalFlags config
+        let progDb = defaultProgramDb
+            setupOptions = defaultSetupScriptOptions
+              { useCabalVersion = orLaterVersion $ mkVersion [1,18,0]
+              , useDistPref     = distPref
+              }
+            replFlags' verbosity' _ = replFlags
+              { replVerbosity = toFlag verbosity'
+              , replDistPref  = toFlag distPref
+              }
 
-      nixShell verbosity distPref globalFlags config $ do
-        maybeWithSandboxDirOnSearchPath useSandbox $
-          setupWrapper verbosity setupOptions Nothing
-          (Cabal.replCommand progDb) (const replFlags') extraArgs
+        nixShell distPref globalFlags config $ do
+          maybeWithSandboxDirOnSearchPath useSandbox $
+            setupWrapper setupOptions Nothing
+            (Cabal.replCommand progDb) replFlags' extraArgs
 
-    -- No .cabal file in the current directory: just start the REPL (possibly
-    -- using the sandbox package DB).
-    onNoPkgDesc = do
-      let configFlags = savedConfigureFlags config
-      (comp, platform, programDb) <- configCompilerAux' configFlags
-      programDb' <- reconfigurePrograms verbosity
-                                        (replProgramPaths replFlags)
-                                        (replProgramArgs replFlags)
-                                        programDb
-      nixShell verbosity distPref globalFlags config $ do
-        startInterpreter verbosity programDb' comp platform
-                        (configPackageDB' configFlags)
+      -- No .cabal file in the current directory: just start the REPL (possibly
+      -- using the sandbox package DB).
+      onNoPkgDesc = do
+        let configFlags = savedConfigureFlags config
+        (comp, platform, programDb) <- liftIO $ configCompilerAux' configFlags
+        programDb' <- reconfigurePrograms (replProgramPaths replFlags)
+                                          (replProgramArgs replFlags)
+                                          programDb
+        nixShell distPref globalFlags config $ do
+          startInterpreter programDb' comp platform
+                          (configPackageDB' configFlags)
 
-  either (const onNoPkgDesc) (const onPkgDesc) pkgDesc
+    either (const onNoPkgDesc) (const onPkgDesc) pkgDesc
 
 installAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
               -> [String] -> Action
 installAction (configFlags, _, installFlags, _) _ globalFlags
-  | fromFlagOrDefault False (installOnly installFlags) = do
-      let verb = fromFlagOrDefault normal (configVerbosity configFlags)
-      (useSandbox, config) <- loadConfigOrSandboxConfig verb globalFlags
-      dist <- findSavedDistPref config (configDistPref configFlags)
-      let setupOpts = defaultSetupScriptOptions { useDistPref = dist }
-      nixShellIfSandboxed verb dist globalFlags config useSandbox $
-        setupWrapper
-        verb setupOpts Nothing
-        installCommand (const mempty) []
+  | fromFlagOrDefault False (installOnly installFlags) =
+      let verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
+      in flip runCabalM verbosity $ do
+        (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+        dist <- liftIO $ findSavedDistPref config (configDistPref configFlags)
+        let setupOpts = defaultSetupScriptOptions { useDistPref = dist }
+        nixShellIfSandboxed dist globalFlags config useSandbox $
+          setupWrapper
+          setupOpts Nothing
+          installCommand (const mempty) []
 
 installAction
   (configFlags, configExFlags, installFlags, haddockFlags)
-  extraArgs globalFlags = do
-  let verb = fromFlagOrDefault normal (configVerbosity configFlags)
-  (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
-                          <$> loadConfigOrSandboxConfig verb globalFlags
+  extraArgs globalFlags =
+  let verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- updateInstallDirs (configUserInstall configFlags)
+                            <$> loadConfigOrSandboxConfig globalFlags
 
-  let sandboxDist =
-        case useSandbox of
-          NoSandbox             -> NoFlag
-          UseSandbox sandboxDir -> Flag $ sandboxBuildDir sandboxDir
-  dist <- findSavedDistPref config
-          (configDistPref configFlags `mappend` sandboxDist)
+    let sandboxDist =
+          case useSandbox of
+            NoSandbox             -> NoFlag
+            UseSandbox sandboxDir -> Flag $ sandboxBuildDir sandboxDir
+    dist <- liftIO $ findSavedDistPref config
+            (configDistPref configFlags `mappend` sandboxDist)
 
-  nixShellIfSandboxed verb dist globalFlags config useSandbox $ do
-    targets <- readUserTargets verb extraArgs
+    nixShellIfSandboxed dist globalFlags config useSandbox $ do
+      targets <- readUserTargets extraArgs
 
-    -- TODO: It'd be nice if 'cabal install' picked up the '-w' flag passed to
-    -- 'configure' when run inside a sandbox.  Right now, running
-    --
-    -- $ cabal sandbox init && cabal configure -w /path/to/ghc
-    --   && cabal build && cabal install
-    --
-    -- performs the compilation twice unless you also pass -w to 'install'.
-    -- However, this is the same behaviour that 'cabal install' has in the normal
-    -- mode of operation, so we stick to it for consistency.
+      -- TODO: It'd be nice if 'cabal install' picked up the '-w' flag passed to
+      -- 'configure' when run inside a sandbox.  Right now, running
+      --
+      -- $ cabal sandbox init && cabal configure -w /path/to/ghc
+      --   && cabal build && cabal install
+      --
+      -- performs the compilation twice unless you also pass -w to 'install'.
+      -- However, this is the same behaviour that 'cabal install' has in the normal
+      -- mode of operation, so we stick to it for consistency.
 
-    let configFlags'    = maybeForceTests installFlags' $
-                          savedConfigureFlags   config `mappend`
-                          configFlags { configDistPref = toFlag dist }
-        configExFlags'  = defaultConfigExFlags         `mappend`
-                          savedConfigureExFlags config `mappend` configExFlags
-        installFlags'   = defaultInstallFlags          `mappend`
-                          savedInstallFlags     config `mappend` installFlags
-        haddockFlags'   = defaultHaddockFlags          `mappend`
-                          savedHaddockFlags     config `mappend`
-                          haddockFlags { haddockDistPref = toFlag dist }
-        globalFlags'    = savedGlobalFlags      config `mappend` globalFlags
-    (comp, platform, progdb) <- configCompilerAux' configFlags'
-    -- TODO: Redesign ProgramDB API to prevent such problems as #2241 in the
-    -- future.
-    progdb' <- configureAllKnownPrograms verb progdb
+      let configFlags'    = maybeForceTests installFlags' $
+                            savedConfigureFlags   config `mappend`
+                            configFlags { configDistPref = toFlag dist }
+          configExFlags'  = defaultConfigExFlags         `mappend`
+                            savedConfigureExFlags config `mappend` configExFlags
+          installFlags'   = defaultInstallFlags          `mappend`
+                            savedInstallFlags     config `mappend` installFlags
+          haddockFlags'   = defaultHaddockFlags          `mappend`
+                            savedHaddockFlags     config `mappend`
+                            haddockFlags { haddockDistPref = toFlag dist }
+          globalFlags'    = savedGlobalFlags      config `mappend` globalFlags
+      (comp, platform, progdb) <- liftIO $ configCompilerAux' configFlags'
+      -- TODO: Redesign ProgramDB API to prevent such problems as #2241 in the
+      -- future.
+      progdb' <- configureAllKnownPrograms progdb
 
-    -- If we're working inside a sandbox and the user has set the -w option, we
-    -- may need to create a sandbox-local package DB for this compiler and add a
-    -- timestamp record for this compiler to the timestamp file.
-    configFlags'' <- case useSandbox of
-      NoSandbox               -> configAbsolutePaths $ configFlags'
-      (UseSandbox sandboxDir) -> return $ setPackageDB sandboxDir comp platform
-                                                      configFlags'
+      -- If we're working inside a sandbox and the user has set the -w option, we
+      -- may need to create a sandbox-local package DB for this compiler and add a
+      -- timestamp record for this compiler to the timestamp file.
+      configFlags'' <- liftIO $ case useSandbox of
+        NoSandbox               -> configAbsolutePaths $ configFlags'
+        (UseSandbox sandboxDir) -> return $ setPackageDB sandboxDir comp platform
+                                                        configFlags'
 
-    whenUsingSandbox useSandbox $ \sandboxDir -> do
-      initPackageDBIfNeeded verb configFlags'' comp progdb'
+      whenUsingSandbox useSandbox $ \sandboxDir -> do
+        initPackageDBIfNeeded configFlags'' comp progdb'
 
-      indexFile     <- tryGetIndexFilePath verb config
-      maybeAddCompilerTimestampRecord verb sandboxDir indexFile
-        (compilerId comp) platform
+        indexFile     <- tryGetIndexFilePath config
+        maybeAddCompilerTimestampRecord sandboxDir indexFile
+          (compilerId comp) platform
 
-    -- TODO: Passing 'SandboxPackageInfo' to install unconditionally here means
-    -- that 'cabal install some-package' inside a sandbox will sometimes reinstall
-    -- modified add-source deps, even if they are not among the dependencies of
-    -- 'some-package'. This can also prevent packages that depend on older
-    -- versions of add-source'd packages from building (see #1362).
-    maybeWithSandboxPackageInfo verb configFlags'' globalFlags'
-                                comp platform progdb useSandbox $ \mSandboxPkgInfo ->
-                                maybeWithSandboxDirOnSearchPath useSandbox $
-      withRepoContext verb globalFlags' $ \repoContext ->
-        install verb
-                (configPackageDB' configFlags'')
-                repoContext
-                comp platform progdb'
-                useSandbox mSandboxPkgInfo
-                globalFlags' configFlags'' configExFlags'
-                installFlags' haddockFlags'
-                targets
+      -- TODO: Passing 'SandboxPackageInfo' to install unconditionally here means
+      -- that 'cabal install some-package' inside a sandbox will sometimes reinstall
+      -- modified add-source deps, even if they are not among the dependencies of
+      -- 'some-package'. This can also prevent packages that depend on older
+      -- versions of add-source'd packages from building (see #1362).
+      maybeWithSandboxPackageInfo configFlags'' globalFlags'
+                                  comp platform progdb useSandbox $ \mSandboxPkgInfo ->
+                                  maybeWithSandboxDirOnSearchPath useSandbox $
+        withRepoContext globalFlags' $ \repoContext ->
+          install (configPackageDB' configFlags'')
+                  repoContext
+                  comp platform progdb'
+                  useSandbox mSandboxPkgInfo
+                  globalFlags' configFlags'' configExFlags'
+                  installFlags' haddockFlags'
+                  targets
 
-      where
-        -- '--run-tests' implies '--enable-tests'.
-        maybeForceTests installFlags' configFlags' =
-          if fromFlagOrDefault False (installRunTests installFlags')
-          then configFlags' { configTests = toFlag True }
-          else configFlags'
+        where
+          -- '--run-tests' implies '--enable-tests'.
+          maybeForceTests installFlags' configFlags' =
+            if fromFlagOrDefault False (installRunTests installFlags')
+            then configFlags' { configTests = toFlag True }
+            else configFlags'
 
 testAction :: (TestFlags, BuildFlags, BuildExFlags) -> [String] -> GlobalFlags
            -> IO ()
-testAction (testFlags, buildFlags, buildExFlags) extraArgs globalFlags = do
+testAction (testFlags, buildFlags, buildExFlags) extraArgs globalFlags =
   let verbosity      = fromFlagOrDefault normal (testVerbosity testFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (testDistPref testFlags)
-  let noAddSource    = fromFlagOrDefault DontSkipAddSourceDepsCheck
-                      (buildOnly buildExFlags)
-      buildFlags'    = buildFlags
-                      { buildVerbosity = testVerbosity testFlags }
-      checkFlags = Check $ \_ flags@(configFlags, configExFlags) ->
-        if fromFlagOrDefault False (configTests configFlags)
-          then pure (mempty, flags)
-          else do
-            info verbosity "reconfiguring to enable tests"
-            let flags' = ( configFlags { configTests = toFlag True }
-                        , configExFlags
-                        )
-            pure (Any True, flags')
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (testDistPref testFlags)
+    let noAddSource    = fromFlagOrDefault DontSkipAddSourceDepsCheck
+                        (buildOnly buildExFlags)
+        buildFlags'    = buildFlags
+                        { buildVerbosity = testVerbosity testFlags }
+        checkFlags = Check $ \_ flags@(configFlags, configExFlags) ->
+          if fromFlagOrDefault False (configTests configFlags)
+            then pure (mempty, flags)
+            else do
+              info "reconfiguring to enable tests"
+              let flags' = ( configFlags { configTests = toFlag True }
+                          , configExFlags
+                          )
+              pure (Any True, flags')
 
-  -- reconfigure also checks if we're in a sandbox and reinstalls add-source
-  -- deps if needed.
-  _ <-
-    reconfigure configureAction
-    verbosity distPref useSandbox noAddSource (buildNumJobs buildFlags')
-    checkFlags [] globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    let setupOptions   = defaultSetupScriptOptions { useDistPref = distPref }
-        testFlags'     = testFlags { testDistPref = toFlag distPref }
+    -- reconfigure also checks if we're in a sandbox and reinstalls add-source
+    -- deps if needed.
+    _ <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox noAddSource (buildNumJobs buildFlags')
+      checkFlags [] globalFlags config
+    nixShell distPref globalFlags config $ do
+      let setupOptions   = defaultSetupScriptOptions { useDistPref = distPref }
+          testFlags'     = testFlags { testDistPref = toFlag distPref }
 
-    -- The package was just configured, so the LBI must be available.
-    names <- componentNamesFromLBI verbosity distPref "test suites"
-              (\c -> case c of { LBI.CTest{} -> True; _ -> False })
-    let extraArgs'
-          | null extraArgs = case names of
-            ComponentNamesUnknown -> []
-            ComponentNames names' -> [ Make.unUnqualComponentName name
-                                    | LBI.CTestName name <- names' ]
-          | otherwise      = extraArgs
+      -- The package was just configured, so the LBI must be available.
+      names <- componentNamesFromLBI distPref "test suites"
+                (\c -> case c of { LBI.CTest{} -> True; _ -> False })
+      let extraArgs'
+            | null extraArgs = case names of
+              ComponentNamesUnknown -> []
+              ComponentNames names' -> [ Make.unUnqualComponentName name
+                                      | LBI.CTestName name <- names' ]
+            | otherwise      = extraArgs
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      build verbosity config distPref buildFlags' extraArgs'
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        build config distPref buildFlags' extraArgs'
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      setupWrapper verbosity setupOptions Nothing
-      Cabal.testCommand (const testFlags') extraArgs'
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        setupWrapper setupOptions Nothing
+        Cabal.testCommand (\_ _ -> testFlags') extraArgs'
 
 data ComponentNames = ComponentNamesUnknown
                     | ComponentNames [LBI.ComponentName]
 
 -- | Return the names of all buildable components matching a given predicate.
-componentNamesFromLBI :: Verbosity -> FilePath -> String
+componentNamesFromLBI :: FilePath -> String
                          -> (LBI.Component -> Bool)
-                         -> IO ComponentNames
-componentNamesFromLBI verbosity distPref targetsDescr compPred = do
-  eLBI <- tryGetPersistBuildConfig distPref
+                         -> CabalM ComponentNames
+componentNamesFromLBI distPref targetsDescr compPred = do
+  eLBI <- liftIO $ tryGetPersistBuildConfig distPref
   case eLBI of
     Left err -> case err of
       -- Note: the build config could have been generated by a custom setup
       -- script built against a different Cabal version, so it's crucial that
       -- we ignore the bad version error here.
       ConfigStateFileBadVersion _ _ _ -> return ComponentNamesUnknown
-      _                               -> die' verbosity (show err)
+      _                               -> die' (show err)
     Right lbi -> do
       let pkgDescr = LBI.localPkgDescr lbi
           names    = map LBI.componentName
@@ -704,9 +712,9 @@ componentNamesFromLBI verbosity distPref targetsDescr compPred = do
                      . filter compPred $
                      LBI.pkgComponents pkgDescr
       if null names
-        then do notice verbosity $ "Package has no buildable "
+        then do notice $ "Package has no buildable "
                   ++ targetsDescr ++ "."
-                exitSuccess -- See #3215.
+                liftIO exitSuccess -- See #3215.
 
         else return $! (ComponentNames names)
 
@@ -715,454 +723,474 @@ benchmarkAction :: (BenchmarkFlags, BuildFlags, BuildExFlags)
                    -> IO ()
 benchmarkAction
   (benchmarkFlags, buildFlags, buildExFlags)
-  extraArgs globalFlags = do
+  extraArgs globalFlags =
   let verbosity      = fromFlagOrDefault normal
                        (benchmarkVerbosity benchmarkFlags)
+  in flip runCabalM verbosity $ do
 
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (benchmarkDistPref benchmarkFlags)
-  let buildFlags'    = buildFlags
-                      { buildVerbosity = benchmarkVerbosity benchmarkFlags }
-      noAddSource   = fromFlagOrDefault DontSkipAddSourceDepsCheck
-                      (buildOnly buildExFlags)
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (benchmarkDistPref benchmarkFlags)
+    let buildFlags' = buildFlags
+                        { buildVerbosity = benchmarkVerbosity benchmarkFlags }
+        noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
+                        (buildOnly buildExFlags)
 
-  let checkFlags = Check $ \_ flags@(configFlags, configExFlags) ->
-        if fromFlagOrDefault False (configBenchmarks configFlags)
-          then pure (mempty, flags)
-          else do
-            info verbosity "reconfiguring to enable benchmarks"
-            let flags' = ( configFlags { configBenchmarks = toFlag True }
-                        , configExFlags
-                        )
-            pure (Any True, flags')
+    let checkFlags = Check $ \_ flags@(configFlags, configExFlags) ->
+          if fromFlagOrDefault False (configBenchmarks configFlags)
+            then pure (mempty, flags)
+            else do
+              info "reconfiguring to enable benchmarks"
+              let flags' = ( configFlags { configBenchmarks = toFlag True }
+                          , configExFlags
+                          )
+              pure (Any True, flags')
 
 
-  -- reconfigure also checks if we're in a sandbox and reinstalls add-source
-  -- deps if needed.
-  config' <-
-    reconfigure configureAction
-    verbosity distPref useSandbox noAddSource (buildNumJobs buildFlags')
-    checkFlags [] globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    let setupOptions   = defaultSetupScriptOptions { useDistPref = distPref }
-        benchmarkFlags'= benchmarkFlags { benchmarkDistPref = toFlag distPref }
+    -- reconfigure also checks if we're in a sandbox and reinstalls add-source
+    -- deps if needed.
+    config' <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox noAddSource (buildNumJobs buildFlags')
+      checkFlags [] globalFlags config
+    nixShell distPref globalFlags config $ do
+      let setupOptions      = defaultSetupScriptOptions { useDistPref = distPref }
+          benchmarkFlags' _ = benchmarkFlags { benchmarkDistPref = toFlag distPref }
 
-    -- The package was just configured, so the LBI must be available.
-    names <- componentNamesFromLBI verbosity distPref "benchmarks"
-            (\c -> case c of { LBI.CBench{} -> True; _ -> False; })
-    let extraArgs'
-          | null extraArgs = case names of
-            ComponentNamesUnknown -> []
-            ComponentNames names' -> [ Make.unUnqualComponentName name
-                                    | LBI.CBenchName name <- names']
-          | otherwise      = extraArgs
+      -- The package was just configured, so the LBI must be available.
+      names <- componentNamesFromLBI distPref "benchmarks"
+              (\c -> case c of { LBI.CBench{} -> True; _ -> False; })
+      let extraArgs'
+            | null extraArgs = case names of
+              ComponentNamesUnknown -> []
+              ComponentNames names' -> [ Make.unUnqualComponentName name
+                                      | LBI.CBenchName name <- names']
+            | otherwise      = extraArgs
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      build verbosity config' distPref buildFlags' extraArgs'
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        build config' distPref buildFlags' extraArgs'
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      setupWrapper verbosity setupOptions Nothing
-      Cabal.benchmarkCommand (const benchmarkFlags') extraArgs'
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        setupWrapper setupOptions Nothing
+        Cabal.benchmarkCommand (const benchmarkFlags') extraArgs'
 
 haddockAction :: HaddockFlags -> [String] -> Action
-haddockAction haddockFlags extraArgs globalFlags = do
+haddockAction haddockFlags extraArgs globalFlags =
   let verbosity = fromFlag (haddockVerbosity haddockFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (haddockDistPref haddockFlags)
-  config' <-
-    reconfigure configureAction
-    verbosity distPref useSandbox DontSkipAddSourceDepsCheck NoFlag
-    mempty [] globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    let haddockFlags' = defaultHaddockFlags      `mappend`
-                        savedHaddockFlags config' `mappend`
-                        haddockFlags { haddockDistPref = toFlag distPref }
-        setupScriptOptions = defaultSetupScriptOptions
-                             { useDistPref = distPref }
-    setupWrapper verbosity setupScriptOptions Nothing
-      haddockCommand (const haddockFlags') extraArgs
-    when (haddockForHackage haddockFlags == Flag ForHackage) $ do
-      pkg <- fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
-      let dest = distPref </> name <.> "tar.gz"
-          name = display (packageId pkg) ++ "-docs"
-          docDir = distPref </> "doc" </> "html"
-      createTarGzFile dest docDir name
-      notice verbosity $ "Documentation tarball created: " ++ dest
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (haddockDistPref haddockFlags)
+    config' <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox DontSkipAddSourceDepsCheck NoFlag
+      mempty [] globalFlags config
+    nixShell distPref globalFlags config $ do
+      let haddockFlags' _ = defaultHaddockFlags      `mappend`
+                            savedHaddockFlags config' `mappend`
+                            haddockFlags { haddockDistPref = toFlag distPref }
+          setupScriptOptions = defaultSetupScriptOptions
+                              { useDistPref = distPref }
+      setupWrapper setupScriptOptions Nothing
+        haddockCommand (const haddockFlags') extraArgs
+      when (haddockForHackage haddockFlags == Flag ForHackage) $ do
+        pkg <- liftIO $ fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
+        let dest = distPref </> name <.> "tar.gz"
+            name = display (packageId pkg) ++ "-docs"
+            docDir = distPref </> "doc" </> "html"
+        liftIO $ createTarGzFile dest docDir name
+        notice $ "Documentation tarball created: " ++ dest
 
 doctestAction :: DoctestFlags -> [String] -> Action
-doctestAction doctestFlags extraArgs _globalFlags = do
+doctestAction doctestFlags extraArgs _globalFlags =
   let verbosity = fromFlag (doctestVerbosity doctestFlags)
-
-  setupWrapper verbosity defaultSetupScriptOptions Nothing
-    doctestCommand (const doctestFlags) extraArgs
+  in flip runCabalM verbosity $
+    setupWrapper defaultSetupScriptOptions Nothing
+      doctestCommand (\_ _ -> doctestFlags) extraArgs
 
 cleanAction :: CleanFlags -> [String] -> Action
-cleanAction cleanFlags extraArgs globalFlags = do
-  load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
-  let config = either (\(SomeException _) -> mempty) snd load
-  distPref <- findSavedDistPref config (cleanDistPref cleanFlags)
-  let setupScriptOptions = defaultSetupScriptOptions
-                           { useDistPref = distPref
-                           , useWin32CleanHack = True
-                           }
-      cleanFlags' = cleanFlags { cleanDistPref = toFlag distPref }
-  setupWrapper verbosity setupScriptOptions Nothing
-               cleanCommand (const cleanFlags') extraArgs
-  where
-    verbosity = fromFlagOrDefault normal (cleanVerbosity cleanFlags)
+cleanAction cleanFlags extraArgs globalFlags =
+  let verbosity = fromFlagOrDefault normal (cleanVerbosity cleanFlags)
+  in flip runCabalM verbosity $ do
+    load <- runCabalMInIO $ \liftC -> try (liftC $ loadConfigOrSandboxConfig globalFlags)
+    let config = either (\(SomeException _) -> mempty) snd load
+    distPref <- liftIO $ findSavedDistPref config (cleanDistPref cleanFlags)
+    let setupScriptOptions = defaultSetupScriptOptions
+                            { useDistPref = distPref
+                            , useWin32CleanHack = True
+                            }
+        cleanFlags' = cleanFlags { cleanDistPref = toFlag distPref }
+    setupWrapper setupScriptOptions Nothing
+                cleanCommand (\_ _ -> cleanFlags') extraArgs
 
 listAction :: ListFlags -> [String] -> Action
-listAction listFlags extraArgs globalFlags = do
+listAction listFlags extraArgs globalFlags =
   let verbosity = fromFlag (listVerbosity listFlags)
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity
-                           (globalFlags { globalRequireSandbox = Flag False })
-  let configFlags' = savedConfigureFlags config
-      configFlags  = configFlags' {
-        configPackageDBs = configPackageDBs configFlags'
-                           `mappend` listPackageDBs listFlags
-        }
-      globalFlags' = savedGlobalFlags    config `mappend` globalFlags
-  (comp, _, progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    List.list verbosity
-       (configPackageDB' configFlags)
-       repoContext
-       comp
-       progdb
-       listFlags
-       extraArgs
+  in flip runCabalM verbosity $ do
+    (_useSandbox, config) <- loadConfigOrSandboxConfig
+                            (globalFlags { globalRequireSandbox = Flag False })
+    let configFlags' = savedConfigureFlags config
+        configFlags  = configFlags' {
+          configPackageDBs = configPackageDBs configFlags'
+                            `mappend` listPackageDBs listFlags
+          }
+        globalFlags' = savedGlobalFlags    config `mappend` globalFlags
+    (comp, _, progdb) <- liftIO $ configCompilerAux' configFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      List.list
+        (configPackageDB' configFlags)
+        repoContext
+        comp
+        progdb
+        listFlags
+        extraArgs
 
 infoAction :: InfoFlags -> [String] -> Action
-infoAction infoFlags extraArgs globalFlags = do
+infoAction infoFlags extraArgs globalFlags =
   let verbosity = fromFlag (infoVerbosity infoFlags)
-  targets <- readUserTargets verbosity extraArgs
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity
-                           (globalFlags { globalRequireSandbox = Flag False })
-  let configFlags' = savedConfigureFlags config
-      configFlags  = configFlags' {
-        configPackageDBs = configPackageDBs configFlags'
-                           `mappend` infoPackageDBs infoFlags
-        }
-      globalFlags' = savedGlobalFlags    config `mappend` globalFlags
-  (comp, _, progdb) <- configCompilerAuxEx configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    List.info verbosity
-       (configPackageDB' configFlags)
-       repoContext
-       comp
-       progdb
-       globalFlags'
-       infoFlags
-       targets
+  in flip runCabalM verbosity $ do
+    targets <- readUserTargets extraArgs
+    (_useSandbox, config) <- loadConfigOrSandboxConfig
+                            (globalFlags { globalRequireSandbox = Flag False })
+    let configFlags' = savedConfigureFlags config
+        configFlags  = configFlags' {
+          configPackageDBs = configPackageDBs configFlags'
+                            `mappend` infoPackageDBs infoFlags
+          }
+        globalFlags' = savedGlobalFlags    config `mappend` globalFlags
+    (comp, _, progdb) <- liftIO $ configCompilerAuxEx configFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      List.info
+        (configPackageDB' configFlags)
+        repoContext
+        comp
+        progdb
+        globalFlags'
+        infoFlags
+        targets
 
 updateAction :: UpdateFlags -> [String] -> Action
-updateAction updateFlags extraArgs globalFlags = do
+updateAction updateFlags extraArgs globalFlags =
   let verbosity = fromFlag (updateVerbosity updateFlags)
-  unless (null extraArgs) $
-    die' verbosity $ "'update' doesn't take any extra arguments: " ++ unwords extraArgs
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity
-                           (globalFlags { globalRequireSandbox = Flag False })
-  let globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    update verbosity updateFlags repoContext
+  in flip runCabalM verbosity $ do
+    unless (null extraArgs) $
+      die' $ "'update' doesn't take any extra arguments: " ++ unwords extraArgs
+    (_useSandbox, config) <- loadConfigOrSandboxConfig
+                            (globalFlags { globalRequireSandbox = Flag False })
+    let globalFlags' = savedGlobalFlags config `mappend` globalFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      update updateFlags repoContext
 
 upgradeAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
               -> [String] -> Action
-upgradeAction (configFlags, _, _, _) _ _ = die' verbosity $
-    "Use the 'cabal install' command instead of 'cabal upgrade'.\n"
- ++ "You can install the latest version of a package using 'cabal install'. "
- ++ "The 'cabal upgrade' command has been removed because people found it "
- ++ "confusing and it often led to broken packages.\n"
- ++ "If you want the old upgrade behaviour then use the install command "
- ++ "with the --upgrade-dependencies flag (but check first with --dry-run "
- ++ "to see what would happen). This will try to pick the latest versions "
- ++ "of all dependencies, rather than the usual behaviour of trying to pick "
- ++ "installed versions of all dependencies. If you do use "
- ++ "--upgrade-dependencies, it is recommended that you do not upgrade core "
- ++ "packages (e.g. by using appropriate --constraint= flags)."
- where
-  verbosity = fromFlag (configVerbosity configFlags)
+upgradeAction (configFlags, _, _, _) _ _ =
+  let verbosity = fromFlag (configVerbosity configFlags)
+  in flip runCabalM verbosity . die' $
+      "Use the 'cabal install' command instead of 'cabal upgrade'.\n"
+  ++ "You can install the latest version of a package using 'cabal install'. "
+  ++ "The 'cabal upgrade' command has been removed because people found it "
+  ++ "confusing and it often led to broken packages.\n"
+  ++ "If you want the old upgrade behaviour then use the install command "
+  ++ "with the --upgrade-dependencies flag (but check first with --dry-run "
+  ++ "to see what would happen). This will try to pick the latest versions "
+  ++ "of all dependencies, rather than the usual behaviour of trying to pick "
+  ++ "installed versions of all dependencies. If you do use "
+  ++ "--upgrade-dependencies, it is recommended that you do not upgrade core "
+  ++ "packages (e.g. by using appropriate --constraint= flags)."
 
 fetchAction :: FetchFlags -> [String] -> Action
-fetchAction fetchFlags extraArgs globalFlags = do
+fetchAction fetchFlags extraArgs globalFlags =
   let verbosity = fromFlag (fetchVerbosity fetchFlags)
-  targets <- readUserTargets verbosity extraArgs
-  config <- loadConfig verbosity (globalConfigFile globalFlags)
-  let configFlags  = savedConfigureFlags config
-      globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  (comp, platform, progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    fetch verbosity
-        (configPackageDB' configFlags)
-        repoContext
-        comp platform progdb globalFlags' fetchFlags
-        targets
+  in flip runCabalM verbosity $ do
+    targets <- readUserTargets extraArgs
+    config <- loadConfig (globalConfigFile globalFlags)
+    let configFlags  = savedConfigureFlags config
+        globalFlags' = savedGlobalFlags config `mappend` globalFlags
+    (comp, platform, progdb) <- liftIO $ configCompilerAux' configFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      fetch
+          (configPackageDB' configFlags)
+          repoContext
+          comp platform progdb globalFlags' fetchFlags
+          targets
 
 freezeAction :: FreezeFlags -> [String] -> Action
-freezeAction freezeFlags _extraArgs globalFlags = do
+freezeAction freezeFlags _extraArgs globalFlags =
   let verbosity = fromFlag (freezeVerbosity freezeFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config NoFlag
-  nixShell verbosity distPref globalFlags config $ do
-    let configFlags  = savedConfigureFlags config
-        globalFlags' = savedGlobalFlags config `mappend` globalFlags
-    (comp, platform, progdb) <- configCompilerAux' configFlags
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config NoFlag
+    nixShell distPref globalFlags config $ do
+      let configFlags  = savedConfigureFlags config
+          globalFlags' = savedGlobalFlags config `mappend` globalFlags
+      (comp, platform, progdb) <- liftIO $ configCompilerAux' configFlags
 
-    maybeWithSandboxPackageInfo
-      verbosity configFlags globalFlags'
-      comp platform progdb useSandbox $ \mSandboxPkgInfo ->
-        maybeWithSandboxDirOnSearchPath useSandbox $
-        withRepoContext verbosity globalFlags' $ \repoContext ->
-          freeze verbosity
-            (configPackageDB' configFlags)
-            repoContext
-            comp platform progdb
-            mSandboxPkgInfo
-            globalFlags' freezeFlags
+      maybeWithSandboxPackageInfo
+        configFlags globalFlags'
+        comp platform progdb useSandbox $ \mSandboxPkgInfo ->
+          maybeWithSandboxDirOnSearchPath useSandbox $
+          withRepoContext globalFlags' $ \repoContext ->
+            freeze
+              (configPackageDB' configFlags)
+              repoContext
+              comp platform progdb
+              mSandboxPkgInfo
+              globalFlags' freezeFlags
 
 genBoundsAction :: FreezeFlags -> [String] -> GlobalFlags -> IO ()
-genBoundsAction freezeFlags _extraArgs globalFlags = do
+genBoundsAction freezeFlags _extraArgs globalFlags =
   let verbosity = fromFlag (freezeVerbosity freezeFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config NoFlag
-  nixShell verbosity distPref globalFlags config $ do
-    let configFlags  = savedConfigureFlags config
-        globalFlags' = savedGlobalFlags config `mappend` globalFlags
-    (comp, platform, progdb) <- configCompilerAux' configFlags
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config NoFlag
+    nixShell distPref globalFlags config $ do
+      let configFlags  = savedConfigureFlags config
+          globalFlags' = savedGlobalFlags config `mappend` globalFlags
+      (comp, platform, progdb) <- liftIO $ configCompilerAux' configFlags
 
-    maybeWithSandboxPackageInfo
-      verbosity configFlags globalFlags'
-      comp platform progdb useSandbox $ \mSandboxPkgInfo ->
-        maybeWithSandboxDirOnSearchPath useSandbox $
-        withRepoContext verbosity globalFlags' $ \repoContext ->
-          genBounds verbosity
-                (configPackageDB' configFlags)
-                repoContext
-                comp platform progdb
-                mSandboxPkgInfo
-                globalFlags' freezeFlags
+      maybeWithSandboxPackageInfo
+        configFlags globalFlags'
+        comp platform progdb useSandbox $ \mSandboxPkgInfo ->
+          maybeWithSandboxDirOnSearchPath useSandbox $
+          withRepoContext globalFlags' $ \repoContext ->
+            genBounds
+                  (configPackageDB' configFlags)
+                  repoContext
+                  comp platform progdb
+                  mSandboxPkgInfo
+                  globalFlags' freezeFlags
 
 outdatedAction :: OutdatedFlags -> [String] -> GlobalFlags -> IO ()
-outdatedAction outdatedFlags _extraArgs globalFlags = do
+outdatedAction outdatedFlags _extraArgs globalFlags =
   let verbosity = fromFlag (outdatedVerbosity outdatedFlags)
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  let configFlags  = savedConfigureFlags config
-      globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  (comp, platform, _progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    outdated verbosity outdatedFlags repoContext
-             comp platform
+  in flip runCabalM verbosity $ do
+    (_useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    let configFlags  = savedConfigureFlags config
+        globalFlags' = savedGlobalFlags config `mappend` globalFlags
+    (comp, platform, _progdb) <- liftIO $ configCompilerAux' configFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      outdated outdatedFlags repoContext
+              comp platform
 
 uploadAction :: UploadFlags -> [String] -> Action
-uploadAction uploadFlags extraArgs globalFlags = do
-  config <- loadConfig verbosity (globalConfigFile globalFlags)
-  let uploadFlags' = savedUploadFlags config `mappend` uploadFlags
-      globalFlags' = savedGlobalFlags config `mappend` globalFlags
-      tarfiles     = extraArgs
-  when (null tarfiles && not (fromFlag (uploadDoc uploadFlags'))) $
-    die' verbosity "the 'upload' command expects at least one .tar.gz archive."
-  checkTarFiles extraArgs
-  maybe_password <-
-    case uploadPasswordCmd uploadFlags'
-    of Flag (xs:xss) -> Just . Password <$>
-                        getProgramInvocationOutput verbosity
-                        (simpleProgramInvocation xs xss)
-       _             -> pure $ flagToMaybe $ uploadPassword uploadFlags'
-  withRepoContext verbosity globalFlags' $ \repoContext -> do
-    if fromFlag (uploadDoc uploadFlags')
-    then do
-      when (length tarfiles > 1) $
-       die' verbosity $ "the 'upload' command can only upload documentation "
-             ++ "for one package at a time."
-      tarfile <- maybe (generateDocTarball config) return $ listToMaybe tarfiles
-      Upload.uploadDoc verbosity
-                       repoContext
-                       (flagToMaybe $ uploadUsername uploadFlags')
-                       maybe_password
-                       (fromFlag (uploadCandidate uploadFlags'))
-                       tarfile
-    else do
-      Upload.upload verbosity
-                    repoContext
-                    (flagToMaybe $ uploadUsername uploadFlags')
-                    maybe_password
-                    (fromFlag (uploadCandidate uploadFlags'))
-                    tarfiles
-    where
-    verbosity = fromFlag (uploadVerbosity uploadFlags)
-    checkTarFiles tarfiles
-      | not (null otherFiles)
-      = die' verbosity $ "the 'upload' command expects only .tar.gz archives: "
-           ++ intercalate ", " otherFiles
-      | otherwise = sequence_
-                      [ do exists <- doesFileExist tarfile
-                           unless exists $ die' verbosity $ "file not found: " ++ tarfile
-                      | tarfile <- tarfiles ]
+uploadAction uploadFlags extraArgs globalFlags =
+  let verbosity = fromFlag (uploadVerbosity uploadFlags)
+  in flip runCabalM verbosity $ do
+    config <- loadConfig (globalConfigFile globalFlags)
+    let uploadFlags' = savedUploadFlags config `mappend` uploadFlags
+        globalFlags' = savedGlobalFlags config `mappend` globalFlags
+        tarfiles     = extraArgs
+    when (null tarfiles && not (fromFlag (uploadDoc uploadFlags'))) $
+      die' "the 'upload' command expects at least one .tar.gz archive."
+    checkTarFiles extraArgs
+    maybe_password <-
+      case uploadPasswordCmd uploadFlags'
+      of Flag (xs:xss) -> Just . Password <$>
+                          getProgramInvocationOutput
+                          (simpleProgramInvocation xs xss)
+         _             -> pure $ flagToMaybe $ uploadPassword uploadFlags'
+    withRepoContext globalFlags' $ \repoContext -> do
+      if fromFlag (uploadDoc uploadFlags')
+      then do
+        when (length tarfiles > 1) $
+          die' $ "the 'upload' command can only upload documentation "
+              ++ "for one package at a time."
+        tarfile <- maybe (generateDocTarball config) return $ listToMaybe tarfiles
+        Upload.uploadDoc
+                        repoContext
+                        (flagToMaybe $ uploadUsername uploadFlags')
+                        maybe_password
+                        (fromFlag (uploadCandidate uploadFlags'))
+                        tarfile
+      else do
+        Upload.upload
+                      repoContext
+                      (flagToMaybe $ uploadUsername uploadFlags')
+                      maybe_password
+                      (fromFlag (uploadCandidate uploadFlags'))
+                      tarfiles
+      where
+      checkTarFiles tarfiles
+        | not (null otherFiles)
+        = die' $ "the 'upload' command expects only .tar.gz archives: "
+            ++ intercalate ", " otherFiles
+        | otherwise = sequence_
+                        [ do exists <- liftIO $ doesFileExist tarfile
+                             unless exists $ die' $ "file not found: " ++ tarfile
+                        | tarfile <- tarfiles ]
 
-      where otherFiles = filter (not . isTarGzFile) tarfiles
-            isTarGzFile file = case splitExtension file of
-              (file', ".gz") -> takeExtension file' == ".tar"
-              _              -> False
-    generateDocTarball config = do
-      notice verbosity $
-        "No documentation tarball specified. "
-        ++ "Building a documentation tarball with default settings...\n"
-        ++ "If you need to customise Haddock options, "
-        ++ "run 'haddock --for-hackage' first "
-        ++ "to generate a documentation tarball."
-      haddockAction (defaultHaddockFlags { haddockForHackage = Flag ForHackage })
-                    [] globalFlags
-      distPref <- findSavedDistPref config NoFlag
-      pkg <- fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
-      return $ distPref </> display (packageId pkg) ++ "-docs" <.> "tar.gz"
+        where otherFiles = filter (not . isTarGzFile) tarfiles
+              isTarGzFile file = case splitExtension file of
+                (file', ".gz") -> takeExtension file' == ".tar"
+                _              -> False
+      generateDocTarball config = do
+        notice $
+          "No documentation tarball specified. "
+          ++ "Building a documentation tarball with default settings...\n"
+          ++ "If you need to customise Haddock options, "
+          ++ "run 'haddock --for-hackage' first "
+          ++ "to generate a documentation tarball."
+        liftIO $ do
+          haddockAction (defaultHaddockFlags { haddockForHackage = Flag ForHackage })
+                        [] globalFlags
+          distPref <- findSavedDistPref config NoFlag
+          pkg <- fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
+          return $ distPref </> display (packageId pkg) ++ "-docs" <.> "tar.gz"
 
 checkAction :: Flag Verbosity -> [String] -> Action
-checkAction verbosityFlag extraArgs _globalFlags = do
+checkAction verbosityFlag extraArgs _globalFlags =
   let verbosity = fromFlag verbosityFlag
+  in flip runCabalM verbosity $ do
   unless (null extraArgs) $
-    die' verbosity $ "'check' doesn't take any extra arguments: " ++ unwords extraArgs
-  allOk <- Check.check (fromFlag verbosityFlag)
-  unless allOk exitFailure
+    die' $ "'check' doesn't take any extra arguments: " ++ unwords extraArgs
+  allOk <- Check.check
+  unless allOk $
+    liftIO exitFailure
 
 formatAction :: Flag Verbosity -> [String] -> Action
-formatAction verbosityFlag extraArgs _globalFlags = do
+formatAction verbosityFlag extraArgs _globalFlags =
   let verbosity = fromFlag verbosityFlag
-  path <- case extraArgs of
-    [] -> do cwd <- getCurrentDirectory
-             tryFindPackageDesc cwd
-    (p:_) -> return p
-  pkgDesc <- readGenericPackageDescription verbosity path
-  -- Uses 'writeFileAtomic' under the hood.
-  writeGenericPackageDescription path pkgDesc
+  in flip runCabalM verbosity $ do
+    path <- liftIO $ case extraArgs of
+      [] -> do cwd <- getCurrentDirectory
+               tryFindPackageDesc cwd
+      (p:_) -> return p
+    pkgDesc <- readGenericPackageDescription path
+    -- Uses 'writeFileAtomic' under the hood.
+    liftIO $ writeGenericPackageDescription path pkgDesc
 
 uninstallAction :: Flag Verbosity -> [String] -> Action
-uninstallAction verbosityFlag extraArgs _globalFlags = do
+uninstallAction verbosityFlag extraArgs _globalFlags =
   let verbosity = fromFlag verbosityFlag
       package = case extraArgs of
         p:_ -> p
         _   -> "PACKAGE_NAME"
-  die' verbosity $ "This version of 'cabal-install' does not support the 'uninstall' "
-    ++ "operation. "
-    ++ "It will likely be implemented at some point in the future; "
-    ++ "in the meantime you're advised to use either 'ghc-pkg unregister "
-    ++ package ++ "' or 'cabal sandbox hc-pkg -- unregister " ++ package ++ "'."
+  in flip runCabalM verbosity $ do
+    die' $ "This version of 'cabal-install' does not support the 'uninstall' "
+      ++ "operation. "
+      ++ "It will likely be implemented at some point in the future; "
+      ++ "in the meantime you're advised to use either 'ghc-pkg unregister "
+      ++ package ++ "' or 'cabal sandbox hc-pkg -- unregister " ++ package ++ "'."
 
 
 sdistAction :: (SDistFlags, SDistExFlags) -> [String] -> Action
-sdistAction (sdistFlags, sdistExFlags) extraArgs globalFlags = do
+sdistAction (sdistFlags, sdistExFlags) extraArgs globalFlags =
   let verbosity = fromFlag (sDistVerbosity sdistFlags)
-  unless (null extraArgs) $
-    die' verbosity $ "'sdist' doesn't take any extra arguments: " ++ unwords extraArgs
-  load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
-  let config = either (\(SomeException _) -> mempty) snd load
-  distPref <- findSavedDistPref config (sDistDistPref sdistFlags)
-  let sdistFlags' = sdistFlags { sDistDistPref = toFlag distPref }
-  sdist sdistFlags' sdistExFlags
+  in flip runCabalM verbosity $ do
+    unless (null extraArgs) $
+      die' $ "'sdist' doesn't take any extra arguments: " ++ unwords extraArgs
+    load <- runCabalMInIO $ \liftC -> try (liftC $ loadConfigOrSandboxConfig globalFlags)
+    let config = either (\(SomeException _) -> mempty) snd load
+    distPref <- liftIO $ findSavedDistPref config (sDistDistPref sdistFlags)
+    let sdistFlags' = sdistFlags { sDistDistPref = toFlag distPref }
+    liftIO $ sdist sdistFlags' sdistExFlags
 
 reportAction :: ReportFlags -> [String] -> Action
-reportAction reportFlags extraArgs globalFlags = do
+reportAction reportFlags extraArgs globalFlags =
   let verbosity = fromFlag (reportVerbosity reportFlags)
-  unless (null extraArgs) $
-    die' verbosity $ "'report' doesn't take any extra arguments: " ++ unwords extraArgs
-  config <- loadConfig verbosity (globalConfigFile globalFlags)
-  let globalFlags' = savedGlobalFlags config `mappend` globalFlags
-      reportFlags' = savedReportFlags config `mappend` reportFlags
+  in flip runCabalM verbosity $ do
+    unless (null extraArgs) $
+      die' $ "'report' doesn't take any extra arguments: " ++ unwords extraArgs
+    config <- loadConfig (globalConfigFile globalFlags)
+    let globalFlags' = savedGlobalFlags config `mappend` globalFlags
+        reportFlags' = savedReportFlags config `mappend` reportFlags
 
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-   Upload.report verbosity repoContext
-    (flagToMaybe $ reportUsername reportFlags')
-    (flagToMaybe $ reportPassword reportFlags')
+    withRepoContext globalFlags' $ \repoContext ->
+      Upload.report repoContext
+        (flagToMaybe $ reportUsername reportFlags')
+        (flagToMaybe $ reportPassword reportFlags')
 
 runAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-runAction (buildFlags, buildExFlags) extraArgs globalFlags = do
+runAction (buildFlags, buildExFlags) extraArgs globalFlags =
   let verbosity   = fromFlagOrDefault normal (buildVerbosity buildFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (buildDistPref buildFlags)
-  let noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
-                    (buildOnly buildExFlags)
-  -- reconfigure also checks if we're in a sandbox and reinstalls add-source
-  -- deps if needed.
-  config' <-
-    reconfigure configureAction
-    verbosity distPref useSandbox noAddSource (buildNumJobs buildFlags)
-    mempty [] globalFlags config
-  nixShell verbosity distPref globalFlags config $ do
-    lbi <- getPersistBuildConfig distPref
-    (exe, exeArgs) <- splitRunArgs verbosity lbi extraArgs
+  in flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (buildDistPref buildFlags)
+    let noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
+                      (buildOnly buildExFlags)
+    -- reconfigure also checks if we're in a sandbox and reinstalls add-source
+    -- deps if needed.
+    config' <-
+      reconfigure (\x y -> liftIO . configureAction x y)
+      distPref useSandbox noAddSource (buildNumJobs buildFlags)
+      mempty [] globalFlags config
+    nixShell distPref globalFlags config $ do
+      lbi <- liftIO $ getPersistBuildConfig distPref
+      (exe, exeArgs) <- splitRunArgs lbi extraArgs
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      build verbosity config' distPref buildFlags ["exe:" ++ display (exeName exe)]
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        build config' distPref buildFlags ["exe:" ++ display (exeName exe)]
 
-    maybeWithSandboxDirOnSearchPath useSandbox $
-      run verbosity lbi exe exeArgs
+      maybeWithSandboxDirOnSearchPath useSandbox $
+        run lbi exe exeArgs
 
 getAction :: GetFlags -> [String] -> Action
-getAction getFlags extraArgs globalFlags = do
+getAction getFlags extraArgs globalFlags =
   let verbosity = fromFlag (getVerbosity getFlags)
-  targets <- readUserTargets verbosity extraArgs
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity
-                           (globalFlags { globalRequireSandbox = Flag False })
-  let globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  withRepoContext verbosity (savedGlobalFlags config) $ \repoContext ->
-   get verbosity
-    repoContext
-    globalFlags'
-    getFlags
-    targets
+  in flip runCabalM verbosity $ do
+    targets <- readUserTargets extraArgs
+    (_useSandbox, config) <- loadConfigOrSandboxConfig
+                            (globalFlags { globalRequireSandbox = Flag False })
+    let globalFlags' = savedGlobalFlags config `mappend` globalFlags
+    withRepoContext (savedGlobalFlags config) $ \repoContext ->
+      get
+        repoContext
+        globalFlags'
+        getFlags
+        targets
 
 unpackAction :: GetFlags -> [String] -> Action
 unpackAction getFlags extraArgs globalFlags = do
   getAction getFlags extraArgs globalFlags
 
 initAction :: InitFlags -> [String] -> Action
-initAction initFlags extraArgs globalFlags = do
+initAction initFlags extraArgs globalFlags =
   let verbosity = fromFlag (initVerbosity initFlags)
-  when (extraArgs /= []) $
-    die' verbosity $ "'init' doesn't take any extra arguments: " ++ unwords extraArgs
-  (_useSandbox, config) <- loadConfigOrSandboxConfig verbosity
-                           (globalFlags { globalRequireSandbox = Flag False })
-  let configFlags  = savedConfigureFlags config
-  let globalFlags' = savedGlobalFlags    config `mappend` globalFlags
-  (comp, _, progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    initCabal verbosity
-            (configPackageDB' configFlags)
-            repoContext
-            comp
-            progdb
-            initFlags
+  in flip runCabalM verbosity $ do
+    when (extraArgs /= []) $
+      die' $ "'init' doesn't take any extra arguments: " ++ unwords extraArgs
+    (_useSandbox, config) <- loadConfigOrSandboxConfig
+                            (globalFlags { globalRequireSandbox = Flag False })
+    let configFlags  = savedConfigureFlags config
+    let globalFlags' = savedGlobalFlags    config `mappend` globalFlags
+    (comp, _, progdb) <- liftIO $ configCompilerAux' configFlags
+    withRepoContext globalFlags' $ \repoContext ->
+      initCabal (configPackageDB' configFlags)
+                repoContext
+                comp
+                progdb
+                initFlags
 
 sandboxAction :: SandboxFlags -> [String] -> Action
-sandboxAction sandboxFlags extraArgs globalFlags = do
+sandboxAction sandboxFlags extraArgs globalFlags =
   let verbosity = fromFlag (sandboxVerbosity sandboxFlags)
-  case extraArgs of
-    -- Basic sandbox commands.
-    ["init"] -> sandboxInit verbosity sandboxFlags globalFlags
-    ["delete"] -> sandboxDelete verbosity sandboxFlags globalFlags
-    ("add-source":extra) -> do
-        when (noExtraArgs extra) $
-          die' verbosity "The 'sandbox add-source' command expects at least one argument"
-        sandboxAddSource verbosity extra sandboxFlags globalFlags
-    ("delete-source":extra) -> do
-        when (noExtraArgs extra) $
-          die' verbosity ("The 'sandbox delete-source' command expects " ++
-              "at least one argument")
-        sandboxDeleteSource verbosity extra sandboxFlags globalFlags
-    ["list-sources"] -> sandboxListSources verbosity sandboxFlags globalFlags
+  in flip runCabalM verbosity $ do
+    case extraArgs of
+      -- Basic sandbox commands.
+      ["init"] -> sandboxInit sandboxFlags globalFlags
+      ["delete"] -> sandboxDelete sandboxFlags globalFlags
+      ("add-source":extra) -> do
+          when (noExtraArgs extra) $
+            die' "The 'sandbox add-source' command expects at least one argument"
+          sandboxAddSource extra sandboxFlags globalFlags
+      ("delete-source":extra) -> do
+          when (noExtraArgs extra) $
+            die' ("The 'sandbox delete-source' command expects " ++
+                "at least one argument")
+          sandboxDeleteSource extra sandboxFlags globalFlags
+      ["list-sources"] -> sandboxListSources sandboxFlags globalFlags
 
-    -- More advanced commands.
-    ("hc-pkg":extra) -> do
-        when (noExtraArgs extra) $
-            die' verbosity $ "The 'sandbox hc-pkg' command expects at least one argument"
-        sandboxHcPkg verbosity sandboxFlags globalFlags extra
-    ["buildopts"] -> die' verbosity "Not implemented!"
+      -- More advanced commands.
+      ("hc-pkg":extra) -> do
+          when (noExtraArgs extra) $
+              die' $ "The 'sandbox hc-pkg' command expects at least one argument"
+          sandboxHcPkg sandboxFlags globalFlags extra
+      ["buildopts"] -> die' "Not implemented!"
 
-    -- Hidden commands.
-    ["dump-pkgenv"]  -> dumpPackageEnvironment verbosity sandboxFlags globalFlags
+      -- Hidden commands.
+      ["dump-pkgenv"]  -> dumpPackageEnvironment sandboxFlags globalFlags
 
-    -- Error handling.
-    [] -> die' verbosity $ "Please specify a subcommand (see 'help sandbox')"
-    _  -> die' verbosity $ "Unknown 'sandbox' subcommand: " ++ unwords extraArgs
+      -- Error handling.
+      [] -> die' $ "Please specify a subcommand (see 'help sandbox')"
+      _  -> die' $ "Unknown 'sandbox' subcommand: " ++ unwords extraArgs
 
   where
     noExtraArgs = (<1) . length
@@ -1170,38 +1198,40 @@ sandboxAction sandboxFlags extraArgs globalFlags = do
 execAction :: ExecFlags -> [String] -> Action
 execAction execFlags extraArgs globalFlags = do
   let verbosity = fromFlag (execVerbosity execFlags)
-  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (execDistPref execFlags)
-  let configFlags = savedConfigureFlags config
-      configFlags' = configFlags { configDistPref = Flag distPref }
-  (comp, platform, progdb) <- getPersistOrConfigCompiler configFlags'
-  exec verbosity useSandbox comp platform progdb extraArgs
+  flip runCabalM verbosity $ do
+    (useSandbox, config) <- loadConfigOrSandboxConfig globalFlags
+    distPref <- liftIO $ findSavedDistPref config (execDistPref execFlags)
+    let configFlags = savedConfigureFlags config
+        configFlags' = configFlags { configDistPref = Flag distPref }
+    (comp, platform, progdb) <- liftIO $ getPersistOrConfigCompiler configFlags'
+    exec useSandbox comp platform progdb extraArgs
 
 userConfigAction :: UserConfigFlags -> [String] -> Action
 userConfigAction ucflags extraArgs globalFlags = do
   let verbosity  = fromFlag (userConfigVerbosity ucflags)
       force      = fromFlag (userConfigForce ucflags)
       extraLines = fromFlag (userConfigAppendLines ucflags)
-  case extraArgs of
-    ("init":_) -> do
-      path       <- configFile
-      fileExists <- doesFileExist path
-      if (not fileExists || (fileExists && force))
-      then void $ createDefaultConfigFile verbosity extraLines path
-      else die' verbosity $ path ++ " already exists."
-    ("diff":_) -> mapM_ putStrLn =<< userConfigDiff verbosity globalFlags extraLines
-    ("update":_) -> userConfigUpdate verbosity globalFlags extraLines
-    -- Error handling.
-    [] -> die' verbosity $ "Please specify a subcommand (see 'help user-config')"
-    _  -> die' verbosity $ "Unknown 'user-config' subcommand: " ++ unwords extraArgs
+  flip runCabalM verbosity $
+    case extraArgs of
+      ("init":_) -> do
+        path       <- liftIO configFile
+        fileExists <- liftIO $ doesFileExist path
+        if (not fileExists || (fileExists && force))
+        then void $ createDefaultConfigFile extraLines path
+        else die' $ path ++ " already exists."
+      ("diff":_) -> liftIO . mapM_ putStrLn =<< userConfigDiff globalFlags extraLines
+      ("update":_) -> userConfigUpdate globalFlags extraLines
+      -- Error handling.
+      [] -> die' $ "Please specify a subcommand (see 'help user-config')"
+      _  -> die' $ "Unknown 'user-config' subcommand: " ++ unwords extraArgs
   where configFile = getConfigFilePath (globalConfigFile globalFlags)
 
 -- | See 'Distribution.Client.Install.withWin32SelfUpgrade' for details.
 --
 win32SelfUpgradeAction :: Win32SelfUpgradeFlags -> [String] -> Action
-win32SelfUpgradeAction selfUpgradeFlags (pid:path:_extraArgs) _globalFlags = do
+win32SelfUpgradeAction selfUpgradeFlags (pid:path:_extraArgs) _globalFlags =
   let verbosity = fromFlag (win32SelfUpgradeVerbosity selfUpgradeFlags)
-  Win32SelfUpgrade.deleteOldExeFile verbosity (read pid) path -- TODO: eradicateNoParse
+  in flip runCabalM verbosity $ Win32SelfUpgrade.deleteOldExeFile (read pid) path -- TODO: eradicateNoParse
 win32SelfUpgradeAction _ _ _ = return ()
 
 -- | Used as an entry point when cabal-install needs to invoke itself
@@ -1221,7 +1251,7 @@ manpageAction :: [CommandSpec action] -> Flag Verbosity -> [String] -> Action
 manpageAction commands flagVerbosity extraArgs _ = do
   let verbosity = fromFlag flagVerbosity
   unless (null extraArgs) $
-    die' verbosity $ "'manpage' doesn't take any extra arguments: " ++ unwords extraArgs
+    flip runCabalM verbosity . die' $ "'manpage' doesn't take any extra arguments: " ++ unwords extraArgs
   pname <- getProgName
   let cabalCmd = if takeExtension pname == ".exe"
                  then dropExtension pname

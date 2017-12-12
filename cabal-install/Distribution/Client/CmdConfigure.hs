@@ -19,6 +19,8 @@ import Distribution.Simple.Setup
          ( HaddockFlags, fromFlagOrDefault )
 import Distribution.Verbosity
          ( normal )
+import Distribution.Monad
+         ( runCabalM, liftIO )
 
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
@@ -81,23 +83,23 @@ configureCommand = Client.installCommand {
 configureAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
                 -> [String] -> GlobalFlags -> IO ()
 configureAction (configFlags, configExFlags, installFlags, haddockFlags)
-                _extraArgs globalFlags = do
+                _extraArgs globalFlags = flip runCabalM verbosity $ do
     --TODO: deal with _extraArgs, since flags with wrong syntax end up there
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext cliConfig
 
     -- Write out the @cabal.project.local@ so it gets picked up by the
     -- planning phase. If old config exists, then print the contents
     -- before overwriting
-    exists <- doesFileExist "cabal.project.local"
+    exists <- liftIO $ doesFileExist "cabal.project.local"
     when exists $ do
-        notice verbosity "'cabal.project.local' file already exists. Now overwriting it."
-        copyFile "cabal.project.local" "cabal.project.local~"
-    writeProjectLocalExtraConfig (distDirLayout baseCtx)
+        notice "'cabal.project.local' file already exists. Now overwriting it."
+        liftIO $ copyFile "cabal.project.local" "cabal.project.local~"
+    liftIO $ writeProjectLocalExtraConfig (distDirLayout baseCtx)
                                  cliConfig
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan ->
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan ->
 
             -- TODO: Select the same subset of targets as 'CmdBuild' would
             -- pick (ignoring, for example, executables in libraries
@@ -116,7 +118,7 @@ configureAction (configFlags, configExFlags, installFlags, haddockFlags)
     -- implicit target like "."
     --
     -- TODO: should we say what's in the project (+deps) as a whole?
-    printPlan verbosity baseCtx' buildCtx
+    printPlan baseCtx' buildCtx
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig

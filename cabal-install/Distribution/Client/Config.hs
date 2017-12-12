@@ -96,8 +96,9 @@ import Distribution.Simple.Utils
 import Distribution.Compiler
          ( CompilerFlavor(..), defaultCompilerFlavor )
 import Distribution.Verbosity
-         ( Verbosity, normal )
-
+         ( normal )
+import Distribution.Monad
+         ( CabalM, liftIO, localVerbosity )
 import Distribution.Solver.Types.ConstraintSource
 
 import Data.List
@@ -589,10 +590,10 @@ defaultHackageRemoteRepoKeyThreshold = 3
 -- effective configuration. To loads just what is actually in the config file,
 -- use 'loadRawConfig'.
 --
-loadConfig :: Verbosity -> Flag FilePath -> IO SavedConfig
-loadConfig verbosity configFileFlag = do
-  config <- loadRawConfig verbosity configFileFlag
-  extendToEffectiveConfig config
+loadConfig :: Flag FilePath -> CabalM SavedConfig
+loadConfig configFileFlag = do
+  config <- loadRawConfig configFileFlag
+  liftIO $ extendToEffectiveConfig config
 
 extendToEffectiveConfig :: SavedConfig -> IO SavedConfig
 extendToEffectiveConfig config = do
@@ -613,22 +614,22 @@ extendToEffectiveConfig config = do
 -- comparing or editing a config file, but not suitable for using as the
 -- effective configuration.
 --
-loadRawConfig :: Verbosity -> Flag FilePath -> IO SavedConfig
-loadRawConfig verbosity configFileFlag = do
-  (source, configFile) <- getConfigFilePathAndSource configFileFlag
-  minp <- readConfigFile mempty configFile
+loadRawConfig :: Flag FilePath -> CabalM SavedConfig
+loadRawConfig configFileFlag = do
+  (source, configFile) <- liftIO $ getConfigFilePathAndSource configFileFlag
+  minp <- liftIO $ readConfigFile mempty configFile
   case minp of
     Nothing -> do
-      notice verbosity $ "Config file path source is " ++ sourceMsg source ++ "."
-      notice verbosity $ "Config file " ++ configFile ++ " not found."
-      createDefaultConfigFile verbosity [] configFile
+      notice $ "Config file path source is " ++ sourceMsg source ++ "."
+      notice $ "Config file " ++ configFile ++ " not found."
+      createDefaultConfigFile [] configFile
     Just (ParseOk ws conf) -> do
-      unless (null ws) $ warn verbosity $
+      unless (null ws) $ warn $
         unlines (map (showPWarning configFile) ws)
       return conf
     Just (ParseFailed err) -> do
       let (line, msg) = locatedErrorMsg err
-      die' verbosity $
+      die' $
           "Error parsing config file " ++ configFile
         ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
 
@@ -670,13 +671,13 @@ readConfigFile initial file = handleNotExists $
         then return Nothing
         else ioError ioe
 
-createDefaultConfigFile :: Verbosity -> [String] -> FilePath -> IO SavedConfig
-createDefaultConfigFile verbosity extraLines filePath  = do
-  commentConf <- commentSavedConfig
-  initialConf <- initialSavedConfig
-  extraConf   <- parseExtraLines verbosity extraLines
-  notice verbosity $ "Writing default configuration to " ++ filePath
-  writeConfigFile filePath commentConf (initialConf `mappend` extraConf)
+createDefaultConfigFile :: [String] -> FilePath -> CabalM SavedConfig
+createDefaultConfigFile extraLines filePath  = do
+  commentConf <- liftIO commentSavedConfig
+  initialConf <- liftIO initialSavedConfig
+  extraConf   <- parseExtraLines extraLines
+  notice $ "Writing default configuration to " ++ filePath
+  liftIO $ writeConfigFile filePath commentConf (initialConf `mappend` extraConf)
   return initialConf
 
 writeConfigFile :: FilePath -> SavedConfig -> SavedConfig -> IO ()
@@ -1157,26 +1158,26 @@ withProgramOptionsFields =
   map viewAsFieldDescr $
   programDbOptions defaultProgramDb ParseArgs id (++)
 
-parseExtraLines :: Verbosity -> [String] -> IO SavedConfig
-parseExtraLines verbosity extraLines =
+parseExtraLines :: [String] -> CabalM SavedConfig
+parseExtraLines extraLines =
                 case parseConfig (ConstraintSourceMainConfig "additional lines")
                      mempty (unlines extraLines) of
                   ParseFailed err ->
                     let (line, msg) = locatedErrorMsg err
-                    in die' verbosity $
+                    in die' $
                          "Error parsing additional config lines\n"
                          ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
                   ParseOk [] r -> return r
-                  ParseOk ws _ -> die' verbosity $
+                  ParseOk ws _ -> die' $
                          unlines (map (showPWarning "Error parsing additional config lines") ws)
 
 -- | Get the differences (as a pseudo code diff) between the user's
 -- '~/.cabal/config' and the one that cabal would generate if it didn't exist.
-userConfigDiff :: Verbosity -> GlobalFlags -> [String] -> IO [String]
-userConfigDiff verbosity globalFlags extraLines = do
-  userConfig <- loadRawConfig normal (globalConfigFile globalFlags)
-  extraConfig <- parseExtraLines verbosity extraLines
-  testConfig <- initialSavedConfig
+userConfigDiff :: GlobalFlags -> [String] -> CabalM [String]
+userConfigDiff globalFlags extraLines = do
+  userConfig <- localVerbosity (const normal) $ loadRawConfig (globalConfigFile globalFlags)
+  extraConfig <- parseExtraLines extraLines
+  testConfig <- liftIO initialSavedConfig
   return $ reverse . foldl' createDiff [] . M.toList
                 $ M.unionWith combine
                     (M.fromList . map justFst $ filterShow testConfig)
@@ -1218,15 +1219,15 @@ userConfigDiff verbosity globalFlags extraLines = do
 
 
 -- | Update the user's ~/.cabal/config' keeping the user's customizations.
-userConfigUpdate :: Verbosity -> GlobalFlags -> [String] -> IO ()
-userConfigUpdate verbosity globalFlags extraLines = do
-  userConfig  <- loadRawConfig normal (globalConfigFile globalFlags)
-  extraConfig <- parseExtraLines verbosity extraLines
-  newConfig   <- initialSavedConfig
-  commentConf <- commentSavedConfig
-  cabalFile <- getConfigFilePath $ globalConfigFile globalFlags
+userConfigUpdate :: GlobalFlags -> [String] -> CabalM ()
+userConfigUpdate globalFlags extraLines = do
+  userConfig  <- localVerbosity (const normal) $ loadRawConfig (globalConfigFile globalFlags)
+  extraConfig <- parseExtraLines extraLines
+  newConfig   <- liftIO initialSavedConfig
+  commentConf <- liftIO commentSavedConfig
+  cabalFile <- liftIO . getConfigFilePath $ globalConfigFile globalFlags
   let backup = cabalFile ++ ".backup"
-  notice verbosity $ "Renaming " ++ cabalFile ++ " to " ++ backup ++ "."
-  renameFile cabalFile backup
-  notice verbosity $ "Writing merged config to " ++ cabalFile ++ "."
-  writeConfigFile cabalFile commentConf (newConfig `mappend` userConfig `mappend` extraConfig)
+  notice $ "Renaming " ++ cabalFile ++ " to " ++ backup ++ "."
+  liftIO $ renameFile cabalFile backup
+  notice $ "Writing merged config to " ++ cabalFile ++ "."
+  liftIO $ writeConfigFile cabalFile commentConf (newConfig `mappend` userConfig `mappend` extraConfig)

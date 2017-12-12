@@ -25,6 +25,7 @@ import qualified Distribution.Client.BuildReports.Anonymous as BuildReport
 import Distribution.Client.BuildReports.Anonymous (BuildReport)
 import Distribution.Text (display)
 import Distribution.Verbosity (Verbosity)
+import Distribution.Monad (CabalM)
 import Distribution.Simple.Utils (die')
 import Distribution.Client.HttpUtils
 import Distribution.Client.Setup
@@ -33,22 +34,22 @@ import Distribution.Client.Setup
 type BuildReportId = URI
 type BuildLog = String
 
-uploadReports :: Verbosity -> RepoContext -> (String, String) -> URI -> [(BuildReport, Maybe BuildLog)] -> IO ()
-uploadReports verbosity repoCtxt auth uri reports = do
+uploadReports :: RepoContext -> (String, String) -> URI -> [(BuildReport, Maybe BuildLog)] -> CabalM ()
+uploadReports repoCtxt auth uri reports = do
   forM_ reports $ \(report, mbBuildLog) -> do
-     buildId <- postBuildReport verbosity repoCtxt auth uri report
+     buildId <- postBuildReport repoCtxt auth uri report
      case mbBuildLog of
-       Just buildLog -> putBuildLog verbosity repoCtxt auth buildId buildLog
+       Just buildLog -> putBuildLog repoCtxt auth buildId buildLog
        Nothing       -> return ()
 
-postBuildReport :: Verbosity -> RepoContext -> (String, String) -> URI -> BuildReport -> IO BuildReportId
-postBuildReport verbosity repoCtxt auth uri buildReport = do
+postBuildReport :: RepoContext -> (String, String) -> URI -> BuildReport -> CabalM BuildReportId
+postBuildReport repoCtxt auth uri buildReport = do
   let fullURI = uri { uriPath = "/package" </> display (BuildReport.package buildReport) </> "reports" }
   transport <- repoContextGetTransport repoCtxt
-  res <- postHttp transport verbosity fullURI (BuildReport.show buildReport) (Just auth)
+  res <- postHttp transport fullURI (BuildReport.show buildReport) (Just auth)
   case res of
     (303, redir) -> return $ undefined redir --TODO parse redir
-    _ -> die' verbosity "unrecognized response" -- give response
+    _ -> die' "unrecognized response" -- give response
 
 {-
   setAllowRedirects False
@@ -80,13 +81,13 @@ postBuildReport verbosity repoCtxt auth uri buildReport = do
 
 -- TODO force this to be a PUT?
 
-putBuildLog :: Verbosity -> RepoContext -> (String, String)
+putBuildLog :: RepoContext -> (String, String)
             -> BuildReportId -> BuildLog
-            -> IO ()
-putBuildLog verbosity repoCtxt auth reportId buildLog = do
+            -> CabalM ()
+putBuildLog repoCtxt auth reportId buildLog = do
   let fullURI = reportId {uriPath = uriPath reportId </> "log"}
   transport <- repoContextGetTransport repoCtxt
-  res <- postHttp transport verbosity fullURI buildLog (Just auth)
+  res <- postHttp transport fullURI buildLog (Just auth)
   case res of
     (200, _) -> return ()
-    _ -> die' verbosity "unrecognized response" -- give response
+    _ -> die' "unrecognized response" -- give response

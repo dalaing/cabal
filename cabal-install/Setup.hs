@@ -20,6 +20,7 @@ import Distribution.Simple.Setup ( buildVerbosity
                                  , installVerbosity
                                  )
 import Distribution.Verbosity ( Verbosity )
+import Distribution.Monad ( runCabalM )
 
 import System.IO ( openFile
                  , IOMode (WriteMode)
@@ -53,11 +54,11 @@ buildManpage lbi verbosity = do
   let cabal = buildDir lbi </> "cabal/cabal"
       manpage = buildDir lbi </> "cabal/cabal.1"
   manpageHandle <- openFile manpage WriteMode
-  notice verbosity ("Generating manual page " ++ manpage ++ " ...")
+  flip runCabalM verbosity $ notice ("Generating manual page " ++ manpage ++ " ...")
   _ <- runProcess cabal ["manpage"] Nothing Nothing Nothing (Just manpageHandle) Nothing
   return ()
 
 installManpage :: PackageDescription -> LocalBuildInfo -> Verbosity -> CopyDest -> IO ()
-installManpage pkg lbi verbosity copy = do
+installManpage pkg lbi verbosity copy = flip runCabalM verbosity $ do
   let destDir = mandir (absoluteInstallDirs pkg lbi copy) </> "man1"
-  installOrdinaryFiles verbosity destDir [(buildDir lbi </> "cabal", "cabal.1")]
+  installOrdinaryFiles destDir [(buildDir lbi </> "cabal", "cabal.1")]

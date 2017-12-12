@@ -190,9 +190,9 @@ withComponentsLBI = withAllComponentsInBuildOrder
 -- | Perform the action on each buildable 'Library' or 'Executable' (Component)
 -- in the PackageDescription, subject to the build order specified by the
 -- 'compBuildOrder' field of the given 'LocalBuildInfo'
-withAllComponentsInBuildOrder :: PackageDescription -> LocalBuildInfo
-                              -> (Component -> ComponentLocalBuildInfo -> IO ())
-                              -> IO ()
+withAllComponentsInBuildOrder :: Monad m => PackageDescription -> LocalBuildInfo
+                              -> (Component -> ComponentLocalBuildInfo -> m ())
+                              -> m ()
 withAllComponentsInBuildOrder pkg lbi f =
     withAllTargetsInBuildOrder' pkg lbi $ \target ->
         f (targetComponent target) (targetCLBI target)

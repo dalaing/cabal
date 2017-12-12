@@ -96,6 +96,7 @@ import Distribution.Simple.Utils
 import Distribution.Simple.Program
 import Distribution.Simple.InstallDirs
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Utils.NubList
 import Distribution.Types.Dependency
 import Distribution.Types.ComponentId
@@ -2275,17 +2276,17 @@ configureArgs bcHack flags
                                                  . config_field
                                                  . configInstallDirs)
 
-configureCCompiler :: Verbosity -> ProgramDb
-                      -> IO (FilePath, [String])
-configureCCompiler verbosity progdb = configureProg verbosity progdb gccProgram
+configureCCompiler :: ProgramDb
+                      -> CabalM (FilePath, [String])
+configureCCompiler progdb = configureProg progdb gccProgram
 
-configureLinker :: Verbosity -> ProgramDb -> IO (FilePath, [String])
-configureLinker verbosity progdb = configureProg verbosity progdb ldProgram
+configureLinker :: ProgramDb -> CabalM (FilePath, [String])
+configureLinker progdb = configureProg progdb ldProgram
 
-configureProg :: Verbosity -> ProgramDb -> Program
-                 -> IO (FilePath, [String])
-configureProg verbosity programDb prog = do
-    (p, _) <- requireProgram verbosity prog programDb
+configureProg :: ProgramDb -> Program
+                 -> CabalM (FilePath, [String])
+configureProg programDb prog = do
+    (p, _) <- requireProgram prog programDb
     let pInv = programInvocation p []
     return (progInvokePath pInv, progInvokeArgs pInv)
 

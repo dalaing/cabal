@@ -31,8 +31,8 @@ import System.FilePath (splitSearchPath)
 
 import Distribution.Package
     ( PkgconfigName, mkPkgconfigName )
-import Distribution.Verbosity
-    ( Verbosity )
+import Distribution.Monad
+    ( CabalM, runCabalMInIO, liftIO )
 import Distribution.Version
     ( Version, mkVersion', VersionRange, withinRange )
 
@@ -60,24 +60,24 @@ instance Binary PkgConfigDb
 -- | Query pkg-config for the list of installed packages, together
 -- with their versions. Return a `PkgConfigDb` encapsulating this
 -- information.
-readPkgConfigDb :: Verbosity -> ProgramDb -> IO PkgConfigDb
-readPkgConfigDb verbosity progdb = handle ioErrorHandler $ do
-  (pkgConfig, _) <- requireProgram verbosity pkgConfigProgram progdb
-  pkgList <- lines <$> getProgramOutput verbosity pkgConfig ["--list-all"]
+readPkgConfigDb :: ProgramDb -> CabalM PkgConfigDb
+readPkgConfigDb progdb = runCabalMInIO $ \liftC -> handle (liftC . ioErrorHandler) $ liftC $ do
+  (pkgConfig, _) <- requireProgram pkgConfigProgram progdb
+  pkgList <- lines <$> getProgramOutput pkgConfig ["--list-all"]
   -- The output of @pkg-config --list-all@ also includes a description
   -- for each package, which we do not need.
   let pkgNames = map (takeWhile (not . isSpace)) pkgList
-  pkgVersions <- lines <$> getProgramOutput verbosity pkgConfig
+  pkgVersions <- lines <$> getProgramOutput pkgConfig
                              ("--modversion" : pkgNames)
   (return . pkgConfigDbFromList . zip pkgNames) pkgVersions
       where
         -- For when pkg-config invocation fails (possibly because of a
         -- too long command line).
-        ioErrorHandler :: IOException -> IO PkgConfigDb
+        ioErrorHandler :: IOException -> CabalM PkgConfigDb
         ioErrorHandler e = do
-          info verbosity ("Failed to query pkg-config, Cabal will continue"
-                          ++ " without solving for pkg-config constraints: "
-                          ++ show e)
+          info ("Failed to query pkg-config, Cabal will continue"
+                        ++ " without solving for pkg-config constraints: "
+                        ++ show e)
           return NoPkgConfigDb
 
 -- | Create a `PkgConfigDb` from a list of @(packageName, version)@ pairs.
@@ -123,9 +123,9 @@ pkgConfigDbPkgVersion NoPkgConfigDb _ = Just Nothing
 -- | Query pkg-config for the locations of pkg-config's package files. Use this
 -- to monitor for changes in the pkg-config DB.
 --
-getPkgConfigDbDirs :: Verbosity -> ProgramDb -> IO [FilePath]
-getPkgConfigDbDirs verbosity progdb =
-    (++) <$> getEnvPath <*> getDefPath
+getPkgConfigDbDirs :: ProgramDb -> CabalM [FilePath]
+getPkgConfigDbDirs progdb =
+    (++) <$> liftIO getEnvPath <*> getDefPath
  where
     -- According to @man pkg-config@:
     --
@@ -144,16 +144,15 @@ getPkgConfigDbDirs verbosity progdb =
     --
     -- > pkg-config --variable pc_path pkg-config
     --
-    getDefPath = handle ioErrorHandler $ do
-      (pkgConfig, _) <- requireProgram verbosity pkgConfigProgram progdb
+    getDefPath = runCabalMInIO $ \liftC -> handle (liftC . ioErrorHandler) $ liftC $ do
+      (pkgConfig, _) <- requireProgram pkgConfigProgram progdb
       parseSearchPath <$>
-        getProgramOutput verbosity pkgConfig
-                         ["--variable", "pc_path", "pkg-config"]
+        getProgramOutput pkgConfig ["--variable", "pc_path", "pkg-config"]
 
     parseSearchPath str =
       case lines str of
         [p] | not (null p) -> splitSearchPath p
         _                  -> []
 
-    ioErrorHandler :: IOException -> IO [FilePath]
+    ioErrorHandler :: IOException -> CabalM [FilePath]
     ioErrorHandler _e = return []

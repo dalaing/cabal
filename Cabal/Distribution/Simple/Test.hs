@@ -36,6 +36,7 @@ import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
 import Distribution.TestSuite
 import Distribution.Text
+import Distribution.Monad
 
 import System.Directory
     ( createDirectoryIfMissing, doesFileExist, getDirectoryContents
@@ -80,50 +81,51 @@ test args pkg_descr lbi flags = do
                   , logFile = ""
                   }
 
-    unless (PD.hasTests pkg_descr) $ do
-        notice verbosity "Package has no test suites."
-        exitSuccess
+    flip runCabalM verbosity $ do
+      unless (PD.hasTests pkg_descr) $ do
+          notice "Package has no test suites."
+          liftIO exitSuccess
 
-    when (PD.hasTests pkg_descr && null enabledTests) $
-        die' verbosity $
-              "No test suites enabled. Did you remember to configure with "
-           ++ "\'--enable-tests\'?"
+      when (PD.hasTests pkg_descr && null enabledTests) $
+          die' $
+                "No test suites enabled. Did you remember to configure with "
+            ++ "\'--enable-tests\'?"
 
-    testsToRun <- case testNames of
-            [] -> return $ zip enabledTests $ repeat Nothing
-            names -> for names $ \tName ->
-                let testMap = zip enabledNames enabledTests
-                    enabledNames = map (PD.testName . fst) enabledTests
-                    allNames = map PD.testName pkgTests
-                    tCompName = mkUnqualComponentName tName
-                in case lookup tCompName testMap of
-                    Just t -> return (t, Nothing)
-                    _ | tCompName `elem` allNames ->
-                          die' verbosity $ "Package configured with test suite "
-                                ++ tName ++ " disabled."
-                      | otherwise -> die' verbosity $ "no such test: " ++ tName
+      testsToRun <- case testNames of
+              [] -> return $ zip enabledTests $ repeat Nothing
+              names -> for names $ \tName ->
+                  let testMap = zip enabledNames enabledTests
+                      enabledNames = map (PD.testName . fst) enabledTests
+                      allNames = map PD.testName pkgTests
+                      tCompName = mkUnqualComponentName tName
+                  in case lookup tCompName testMap of
+                      Just t -> return (t, Nothing)
+                      _ | tCompName `elem` allNames ->
+                            die' $ "Package configured with test suite "
+                                  ++ tName ++ " disabled."
+                        | otherwise -> die' $ "no such test: " ++ tName
 
-    createDirectoryIfMissing True testLogDir
+      liftIO $ do
+        createDirectoryIfMissing True testLogDir
+        -- Delete ordinary files from test log directory.
+        getDirectoryContents testLogDir
+            >>= filterM doesFileExist . map (testLogDir </>)
+            >>= traverse_ removeFile
 
-    -- Delete ordinary files from test log directory.
-    getDirectoryContents testLogDir
-        >>= filterM doesFileExist . map (testLogDir </>)
-        >>= traverse_ removeFile
+      let totalSuites = length testsToRun
+      notice $ "Running " ++ show totalSuites ++ " test suites..."
+      suites <- liftIO $ traverse doTest testsToRun
+      let packageLog = (localPackageLog pkg_descr lbi) { testSuites = suites }
+          packageLogFile = (</>) testLogDir
+              $ packageLogPath machineTemplate pkg_descr lbi
+      allOk <- summarizePackage packageLog
+      liftIO $ writeFile packageLogFile $ show packageLog
 
-    let totalSuites = length testsToRun
-    notice verbosity $ "Running " ++ show totalSuites ++ " test suites..."
-    suites <- traverse doTest testsToRun
-    let packageLog = (localPackageLog pkg_descr lbi) { testSuites = suites }
-        packageLogFile = (</>) testLogDir
-            $ packageLogPath machineTemplate pkg_descr lbi
-    allOk <- summarizePackage verbosity packageLog
-    writeFile packageLogFile $ show packageLog
+      when (LBI.testCoverage lbi) $
+          markupPackage lbi distPref (display $ PD.package pkg_descr) $
+              map (fst . fst) testsToRun
 
-    when (LBI.testCoverage lbi) $
-        markupPackage verbosity lbi distPref (display $ PD.package pkg_descr) $
-            map (fst . fst) testsToRun
-
-    unless allOk exitFailure
+      unless allOk $ liftIO exitFailure
 
 packageLogPath :: PathTemplate
                -> PD.PackageDescription

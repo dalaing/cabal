@@ -66,7 +66,7 @@ import Distribution.Types.GenericPackageDescription (emptyGenericPackageDescript
 import Distribution.Types.PackageDescription        (specVersion')
 import Distribution.Types.UnqualComponentName       (UnqualComponentName, mkUnqualComponentName)
 import Distribution.Utils.Generic                   (breakMaybe, unfoldrM, validateUTF8)
-import Distribution.Verbosity                       (Verbosity)
+import Distribution.Monad                           (CabalM, liftIO)
 import Distribution.Version
        (LowerBound (..), Version, asVersionIntervals, mkVersion, orLaterVersion, version0,
        versionNumbers)
@@ -92,25 +92,24 @@ import qualified Text.Parsec                                       as P
 -- Argument order is chosen to encourage partial application.
 readAndParseFile
     :: (BS.ByteString -> ParseResult a)  -- ^ File contents to final value parser
-    -> Verbosity                         -- ^ Verbosity level
     -> FilePath                          -- ^ File to read
-    -> IO a
-readAndParseFile parser verbosity fpath = do
-    exists <- doesFileExist fpath
+    -> CabalM a
+readAndParseFile parser fpath = do
+    exists <- liftIO $ doesFileExist fpath
     unless exists $
-      die' verbosity $
+      die' $
         "Error Parsing: file \"" ++ fpath ++ "\" doesn't exist. Cannot continue."
-    bs <- BS.readFile fpath
+    bs <- liftIO $ BS.readFile fpath
     let (warnings, result) = runParseResult (parser bs)
-    traverse_ (warn verbosity . showPWarning fpath) warnings
+    traverse_ (warn . showPWarning fpath) warnings
     case result of
         Right x -> return x
         Left (_, errors) -> do
-            traverse_ (warn verbosity . showPError fpath) errors
-            die' verbosity $ "Failed parsing \"" ++ fpath ++ "\"."
+            traverse_ (warn . showPError fpath) errors
+            die' $ "Failed parsing \"" ++ fpath ++ "\"."
 
 -- | Parse the given package file.
-readGenericPackageDescription :: Verbosity -> FilePath -> IO GenericPackageDescription
+readGenericPackageDescription :: FilePath -> CabalM GenericPackageDescription
 readGenericPackageDescription = readAndParseFile parseGenericPackageDescription
 
 ------------------------------------------------------------------------------
@@ -727,7 +726,7 @@ libFieldNames = fieldGrammarKnownFieldList (libraryFieldGrammar Nothing)
 -- Suplementary build information
 -------------------------------------------------------------------------------
 
-readHookedBuildInfo :: Verbosity -> FilePath -> IO HookedBuildInfo
+readHookedBuildInfo :: FilePath -> CabalM HookedBuildInfo
 readHookedBuildInfo = readAndParseFile parseHookedBuildInfo
 
 parseHookedBuildInfo :: BS.ByteString -> ParseResult HookedBuildInfo

@@ -31,7 +31,9 @@ import Distribution.Types.ComponentName
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, liftIO )
 import Distribution.Simple.Utils
          ( wrapText, die', ordNub, info )
 import Distribution.Client.ProjectPlanning
@@ -109,26 +111,26 @@ runCommand = Client.installCommand {
 runAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
           -> [String] -> GlobalFlags -> IO ()
 runAction (configFlags, configExFlags, installFlags, haddockFlags)
-            targetStrings globalFlags = do
+            targetStrings globalFlags = flip runCabalM verbosity $ do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext cliConfig
 
-    targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx)
-                         (take 1 targetStrings) -- Drop the exe's args.
+    targetSelectors <- either reportTargetSelectorProblems return
+                   =<< liftIO (readTargetSelectors (localPackages baseCtx)
+                         (take 1 targetStrings)) -- Drop the exe's args.
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan -> do
 
             when (buildSettingOnlyDeps (buildSettings baseCtx)) $
-              die' verbosity $
+              die' $
                   "The run command does not support '--only-dependencies'. "
                ++ "You may wish to use 'build --only-dependencies' and then "
                ++ "use 'run'."
 
             -- Interpret the targets on the command line as build targets
             -- (as opposed to say repl or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either reportTargetProblems return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
@@ -145,7 +147,6 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
             -- the 'runProjectPreBuildPhase'. Keep it in mind when modifying this.
             _ <- singleExeOrElse
                    (reportTargetProblems
-                      verbosity
                       [TargetProblemMultipleTargets targets])
                    targets
 
@@ -158,14 +159,14 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
     (selectedUnitId, selectedComponent) <-
       -- Slight duplication with 'runProjectPreBuildPhase'.
       singleExeOrElse
-        (die' verbosity $ "No or multiple targets given, but the run "
+        (die' $ "No or multiple targets given, but the run "
                        ++ "phase has been reached. This is a bug.")
         $ targetsMap buildCtx
 
-    printPlan verbosity baseCtx buildCtx
+    printPlan baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    buildOutcomes <- runProjectBuildPhase baseCtx buildCtx
+    runProjectPostBuildPhase baseCtx buildCtx buildOutcomes
 
 
     let elaboratedPlan = elaboratedPlanToExecute buildCtx
@@ -189,16 +190,16 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
     -- an error in all of these cases, even if some seem like they
     -- shouldn't happen.
     pkg <- case matchingElaboratedConfiguredPackages of
-      [] -> die' verbosity $ "Unknown executable "
+      [] -> die' $ "Unknown executable "
                           ++ exeName
                           ++ " in package "
                           ++ display selectedUnitId
       [elabPkg] -> do
-        info verbosity $ "Selecting "
+        info $ "Selecting "
                        ++ display selectedUnitId
                        ++ " to supply " ++ exeName
         return elabPkg
-      elabPkgs -> die' verbosity
+      elabPkgs -> die'
         $ "Multiple matching executables found matching "
         ++ exeName
         ++ ":\n"
@@ -210,7 +211,6 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
                </> exeName
     let args = drop 1 targetStrings
     runProgramInvocation
-      verbosity
       emptyProgramInvocation {
         progInvokePath  = exePath,
         progInvokeArgs  = args,
@@ -255,7 +255,7 @@ dataDirEnvVarForPackage pkg =
      -- remote/local tarballs.
      (BuildInplaceOnly, _) -> Nothing
 
-singleExeOrElse :: IO (UnitId, UnqualComponentName) -> TargetsMap -> IO (UnitId, UnqualComponentName)
+singleExeOrElse :: CabalM (UnitId, UnqualComponentName) -> TargetsMap -> CabalM (UnitId, UnqualComponentName)
 singleExeOrElse action targetsMap =
   case Set.toList . distinctTargetComponents $ targetsMap
   of [(unitId, CExeName component)] -> return (unitId, component)
@@ -371,9 +371,9 @@ data TargetProblem =
    | TargetProblemIsSubComponent  PackageId ComponentName SubComponentTarget
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: [TargetProblem] -> CabalM a
+reportTargetProblems =
+    die' . unlines . map renderTargetProblem
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =

@@ -68,6 +68,7 @@ import Distribution.System
 import Distribution.Text ( display, simpleParse )
 import Distribution.Utils.NubList ( toNubListR )
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Compat.Stack
 import Distribution.Version (Version)
 import Language.Haskell.Extension
@@ -138,10 +139,10 @@ configureToolchain _implInfo ghcProg ghcInfo =
           in  (b, b, b, b)
 
     findProg :: String -> [FilePath]
-             -> Verbosity -> ProgramSearchPath
-             -> IO (Maybe (FilePath, [FilePath]))
-    findProg progName extraPath v searchpath =
-        findProgramOnSearchPath v searchpath' progName
+             -> ProgramSearchPath
+             -> CabalM (Maybe (FilePath, [FilePath]))
+    findProg progName extraPath searchpath =
+        findProgramOnSearchPath searchpath' progName
       where
         searchpath' = (map ProgramSearchPathDir extraPath) ++ searchpath
 
@@ -172,37 +173,38 @@ configureToolchain _implInfo ghcProg ghcInfo =
             | (flags', ""):_ <- reads flags -> flags'
             | otherwise -> tokenizeQuotedWords flags
 
-    configureGcc :: Verbosity -> ConfiguredProgram -> NoCallStackIO ConfiguredProgram
-    configureGcc _v gccProg = do
+    configureGcc :: ConfiguredProgram -> CabalM ConfiguredProgram
+    configureGcc gccProg = do
       return gccProg {
         programDefaultArgs = programDefaultArgs gccProg
                              ++ ccFlags ++ gccLinkerFlags
       }
 
-    configureLd :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
-    configureLd v ldProg = do
-      ldProg' <- configureLd' v ldProg
+    configureLd :: ConfiguredProgram -> CabalM ConfiguredProgram
+    configureLd ldProg = do
+      ldProg' <- configureLd' ldProg
       return ldProg' {
         programDefaultArgs = programDefaultArgs ldProg' ++ ldLinkerFlags
       }
 
     -- we need to find out if ld supports the -x flag
-    configureLd' :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
-    configureLd' verbosity ldProg = do
-      tempDir <- getTemporaryDirectory
+    configureLd' :: ConfiguredProgram -> CabalM ConfiguredProgram
+    configureLd' ldProg = do
+      tempDir <- liftIO getTemporaryDirectory
       ldx <- withTempFile tempDir ".c" $ \testcfile testchnd ->
              withTempFile tempDir ".o" $ \testofile testohnd -> do
-               hPutStrLn testchnd "int foo() { return 0; }"
-               hClose testchnd; hClose testohnd
-               runProgram verbosity ghcProg
+               liftIO $ do
+                 hPutStrLn testchnd "int foo() { return 0; }"
+                 hClose testchnd; hClose testohnd
+               runProgram ghcProg
                           [ "-hide-all-packages"
                           , "-c", testcfile
                           , "-o", testofile
                           ]
-               withTempFile tempDir ".o" $ \testofile' testohnd' ->
+               withTempFile tempDir ".o" $ \testofile' testohnd' -> runCabalMInIO $ \liftC ->
                  do
                    hClose testohnd'
-                   _ <- getProgramOutput verbosity ldProg
+                   _ <- liftC $ getProgramOutput ldProg
                      ["-x", "-r", testofile, "-o", testofile']
                    return True
                  `catchIO`   (\_ -> return False)
@@ -211,30 +213,30 @@ configureToolchain _implInfo ghcProg ghcInfo =
         then return ldProg { programDefaultArgs = ["-x"] }
         else return ldProg
 
-getLanguages :: Verbosity -> GhcImplInfo -> ConfiguredProgram
-             -> NoCallStackIO [(Language, String)]
-getLanguages _ implInfo _
+getLanguages :: GhcImplInfo -> ConfiguredProgram
+             -> CabalM [(Language, String)]
+getLanguages implInfo _
   -- TODO: should be using --supported-languages rather than hard coding
   | supportsHaskell2010 implInfo = return [(Haskell98,   "-XHaskell98")
                                           ,(Haskell2010, "-XHaskell2010")]
   | otherwise                    = return [(Haskell98,   "")]
 
-getGhcInfo :: Verbosity -> GhcImplInfo -> ConfiguredProgram
-           -> IO [(String, String)]
-getGhcInfo verbosity _implInfo ghcProg = do
-      xs <- getProgramOutput verbosity (suppressOverrideArgs ghcProg)
+getGhcInfo :: GhcImplInfo -> ConfiguredProgram
+           -> CabalM [(String, String)]
+getGhcInfo _implInfo ghcProg = do
+      xs <- getProgramOutput (suppressOverrideArgs ghcProg)
                  ["--info"]
       case reads xs of
         [(i, ss)]
           | all isSpace ss ->
               return i
         _ ->
-          die' verbosity "Can't parse --info output of GHC"
+          die' "Can't parse --info output of GHC"
 
-getExtensions :: Verbosity -> GhcImplInfo -> ConfiguredProgram
-              -> IO [(Extension, Maybe String)]
-getExtensions verbosity implInfo ghcProg = do
-    str <- getProgramOutput verbosity (suppressOverrideArgs ghcProg)
+getExtensions :: GhcImplInfo -> ConfiguredProgram
+              -> CabalM [(Extension, Maybe String)]
+getExtensions implInfo ghcProg = do
+    str <- getProgramOutput (suppressOverrideArgs ghcProg)
               ["--supported-languages"]
     let extStrs = if reportsNoExt implInfo
                   then lines str
@@ -468,18 +470,18 @@ substTopDir topDir ipo
 -- CABAL_SANDBOX_PACKAGE_PATH to the same value that it set
 -- GHC{,JS}_PACKAGE_PATH to. If that is the case it is OK to allow
 -- GHC{,JS}_PACKAGE_PATH.
-checkPackageDbEnvVar :: Verbosity -> String -> String -> IO ()
-checkPackageDbEnvVar verbosity compilerName packagePathEnvVar = do
-    mPP <- lookupEnv packagePathEnvVar
+checkPackageDbEnvVar :: String -> String -> CabalM ()
+checkPackageDbEnvVar compilerName packagePathEnvVar = do
+    mPP <- liftIO $ lookupEnv packagePathEnvVar
     when (isJust mPP) $ do
-        mcsPP <- lookupEnv "CABAL_SANDBOX_PACKAGE_PATH"
+        mcsPP <- liftIO $ lookupEnv "CABAL_SANDBOX_PACKAGE_PATH"
         unless (mPP == mcsPP) abort
     where
         lookupEnv :: String -> NoCallStackIO (Maybe String)
         lookupEnv name = (Just `fmap` getEnv name)
                          `catchIO` const (return Nothing)
         abort =
-            die' verbosity $ "Use of " ++ compilerName ++ "'s environment variable "
+            die' $ "Use of " ++ compilerName ++ "'s environment variable "
                ++ packagePathEnvVar ++ " is incompatible with Cabal. Use the "
                ++ "flag --package-db to specify a package database (it can be "
                ++ "used multiple times)."

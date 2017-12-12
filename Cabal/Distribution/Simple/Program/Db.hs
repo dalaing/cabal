@@ -63,13 +63,13 @@ module Distribution.Simple.Program.Db (
 import Prelude ()
 import Distribution.Compat.Prelude
 
+import Distribution.Monad
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Find
 import Distribution.Simple.Program.Builtin
 import Distribution.Simple.Utils
 import Distribution.Version
 import Distribution.Text
-import Distribution.Verbosity
 
 import Control.Monad (join)
 import Data.Tuple (swap)
@@ -316,22 +316,21 @@ configuredPrograms = Map.elems . configuredProgs
 -- To verify that a program was actually successfully configured use
 -- 'requireProgram'.
 --
-configureProgram :: Verbosity
-                 -> Program
+configureProgram :: Program
                  -> ProgramDb
-                 -> IO ProgramDb
-configureProgram verbosity prog progdb = do
+                 -> CabalM ProgramDb
+configureProgram prog progdb = do
   let name = programName prog
   maybeLocation <- case userSpecifiedPath prog progdb of
     Nothing   ->
-      programFindLocation prog verbosity (progSearchPath progdb)
+      programFindLocation prog (progSearchPath progdb)
       >>= return . fmap (swap . fmap FoundOnSystem . swap)
     Just path -> do
-      absolute <- doesExecutableExist path
+      absolute <- liftIO $ doesExecutableExist path
       if absolute
         then return (Just (UserSpecified path, []))
-        else findProgramOnSearchPath verbosity (progSearchPath progdb) path
-             >>= maybe (die' verbosity notFound)
+        else findProgramOnSearchPath (progSearchPath progdb) path
+             >>= maybe (die' notFound)
                        (return . Just . swap . fmap UserSpecified . swap)
       where notFound = "Cannot find the program '" ++ name
                      ++ "'. User-specified path '"
@@ -340,8 +339,8 @@ configureProgram verbosity prog progdb = do
   case maybeLocation of
     Nothing -> return progdb
     Just (location, triedLocations) -> do
-      version <- programFindVersion prog verbosity (locationPath location)
-      newPath <- programSearchPathAsPATHVar (progSearchPath progdb)
+      version <- programFindVersion prog (locationPath location)
+      newPath <- liftIO $ programSearchPathAsPATHVar (progSearchPath progdb)
       let configuredProg        = ConfiguredProgram {
             programId           = name,
             programVersion      = version,
@@ -352,18 +351,17 @@ configureProgram verbosity prog progdb = do
             programLocation     = location,
             programMonitorFiles = triedLocations
           }
-      configuredProg' <- programPostConf prog verbosity configuredProg
+      configuredProg' <- programPostConf prog configuredProg
       return (updateConfiguredProgs (Map.insert name configuredProg') progdb)
 
 
 -- | Configure a bunch of programs using 'configureProgram'. Just a 'foldM'.
 --
-configurePrograms :: Verbosity
-                  -> [Program]
+configurePrograms :: [Program]
                   -> ProgramDb
-                  -> IO ProgramDb
-configurePrograms verbosity progs progdb =
-  foldM (flip (configureProgram verbosity)) progdb progs
+                  -> CabalM ProgramDb
+configurePrograms progs progdb =
+  foldM (flip configureProgram) progdb progs
 
 
 -- | Unconfigure a program.  This is basically a hack and you shouldn't
@@ -375,11 +373,10 @@ unconfigureProgram progname =
 
 -- | Try to configure all the known programs that have not yet been configured.
 --
-configureAllKnownPrograms :: Verbosity
-                          -> ProgramDb
-                          -> IO ProgramDb
-configureAllKnownPrograms verbosity progdb =
-  configurePrograms verbosity
+configureAllKnownPrograms :: ProgramDb
+                          -> CabalM ProgramDb
+configureAllKnownPrograms progdb =
+  configurePrograms
     [ prog | (prog,_,_) <- Map.elems notYetConfigured ] progdb
   where
     notYetConfigured = unconfiguredProgs progdb
@@ -390,13 +387,12 @@ configureAllKnownPrograms verbosity progdb =
 -- the same inputs as 'userSpecifyPath' and 'userSpecifyArgs' and for all progs
 -- with a new path it calls 'configureProgram'.
 --
-reconfigurePrograms :: Verbosity
-                    -> [(String, FilePath)]
+reconfigurePrograms :: [(String, FilePath)]
                     -> [(String, [ProgArg])]
                     -> ProgramDb
-                    -> IO ProgramDb
-reconfigurePrograms verbosity paths argss progdb = do
-  configurePrograms verbosity progs
+                    -> CabalM ProgramDb
+reconfigurePrograms paths argss progdb = do
+  configurePrograms progs
    . userSpecifyPaths paths
    . userSpecifyArgss argss
    $ progdb
@@ -410,17 +406,17 @@ reconfigurePrograms verbosity paths argss progdb = do
 -- It raises an exception if the program could not be configured, otherwise
 -- it returns the configured program.
 --
-requireProgram :: Verbosity -> Program -> ProgramDb
-               -> IO (ConfiguredProgram, ProgramDb)
-requireProgram verbosity prog progdb = do
+requireProgram :: Program -> ProgramDb
+               -> CabalM (ConfiguredProgram, ProgramDb)
+requireProgram prog progdb = do
 
   -- If it's not already been configured, try to configure it now
   progdb' <- case lookupProgram prog progdb of
-    Nothing -> configureProgram verbosity prog progdb
+    Nothing -> configureProgram prog progdb
     Just _  -> return progdb
 
   case lookupProgram prog progdb' of
-    Nothing             -> die' verbosity notFound
+    Nothing             -> die' notFound
     Just configuredProg -> return (configuredProg, progdb')
 
   where notFound       = "The program '" ++ programName prog
@@ -438,13 +434,13 @@ requireProgram verbosity prog progdb = do
 -- unsuitable, it returns an error value.
 --
 lookupProgramVersion
-  :: Verbosity -> Program -> VersionRange -> ProgramDb
-  -> IO (Either String (ConfiguredProgram, Version, ProgramDb))
-lookupProgramVersion verbosity prog range programDb = do
+  :: Program -> VersionRange -> ProgramDb
+  -> CabalM (Either String (ConfiguredProgram, Version, ProgramDb))
+lookupProgramVersion prog range programDb = do
 
   -- If it's not already been configured, try to configure it now
   programDb' <- case lookupProgram prog programDb of
-    Nothing -> configureProgram verbosity prog programDb
+    Nothing -> configureProgram prog programDb
     Just _  -> return programDb
 
   case lookupProgram prog programDb' of
@@ -477,9 +473,9 @@ lookupProgramVersion verbosity prog range programDb = do
 -- | Like 'lookupProgramVersion', but raises an exception in case of error
 -- instead of returning 'Left errMsg'.
 --
-requireProgramVersion :: Verbosity -> Program -> VersionRange
+requireProgramVersion :: Program -> VersionRange
                       -> ProgramDb
-                      -> IO (ConfiguredProgram, Version, ProgramDb)
-requireProgramVersion verbosity prog range programDb =
-  join $ either (die' verbosity) return `fmap`
-  lookupProgramVersion verbosity prog range programDb
+                      -> CabalM (ConfiguredProgram, Version, ProgramDb)
+requireProgramVersion prog range programDb =
+  join $ either die' return `fmap`
+  lookupProgramVersion prog range programDb

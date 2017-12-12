@@ -78,8 +78,8 @@ import Distribution.Simple.Utils as Utils
 import Distribution.System
          ( Platform )
 import Distribution.Text ( display )
-import Distribution.Verbosity as Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, askVerbosity )
 
 import System.FilePath ( (</>) )
 
@@ -101,8 +101,7 @@ chooseCabalVersion configExFlags maybeVersion =
                           else anyVersion
 
 -- | Configure the package found in the local directory
-configure :: Verbosity
-          -> PackageDBStack
+configure :: PackageDBStack
           -> RepoContext
           -> Compiler
           -> Platform
@@ -110,31 +109,31 @@ configure :: Verbosity
           -> ConfigFlags
           -> ConfigExFlags
           -> [String]
-          -> IO ()
-configure verbosity packageDBs repoCtxt comp platform progdb
+          -> CabalM ()
+configure packageDBs repoCtxt comp platform progdb
   configFlags configExFlags extraArgs = do
 
-  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-  sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
-  pkgConfigDb       <- readPkgConfigDb      verbosity progdb
+  installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+  sourcePkgDb       <- getSourcePackages    repoCtxt
+  pkgConfigDb       <- readPkgConfigDb      progdb
 
-  checkConfigExFlags verbosity installedPkgIndex
+  checkConfigExFlags installedPkgIndex
                      (packageIndex sourcePkgDb) configExFlags
 
-  progress <- planLocalPackage verbosity comp platform configFlags configExFlags
+  progress <- planLocalPackage comp platform configFlags configExFlags
                                installedPkgIndex sourcePkgDb pkgConfigDb
 
-  notice verbosity "Resolving dependencies..."
+  notice "Resolving dependencies..."
   maybePlan <- foldProgress logMsg (return . Left) (return . Right)
                             progress
   case maybePlan of
     Left message -> do
-      warn verbosity $
+      warn $
            "solver failed to find a solution:\n"
         ++ message
         ++ "\nTrying configure anyway."
-      setupWrapper verbosity (setupScriptOptions installedPkgIndex Nothing)
-        Nothing configureCommand (const configFlags) extraArgs
+      setupWrapper (setupScriptOptions installedPkgIndex Nothing)
+        Nothing configureCommand (\_ _ -> configFlags) extraArgs
 
     Right installPlan0 ->
      let installPlan = InstallPlan.configureInstallPlan configFlags installPlan0
@@ -142,12 +141,12 @@ configure verbosity packageDBs repoCtxt comp platform progdb
       [pkg@(ReadyPackage
               (ConfiguredPackage _ (SourcePackage _ _ (LocalUnpackedPackage _) _)
                                  _ _ _))] -> do
-        configurePackage verbosity
+        configurePackage
           platform (compilerInfo comp)
           (setupScriptOptions installedPkgIndex (Just pkg))
           configFlags pkg extraArgs
 
-      _ -> die' verbosity $ "internal error: configure install plan should have exactly "
+      _ -> die' $ "internal error: configure install plan should have exactly "
               ++ "one local ready package."
 
   where
@@ -169,7 +168,7 @@ configure verbosity packageDBs repoCtxt comp platform progdb
         Nothing
         False
 
-    logMsg message rest = debug verbosity message >> rest
+    logMsg message rest = debug message >> rest
 
 configureSetupScript :: PackageDBStack
                      -> Compiler
@@ -259,16 +258,15 @@ configureSetupScript packageDBs
 -- | Warn if any constraints or preferences name packages that are not in the
 -- source package index or installed package index.
 checkConfigExFlags :: Package pkg
-                   => Verbosity
-                   -> InstalledPackageIndex
+                   => InstalledPackageIndex
                    -> PackageIndex pkg
                    -> ConfigExFlags
-                   -> IO ()
-checkConfigExFlags verbosity installedPkgIndex sourcePkgIndex flags = do
-  unless (null unknownConstraints) $ warn verbosity $
+                   -> CabalM ()
+checkConfigExFlags installedPkgIndex sourcePkgIndex flags = do
+  unless (null unknownConstraints) $ warn $
              "Constraint refers to an unknown package: "
           ++ showConstraint (head unknownConstraints)
-  unless (null unknownPreferences) $ warn verbosity $
+  unless (null unknownPreferences) $ warn $
              "Preference refers to an unknown package: "
           ++ display (head unknownPreferences)
   where
@@ -284,21 +282,22 @@ checkConfigExFlags verbosity installedPkgIndex sourcePkgIndex flags = do
 -- | Make an 'InstallPlan' for the unpacked package in the current directory,
 -- and all its dependencies.
 --
-planLocalPackage :: Verbosity -> Compiler
+planLocalPackage :: Compiler
                  -> Platform
                  -> ConfigFlags -> ConfigExFlags
                  -> InstalledPackageIndex
                  -> SourcePackageDb
                  -> PkgConfigDb
-                 -> IO (Progress String String SolverInstallPlan)
-planLocalPackage verbosity comp platform configFlags configExFlags
+                 -> CabalM (Progress String String SolverInstallPlan)
+planLocalPackage comp platform configFlags configExFlags
   installedPkgIndex (SourcePackageDb _ packagePrefs) pkgConfigDb = do
-  pkg <- readGenericPackageDescription verbosity =<<
+  pkg <- readGenericPackageDescription =<<
             case flagToMaybe (configCabalFilePath configFlags) of
-                Nothing -> defaultPackageDesc verbosity
+                Nothing -> defaultPackageDesc
                 Just fp -> return fp
-  solver <- chooseSolver verbosity (fromFlag $ configSolver configExFlags)
+  solver <- chooseSolver (fromFlag $ configSolver configExFlags)
             (compilerInfo comp)
+  verbosity <- askVerbosity
 
   let -- We create a local package and ask to resolve a dependency on it
       localPkg = SourcePackage {
@@ -312,7 +311,7 @@ planLocalPackage verbosity comp platform configFlags configExFlags
       benchmarksEnabled =
         fromFlagOrDefault False $ configBenchmarks configFlags
 
-      resolverParams =
+      resolverParams verb =
           removeLowerBounds
           (fromMaybe (AllowOlder mempty) $ configAllowOlder configExFlags)
         . removeUpperBounds
@@ -353,7 +352,7 @@ planLocalPackage verbosity comp platform configFlags configExFlags
             -- installed package index
         . setSolveExecutables (SolveExecutables False)
 
-        . setSolverVerbosity verbosity
+        . setSolverVerbosity verb
 
         $ standardInstallPolicy
             installedPkgIndex
@@ -363,7 +362,7 @@ planLocalPackage verbosity comp platform configFlags configExFlags
             (SourcePackageDb mempty packagePrefs)
             [SpecificSourcePackage localPkg]
 
-  return (resolveDependencies platform (compilerInfo comp) pkgConfigDb solver resolverParams)
+  return (resolveDependencies platform (compilerInfo comp) pkgConfigDb solver (resolverParams verbosity))
 
 
 -- | Call an installer for an 'SourcePackage' but override the configure
@@ -374,23 +373,21 @@ planLocalPackage verbosity comp platform configFlags configExFlags
 --
 -- NB: when updating this function, don't forget to also update
 -- 'installReadyPackage' in D.C.Install.
-configurePackage :: Verbosity
-                 -> Platform -> CompilerInfo
+configurePackage :: Platform -> CompilerInfo
                  -> SetupScriptOptions
                  -> ConfigFlags
                  -> ReadyPackage
                  -> [String]
-                 -> IO ()
-configurePackage verbosity platform comp scriptOptions configFlags
+                 -> CabalM ()
+configurePackage platform comp scriptOptions configFlags
                  (ReadyPackage (ConfiguredPackage ipid spkg flags stanzas deps))
-                 extraArgs =
-
-  setupWrapper verbosity
+                 extraArgs = do
+  setupWrapper
     scriptOptions (Just pkg) configureCommand configureFlags extraArgs
 
   where
     gpkg = packageDescription spkg
-    configureFlags   = filterConfigureFlags configFlags {
+    configureFlags verbosity  = filterConfigureFlags configFlags {
       configIPID = if isJust (flagToMaybe (configIPID configFlags))
                     -- Make sure cabal configure --ipid works.
                     then configIPID configFlags
@@ -446,14 +443,13 @@ readConfigFlags dist =
 
 -- | Save the configure flags and environment to the specified files.
 writeConfigFlagsTo :: FilePath  -- ^ path to saved flags file
-                   -> Verbosity -> (ConfigFlags, ConfigExFlags)
-                   -> IO ()
-writeConfigFlagsTo file verb flags = do
-  writeCommandFlags verb file configureExCommand flags
+                   -> (ConfigFlags, ConfigExFlags)
+                   -> CabalM ()
+writeConfigFlagsTo file flags = do
+  writeCommandFlags file configureExCommand flags
 
 -- | Save the build flags to the usual location.
-writeConfigFlags :: Verbosity
-                 -> FilePath  -- ^ @--build-dir@
-                 -> (ConfigFlags, ConfigExFlags) -> IO ()
-writeConfigFlags verb dist =
-  writeConfigFlagsTo (cabalConfigFlagsFile dist) verb
+writeConfigFlags :: FilePath  -- ^ @--build-dir@
+                 -> (ConfigFlags, ConfigExFlags) -> CabalM ()
+writeConfigFlags dist =
+  writeConfigFlagsTo (cabalConfigFlagsFile dist)

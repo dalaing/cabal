@@ -54,7 +54,7 @@ import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.Setup
 import Distribution.Text
 import Distribution.System
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Simple.Utils
 
 import System.FilePath ((</>), (<.>), normalise)
@@ -119,12 +119,11 @@ haddockName pkg_descr = display (packageName pkg_descr) <.> "haddock"
 -- -----------------------------------------------------------------------------
 -- Source File helper
 
-getLibSourceFiles :: Verbosity
-                     -> LocalBuildInfo
+getLibSourceFiles ::    LocalBuildInfo
                      -> Library
                      -> ComponentLocalBuildInfo
-                     -> IO [(ModuleName.ModuleName, FilePath)]
-getLibSourceFiles verbosity lbi lib clbi = getSourceFiles verbosity searchpaths modules
+                     -> CabalM [(ModuleName.ModuleName, FilePath)]
+getLibSourceFiles lbi lib clbi = getSourceFiles searchpaths modules
   where
     bi               = libBuildInfo lib
     modules          = allLibModules lib clbi
@@ -132,14 +131,13 @@ getLibSourceFiles verbosity lbi lib clbi = getSourceFiles verbosity searchpaths 
                      [ autogenComponentModulesDir lbi clbi
                      , autogenPackageModulesDir lbi ]
 
-getExeSourceFiles :: Verbosity
-                     -> LocalBuildInfo
+getExeSourceFiles ::    LocalBuildInfo
                      -> Executable
                      -> ComponentLocalBuildInfo
-                     -> IO [(ModuleName.ModuleName, FilePath)]
-getExeSourceFiles verbosity lbi exe clbi = do
-    moduleFiles <- getSourceFiles verbosity searchpaths modules
-    srcMainPath <- findFile (hsSourceDirs bi) (modulePath exe)
+                     -> CabalM [(ModuleName.ModuleName, FilePath)]
+getExeSourceFiles lbi exe clbi = do
+    moduleFiles <- getSourceFiles searchpaths modules
+    srcMainPath <- liftIO $ findFile (hsSourceDirs bi) (modulePath exe)
     return ((ModuleName.main, srcMainPath) : moduleFiles)
   where
     bi          = buildInfo exe
@@ -148,12 +146,11 @@ getExeSourceFiles verbosity lbi exe clbi = do
                 : autogenPackageModulesDir lbi
                 : exeBuildDir lbi exe : hsSourceDirs bi
 
-getFLibSourceFiles :: Verbosity
-                   -> LocalBuildInfo
+getFLibSourceFiles :: LocalBuildInfo
                    -> ForeignLib
                    -> ComponentLocalBuildInfo
-                   -> IO [(ModuleName.ModuleName, FilePath)]
-getFLibSourceFiles verbosity lbi flib clbi = getSourceFiles verbosity searchpaths modules
+                   -> CabalM [(ModuleName.ModuleName, FilePath)]
+getFLibSourceFiles lbi flib clbi = getSourceFiles searchpaths modules
   where
     bi          = foreignLibBuildInfo flib
     modules     = otherModules bi
@@ -161,14 +158,14 @@ getFLibSourceFiles verbosity lbi flib clbi = getSourceFiles verbosity searchpath
                 : autogenPackageModulesDir lbi
                 : flibBuildDir lbi flib : hsSourceDirs bi
 
-getSourceFiles :: Verbosity -> [FilePath]
+getSourceFiles ::    [FilePath]
                   -> [ModuleName.ModuleName]
-                  -> IO [(ModuleName.ModuleName, FilePath)]
-getSourceFiles verbosity dirs modules = flip traverse modules $ \m -> fmap ((,) m) $
-    findFileWithExtension ["hs", "lhs", "hsig", "lhsig"] dirs (ModuleName.toFilePath m)
+                  -> CabalM [(ModuleName.ModuleName, FilePath)]
+getSourceFiles dirs modules = flip traverse modules $ \m -> fmap ((,) m) $
+    liftIO (findFileWithExtension ["hs", "lhs", "hsig", "lhsig"] dirs (ModuleName.toFilePath m))
       >>= maybe (notFound m) (return . normalise)
   where
-    notFound module_ = die' verbosity $ "can't find source for module " ++ display module_
+    notFound module_ = die' $ "can't find source for module " ++ display module_
 
 -- | The directory where we put build results for an executable
 exeBuildDir :: LocalBuildInfo -> Executable -> FilePath

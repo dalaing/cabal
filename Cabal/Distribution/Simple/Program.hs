@@ -144,53 +144,49 @@ import Distribution.Simple.Program.Db
 import Distribution.Simple.Program.Builtin
 import Distribution.Simple.Program.Find
 import Distribution.Simple.Utils
-import Distribution.Verbosity
+import Distribution.Monad
 
 -- | Runs the given configured program.
-runProgram :: Verbosity          -- ^Verbosity
-           -> ConfiguredProgram  -- ^The program to run
+runProgram :: ConfiguredProgram  -- ^The program to run
            -> [ProgArg]          -- ^Any /extra/ arguments to add
-           -> IO ()
-runProgram verbosity prog args =
-  runProgramInvocation verbosity (programInvocation prog args)
+           -> CabalM ()
+runProgram prog args =
+  runProgramInvocation (programInvocation prog args)
 
 
 -- | Runs the given configured program and gets the output.
 --
-getProgramOutput :: Verbosity          -- ^Verbosity
-                 -> ConfiguredProgram  -- ^The program to run
+getProgramOutput :: ConfiguredProgram  -- ^The program to run
                  -> [ProgArg]          -- ^Any /extra/ arguments to add
-                 -> IO String
-getProgramOutput verbosity prog args =
-  getProgramInvocationOutput verbosity (programInvocation prog args)
+                 -> CabalM String
+getProgramOutput prog args =
+  getProgramInvocationOutput (programInvocation prog args)
 
 
 -- | Looks up the given program in the program database and runs it.
 --
-runDbProgram :: Verbosity  -- ^verbosity
-             -> Program    -- ^The program to run
+runDbProgram :: Program    -- ^The program to run
              -> ProgramDb  -- ^look up the program here
              -> [ProgArg]  -- ^Any /extra/ arguments to add
-             -> IO ()
-runDbProgram verbosity prog programDb args =
+             -> CabalM ()
+runDbProgram prog programDb args =
   case lookupProgram prog programDb of
-    Nothing             -> die' verbosity notFound
-    Just configuredProg -> runProgram verbosity configuredProg args
+    Nothing             -> die' notFound
+    Just configuredProg -> runProgram configuredProg args
  where
    notFound = "The program '" ++ programName prog
            ++ "' is required but it could not be found"
 
 -- | Looks up the given program in the program database and runs it.
 --
-getDbProgramOutput :: Verbosity  -- ^verbosity
-                   -> Program    -- ^The program to run
+getDbProgramOutput :: Program    -- ^The program to run
                    -> ProgramDb  -- ^look up the program here
                    -> [ProgArg]  -- ^Any /extra/ arguments to add
-                   -> IO String
-getDbProgramOutput verbosity prog programDb args =
+                   -> CabalM String
+getDbProgramOutput prog programDb args =
   case lookupProgram prog programDb of
-    Nothing             -> die' verbosity notFound
-    Just configuredProg -> getProgramOutput verbosity configuredProg args
+    Nothing             -> die' notFound
+    Just configuredProg -> getProgramOutput configuredProg args
  where
    notFound = "The program '" ++ programName prog
            ++ "' is required but it could not be found"
@@ -201,23 +197,23 @@ getDbProgramOutput verbosity prog programDb args =
 --
 
 {-# DEPRECATED rawSystemProgram "use runProgram instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-rawSystemProgram :: Verbosity -> ConfiguredProgram
-                 -> [ProgArg] -> IO ()
+rawSystemProgram :: ConfiguredProgram
+                 -> [ProgArg] -> CabalM ()
 rawSystemProgram = runProgram
 
 {-# DEPRECATED rawSystemProgramStdout "use getProgramOutput instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-rawSystemProgramStdout :: Verbosity -> ConfiguredProgram
-                       -> [ProgArg] -> IO String
+rawSystemProgramStdout :: ConfiguredProgram
+                       -> [ProgArg] -> CabalM String
 rawSystemProgramStdout = getProgramOutput
 
 {-# DEPRECATED rawSystemProgramConf "use runDbProgram instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-rawSystemProgramConf :: Verbosity  -> Program -> ProgramConfiguration
-                     -> [ProgArg] -> IO ()
+rawSystemProgramConf :: Program -> ProgramConfiguration
+                     -> [ProgArg] -> CabalM ()
 rawSystemProgramConf = runDbProgram
 
 {-# DEPRECATED rawSystemProgramStdoutConf "use getDbProgramOutput instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-rawSystemProgramStdoutConf :: Verbosity -> Program -> ProgramConfiguration
-                           -> [ProgArg] -> IO String
+rawSystemProgramStdoutConf :: Program -> ProgramConfiguration
+                           -> [ProgArg] -> CabalM String
 rawSystemProgramStdoutConf = getDbProgramOutput
 
 {-# DEPRECATED ProgramConfiguration "use ProgramDb instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
@@ -235,7 +231,7 @@ restoreProgramConfiguration :: [Program] -> ProgramConfiguration
 restoreProgramConfiguration = restoreProgramDb
 
 {-# DEPRECATED findProgramOnPath "use findProgramOnSearchPath instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-findProgramOnPath :: String -> Verbosity -> IO (Maybe FilePath)
-findProgramOnPath name verbosity =
+findProgramOnPath :: String -> CabalM (Maybe FilePath)
+findProgramOnPath name =
     fmap (fmap fst) $
-    findProgramOnSearchPath verbosity defaultProgramSearchPath name
+    findProgramOnSearchPath defaultProgramSearchPath name

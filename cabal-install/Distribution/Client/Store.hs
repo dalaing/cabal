@@ -34,6 +34,7 @@ import           Distribution.Compiler (CompilerId)
 import           Distribution.Simple.Utils
                    ( withTempDirectory, debug, info )
 import           Distribution.Verbosity
+import           Distribution.Monad
 import           Distribution.Text
 
 import           Data.Set (Set)
@@ -168,14 +169,13 @@ data NewStoreEntryOutcome = UseNewStoreEntry
 -- then you must read the existing registration information (unless your
 -- registration information is constructed fully deterministically).
 --
-newStoreEntry :: Verbosity
-              -> StoreDirLayout
+newStoreEntry :: StoreDirLayout
               -> CompilerId
               -> UnitId
-              -> (FilePath -> IO (FilePath, [FilePath])) -- ^ Action to place files.
-              -> IO ()                     -- ^ Register action, if necessary.
-              -> IO NewStoreEntryOutcome
-newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
+              -> (FilePath -> CabalM (FilePath, [FilePath])) -- ^ Action to place files.
+              -> CabalM ()                     -- ^ Register action, if necessary.
+              -> CabalM NewStoreEntryOutcome
+newStoreEntry storeDirLayout@StoreDirLayout{..}
               compid unitid
               copyFiles register =
     -- See $concurrency above for an explanation of the concurrency protocol
@@ -186,16 +186,16 @@ newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
       (incomingEntryDir, otherFiles) <- copyFiles incomingTmpDir
 
       -- Take a lock named after the 'UnitId' in question.
-      withIncomingUnitIdLock verbosity storeDirLayout compid unitid $ do
+      withIncomingUnitIdLock storeDirLayout compid unitid $ do
 
         -- Check for the existence of the final store entry directory.
-        exists <- doesStoreEntryExist storeDirLayout compid unitid
+        exists <- liftIO $ doesStoreEntryExist storeDirLayout compid unitid
 
         if exists
           -- If the entry exists then we lost the race and we must abandon,
           -- unlock and re-use the existing store entry.
           then do
-            info verbosity $
+            info $
                 "Concurrent build race: abandoning build in favour of existing "
              ++ "store entry " ++ display compid </> display unitid
             return UseExistingStoreEntry
@@ -207,13 +207,14 @@ newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
             register
 
             -- Atomically rename the temp dir to the final store entry location.
-            renameDirectory incomingEntryDir finalEntryDir
-            forM_ otherFiles $ \file -> do
-              let finalStoreFile = storeDirectory compid </> makeRelative (incomingTmpDir </> (dropDrive (storeDirectory compid))) file
-              createDirectoryIfMissing True (takeDirectory finalStoreFile)
-              renameFile file finalStoreFile
+            liftIO $ do
+              renameDirectory incomingEntryDir finalEntryDir
+              forM_ otherFiles $ \file -> do
+                let finalStoreFile = storeDirectory compid </> makeRelative (incomingTmpDir </> (dropDrive (storeDirectory compid))) file
+                createDirectoryIfMissing True (takeDirectory finalStoreFile)
+                renameFile file finalStoreFile
 
-            debug verbosity $
+            debug $
               "Installed store entry " ++ display compid </> display unitid
             return UseNewStoreEntry
   where
@@ -221,28 +222,30 @@ newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
 
 
 withTempIncomingDir :: StoreDirLayout -> CompilerId
-                    -> (FilePath -> IO a) -> IO a
+                    -> (FilePath -> CabalM a) -> CabalM a
 withTempIncomingDir StoreDirLayout{storeIncomingDirectory} compid action = do
-    createDirectoryIfMissing True incomingDir
-    withTempDirectory silent incomingDir "new" action
+    liftIO $ createDirectoryIfMissing True incomingDir
+    localVerbosity (const silent) $
+      withTempDirectory incomingDir "new" (action)
   where
     incomingDir = storeIncomingDirectory compid
 
 
-withIncomingUnitIdLock :: Verbosity -> StoreDirLayout
+withIncomingUnitIdLock :: StoreDirLayout
                        -> CompilerId -> UnitId
-                       -> IO a -> IO a
-withIncomingUnitIdLock verbosity StoreDirLayout{storeIncomingLock}
+                       -> CabalM a -> CabalM a
+withIncomingUnitIdLock StoreDirLayout{storeIncomingLock}
                        compid unitid action =
-    bracket takeLock releaseLock (\_hnd -> action)
+    runCabalMInIO $ \liftC ->
+    bracket (takeLock liftC) releaseLock (\_hnd -> liftC action)
   where
-    takeLock = do
+    takeLock liftC = do
       h <- openFile (storeIncomingLock compid unitid) ReadWriteMode
       -- First try non-blocking, but if we would have to wait then
       -- log an explanation and do it again in blocking mode.
       gotlock <- hTryLock h ExclusiveLock
       unless gotlock $ do
-        info verbosity $ "Waiting for file lock on store entry "
+        liftC . info $ "Waiting for file lock on store entry "
                       ++ display compid </> display unitid
         hLock h ExclusiveLock
       return h

@@ -40,7 +40,7 @@ import Distribution.Compat.Prelude
 
 import Distribution.Simple.Program.Find
 import Distribution.Version
-import Distribution.Verbosity
+import Distribution.Monad
 
 import qualified Data.Map as Map
 
@@ -64,17 +64,17 @@ data Program = Program {
        -- where the program was found, it returns all the other places that
        -- were tried.
        --
-       programFindLocation :: Verbosity -> ProgramSearchPath
-                              -> IO (Maybe (FilePath, [FilePath])),
+       programFindLocation :: ProgramSearchPath
+                              -> CabalM (Maybe (FilePath, [FilePath])),
 
        -- | Try to find the version of the program. For many programs this is
        -- not possible or is not necessary so it's OK to return Nothing.
-       programFindVersion :: Verbosity -> FilePath -> IO (Maybe Version),
+       programFindVersion :: FilePath -> CabalM (Maybe Version),
 
        -- | A function to do any additional configuration after we have
        -- located the program (and perhaps identified its version). For example
        -- it could add args, or environment vars.
-       programPostConf :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
+       programPostConf :: ConfiguredProgram -> CabalM ConfiguredProgram
      }
 instance Show Program where
   show (Program name _ _ _) = "Program: " ++ name
@@ -159,9 +159,9 @@ suppressOverrideArgs prog = prog { programOverrideArgs = [] }
 simpleProgram :: String -> Program
 simpleProgram name = Program {
     programName         = name,
-    programFindLocation = \v p -> findProgramOnSearchPath v p name,
-    programFindVersion  = \_ _ -> return Nothing,
-    programPostConf     = \_ p -> return p
+    programFindLocation = \p -> findProgramOnSearchPath p name,
+    programFindVersion  = const (return Nothing),
+    programPostConf     = return
   }
 
 -- | Make a simple 'ConfiguredProgram'.

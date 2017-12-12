@@ -30,6 +30,7 @@ import qualified Distribution.Simple.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
 import Distribution.Simple.UserHooks
 import Distribution.Simple.Utils
+import Distribution.Monad
 import Distribution.Text
 
 import System.Exit ( ExitCode(..), exitFailure, exitSuccess )
@@ -49,59 +50,60 @@ bench args pkg_descr lbi flags = do
         enabledBenchmarks = map fst (LBI.enabledBenchLBIs pkg_descr lbi)
 
         -- Run the benchmark
-        doBench :: PD.Benchmark -> IO ExitCode
-        doBench bm =
+        doBench :: PD.Benchmark -> CabalM ExitCode
+        doBench bm = do
             case PD.benchmarkInterface bm of
               PD.BenchmarkExeV10 _ _ -> do
                   let cmd = LBI.buildDir lbi </> name </> name <.> exeExtension
                       options = map (benchOption pkg_descr lbi bm) $
                                 benchmarkOptions flags
                   -- Check that the benchmark executable exists.
-                  exists <- doesFileExist cmd
-                  unless exists $ die' verbosity $
+                  exists <- liftIO $ doesFileExist cmd
+                  unless exists $ die' $
                       "Error: Could not find benchmark program \""
                       ++ cmd ++ "\". Did you build the package first?"
 
-                  notice verbosity $ startMessage name
+                  notice $ startMessage name
                   -- This will redirect the child process
                   -- stdout/stderr to the parent process.
-                  exitcode <- rawSystemExitCode verbosity cmd options
-                  notice verbosity $ finishMessage name exitcode
+                  exitcode <- rawSystemExitCode cmd options
+                  notice $ finishMessage name exitcode
                   return exitcode
 
               _ -> do
-                  notice verbosity $ "No support for running "
+                  notice $ "No support for running "
                       ++ "benchmark " ++ name ++ " of type: "
                       ++ display (PD.benchmarkType bm)
-                  exitFailure
+                  liftIO exitFailure
           where name = unUnqualComponentName $ PD.benchmarkName bm
 
-    unless (PD.hasBenchmarks pkg_descr) $ do
-        notice verbosity "Package has no benchmarks."
-        exitSuccess
+    flip runCabalM verbosity $ do
+      unless (PD.hasBenchmarks pkg_descr) $ do
+          notice "Package has no benchmarks."
+          liftIO exitSuccess
 
-    when (PD.hasBenchmarks pkg_descr && null enabledBenchmarks) $
-        die' verbosity $ "No benchmarks enabled. Did you remember to configure with "
-              ++ "\'--enable-benchmarks\'?"
+      when (PD.hasBenchmarks pkg_descr && null enabledBenchmarks) $
+          die' $ "No benchmarks enabled. Did you remember to configure with "
+                ++ "\'--enable-benchmarks\'?"
 
-    bmsToRun <- case benchmarkNames of
-            [] -> return enabledBenchmarks
-            names -> for names $ \bmName ->
-                let benchmarkMap = zip enabledNames enabledBenchmarks
-                    enabledNames = map PD.benchmarkName enabledBenchmarks
-                    allNames = map PD.benchmarkName pkgBenchmarks
-                in case lookup (mkUnqualComponentName bmName) benchmarkMap of
-                    Just t -> return t
-                    _ | mkUnqualComponentName bmName `elem` allNames ->
-                          die' verbosity $ "Package configured with benchmark "
-                                ++ bmName ++ " disabled."
-                      | otherwise -> die' verbosity $ "no such benchmark: " ++ bmName
+      bmsToRun <- case benchmarkNames of
+              [] -> return enabledBenchmarks
+              names -> for names $ \bmName ->
+                  let benchmarkMap = zip enabledNames enabledBenchmarks
+                      enabledNames = map PD.benchmarkName enabledBenchmarks
+                      allNames = map PD.benchmarkName pkgBenchmarks
+                  in case lookup (mkUnqualComponentName bmName) benchmarkMap of
+                      Just t -> return t
+                      _ | mkUnqualComponentName bmName `elem` allNames ->
+                            die' $ "Package configured with benchmark "
+                                  ++ bmName ++ " disabled."
+                        | otherwise -> die' $ "no such benchmark: " ++ bmName
 
-    let totalBenchmarks = length bmsToRun
-    notice verbosity $ "Running " ++ show totalBenchmarks ++ " benchmarks..."
-    exitcodes <- traverse doBench bmsToRun
-    let allOk = totalBenchmarks == length (filter (== ExitSuccess) exitcodes)
-    unless allOk exitFailure
+      let totalBenchmarks = length bmsToRun
+      notice $ "Running " ++ show totalBenchmarks ++ " benchmarks..."
+      exitcodes <- traverse doBench bmsToRun
+      let allOk = totalBenchmarks == length (filter (== ExitSuccess) exitcodes)
+      unless allOk $ liftIO exitFailure
   where
     startMessage name = "Benchmark " ++ name ++ ": RUNNING...\n"
     finishMessage name exitcode = "Benchmark " ++ name ++ ": "

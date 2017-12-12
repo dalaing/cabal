@@ -254,7 +254,7 @@ allTargetsInBuildOrder' pkg_descr lbi
 -- build dependency order.  (TODO: We should use Shake!)
 -- Has a prime because it takes a 'PackageDescription' argument
 -- which may disagree with 'localPkgDescr' in 'LocalBuildInfo'.
-withAllTargetsInBuildOrder' :: PackageDescription -> LocalBuildInfo -> (TargetInfo -> IO ()) -> IO ()
+withAllTargetsInBuildOrder' :: Monad m => PackageDescription -> LocalBuildInfo -> (TargetInfo -> m ()) -> m ()
 withAllTargetsInBuildOrder' pkg_descr lbi f
     = sequence_ [ f target | target <- allTargetsInBuildOrder' pkg_descr lbi ]
 
@@ -272,7 +272,7 @@ neededTargetsInBuildOrder' pkg_descr lbi uids =
 -- the build dependency order.
 -- Has a prime because it takes a 'PackageDescription' argument
 -- which may disagree with 'localPkgDescr' in 'LocalBuildInfo'.
-withNeededTargetsInBuildOrder' :: PackageDescription -> LocalBuildInfo -> [UnitId] -> (TargetInfo -> IO ()) -> IO ()
+withNeededTargetsInBuildOrder' :: Monad m => PackageDescription -> LocalBuildInfo -> [UnitId] -> (TargetInfo -> m ()) -> m ()
 withNeededTargetsInBuildOrder' pkg_descr lbi uids f
     = sequence_ [ f target | target <- neededTargetsInBuildOrder' pkg_descr lbi uids ]
 
@@ -295,13 +295,13 @@ unitIdTarget lbi = unitIdTarget' (localPkgDescr lbi) lbi
 allTargetsInBuildOrder :: LocalBuildInfo -> [TargetInfo]
 allTargetsInBuildOrder lbi = allTargetsInBuildOrder' (localPkgDescr lbi) lbi
 
-withAllTargetsInBuildOrder :: LocalBuildInfo -> (TargetInfo -> IO ()) -> IO ()
+withAllTargetsInBuildOrder :: Monad m => LocalBuildInfo -> (TargetInfo -> m ()) -> m ()
 withAllTargetsInBuildOrder lbi = withAllTargetsInBuildOrder' (localPkgDescr lbi) lbi
 
 neededTargetsInBuildOrder :: LocalBuildInfo -> [UnitId] -> [TargetInfo]
 neededTargetsInBuildOrder lbi = neededTargetsInBuildOrder' (localPkgDescr lbi) lbi
 
-withNeededTargetsInBuildOrder :: LocalBuildInfo -> [UnitId] -> (TargetInfo -> IO ()) -> IO ()
+withNeededTargetsInBuildOrder :: Monad m => LocalBuildInfo -> [UnitId] -> (TargetInfo -> m ()) -> m ()
 withNeededTargetsInBuildOrder lbi = withNeededTargetsInBuildOrder' (localPkgDescr lbi) lbi
 
 -------------------------------------------------------------------------------

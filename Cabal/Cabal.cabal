@@ -385,6 +385,10 @@ library
     Distribution.Parsec.ParseResult
     Distribution.Parsec.Parser
 
+  -- Cabal monad
+  exposed-modules:
+    Distribution.Monad
+
   -- Lens functionality
   exposed-modules:
     Distribution.Compat.Lens

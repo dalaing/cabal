@@ -27,7 +27,7 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Utils
 import Distribution.System
 import Distribution.TestSuite
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Text
 
 -- | Logs all test results for a package, broken down first by test suite and
@@ -125,8 +125,8 @@ testSuiteLogPath template pkg_descr lbi test_name result =
 -- | Print a summary to the console after all test suites have been run
 -- indicating the number of successful test suites and cases.  Returns 'True' if
 -- all test suites passed and 'False' otherwise.
-summarizePackage :: Verbosity -> PackageLog -> IO Bool
-summarizePackage verbosity packageLog = do
+summarizePackage :: PackageLog -> CabalM Bool
+summarizePackage packageLog = do
     let counts = map (countTestResults . testLogs) $ testSuites packageLog
         (passed, failed, errors) = foldl1 addTriple counts
         totalCases = passed + failed + errors
@@ -134,7 +134,7 @@ summarizePackage verbosity packageLog = do
                        $ filter (suitePassed . testLogs)
                        $ testSuites packageLog
         totalSuites = length $ testSuites packageLog
-    notice verbosity $ show passedSuites ++ " of " ++ show totalSuites
+    notice $ show passedSuites ++ " of " ++ show totalSuites
         ++ " test suites (" ++ show passed ++ " of "
         ++ show totalCases ++ " test cases) passed."
     return $! passedSuites == totalSuites
@@ -143,10 +143,10 @@ summarizePackage verbosity packageLog = do
 
 -- | Print a summary of a single test case's result to the console, supressing
 -- output for certain verbosity or test filter levels.
-summarizeTest :: Verbosity -> TestShowDetails -> TestLogs -> IO ()
-summarizeTest _ _ (GroupLogs {}) = return ()
-summarizeTest verbosity details t =
-    when shouldPrint $ notice verbosity $ "Test case " ++ testName t
+summarizeTest :: TestShowDetails -> TestLogs -> CabalM ()
+summarizeTest _ (GroupLogs {}) = return ()
+summarizeTest details t =
+    when shouldPrint $ notice $ "Test case " ++ testName t
         ++ ": " ++ show (testResult t)
     where shouldPrint = (details > Never) && (notPassed || details == Always)
           notPassed = testResult t /= Pass

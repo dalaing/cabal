@@ -24,8 +24,8 @@ import Distribution.Utils.NubList
          ( NubList, fromNubList )
 import Distribution.Client.HttpUtils
          ( HttpTransport, configureTransport )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, runCabalMInIO, liftIO, askVerbosity )
 import Distribution.Simple.Utils
          ( info )
 
@@ -119,7 +119,7 @@ data RepoContext = RepoContext {
     -- we don't know a-priori whether or not we need the transport (for instance
     -- when using cabal in "nix mode") incurring the overhead of transport
     -- initialization on _every_ invocation (eg @cabal build@) is undesirable.
-  , repoContextGetTransport :: IO HttpTransport
+  , repoContextGetTransport :: CabalM HttpTransport
 
     -- | Get the (initialized) secure repo
     --
@@ -127,8 +127,8 @@ data RepoContext = RepoContext {
     -- must be serializable)
   , repoContextWithSecureRepo :: forall a.
                                  Repo
-                              -> (forall down. Sec.Repository down -> IO a)
-                              -> IO a
+                              -> (forall down. Sec.Repository down -> CabalM a)
+                              -> CabalM a
 
     -- | Should we ignore expiry times (when checking security)?
   , repoContextIgnoreExpiry :: Bool
@@ -137,10 +137,9 @@ data RepoContext = RepoContext {
 -- | Wrapper around 'Repository', hiding the type argument
 data SecureRepo = forall down. SecureRepo (Sec.Repository down)
 
-withRepoContext :: Verbosity -> GlobalFlags -> (RepoContext -> IO a) -> IO a
-withRepoContext verbosity globalFlags =
+withRepoContext :: GlobalFlags -> (RepoContext -> CabalM a) -> CabalM a
+withRepoContext globalFlags =
     withRepoContext'
-      verbosity
       (fromNubList (globalRemoteRepos    globalFlags))
       (fromNubList (globalLocalRepos     globalFlags))
       (fromFlag    (globalCacheDir       globalFlags))
@@ -148,18 +147,19 @@ withRepoContext verbosity globalFlags =
       (flagToMaybe (globalIgnoreExpiry   globalFlags))
       (fromNubList (globalProgPathExtra globalFlags))
 
-withRepoContext' :: Verbosity -> [RemoteRepo] -> [FilePath]
+withRepoContext' :: [RemoteRepo] -> [FilePath]
                  -> FilePath  -> Maybe String -> Maybe Bool
                  -> [FilePath]
-                 -> (RepoContext -> IO a)
-                 -> IO a
-withRepoContext' verbosity remoteRepos localRepos
+                 -> (RepoContext -> CabalM a)
+                 -> CabalM a
+withRepoContext' remoteRepos localRepos
                  sharedCacheDir httpTransport ignoreExpiry extraPaths = \callback -> do
-    transportRef <- newMVar Nothing
+    transportRef <- liftIO $ newMVar Nothing
+    verbosity <- askVerbosity
     let httpLib = Sec.HTTP.transportAdapter
                     verbosity
                     (getTransport transportRef)
-    initSecureRepos verbosity httpLib secureRemoteRepos $ \secureRepos' ->
+    initSecureRepos httpLib secureRemoteRepos $ \secureRepos' ->
       callback RepoContext {
           repoContextRepos          = allRemoteRepos
                                    ++ map RepoLocal localRepos
@@ -177,38 +177,38 @@ withRepoContext' verbosity remoteRepos localRepos
             isSecure = remoteRepoSecure remote == Just True
       ]
 
-    getTransport :: MVar (Maybe HttpTransport) -> IO HttpTransport
+    getTransport :: MVar (Maybe HttpTransport) -> CabalM HttpTransport
     getTransport transportRef =
+      runCabalMInIO $ \liftC ->
       modifyMVar transportRef $ \mTransport -> do
         transport <- case mTransport of
           Just tr -> return tr
-          Nothing -> configureTransport verbosity extraPaths httpTransport
+          Nothing -> liftC $ configureTransport extraPaths httpTransport
         return (Just transport, transport)
 
     withSecureRepo :: Map Repo SecureRepo
                    -> Repo
-                   -> (forall down. Sec.Repository down -> IO a)
-                   -> IO a
+                   -> (forall down. Sec.Repository down -> CabalM a)
+                   -> CabalM a
     withSecureRepo secureRepos repo callback =
       case Map.lookup repo secureRepos of
         Just (SecureRepo secureRepo) -> callback secureRepo
-        Nothing -> throwIO $ userError "repoContextWithSecureRepo: unknown repo"
+        Nothing -> liftIO $ throwIO $ userError "repoContextWithSecureRepo: unknown repo"
 
 -- | Initialize the provided secure repositories
 --
 -- Assumed invariant: `remoteRepoSecure` should be set for all these repos.
-initSecureRepos :: forall a. Verbosity
-                -> Sec.HTTP.HttpLib
+initSecureRepos :: forall a. Sec.HTTP.HttpLib
                 -> [(RemoteRepo, FilePath)]
-                -> (Map Repo SecureRepo -> IO a)
-                -> IO a
-initSecureRepos verbosity httpLib repos callback = go Map.empty repos
+                -> (Map Repo SecureRepo -> CabalM a)
+                -> CabalM a
+initSecureRepos httpLib repos callback = go Map.empty repos
   where
-    go :: Map Repo SecureRepo -> [(RemoteRepo, FilePath)] -> IO a
+    go :: Map Repo SecureRepo -> [(RemoteRepo, FilePath)] -> CabalM a
     go !acc [] = callback acc
     go !acc ((r,cacheDir):rs) = do
-      cachePath <- Sec.makeAbsolute $ Sec.fromFilePath cacheDir
-      initSecureRepo verbosity httpLib r cachePath $ \r' ->
+      cachePath <- liftIO $ Sec.makeAbsolute $ Sec.fromFilePath cacheDir
+      initSecureRepo httpLib r cachePath $ \r' ->
         go (Map.insert (RepoSecure r cacheDir) r' acc) rs
 
 -- | Initialize the given secure repo
@@ -217,51 +217,52 @@ initSecureRepos verbosity httpLib repos callback = go Map.empty repos
 -- from @cabal-install@'s; these are secure repositories, but live in the local
 -- file system. We use the convention that these repositories are identified by
 -- URLs of the form @file:/path/to/local/repo@.
-initSecureRepo :: Verbosity
-               -> Sec.HTTP.HttpLib
+initSecureRepo :: Sec.HTTP.HttpLib
                -> RemoteRepo  -- ^ Secure repo ('remoteRepoSecure' assumed)
                -> Sec.Path Sec.Absolute -- ^ Cache dir
-               -> (SecureRepo -> IO a)  -- ^ Callback
-               -> IO a
-initSecureRepo verbosity httpLib RemoteRepo{..} cachePath = \callback -> do
-    requiresBootstrap <- withRepo [] Sec.requiresBootstrap
+               -> (SecureRepo -> CabalM a)  -- ^ Callback
+               -> CabalM a
+initSecureRepo httpLib RemoteRepo{..} cachePath = \callback -> do
+    requiresBootstrap <- withRepo [] (liftIO . Sec.requiresBootstrap)
 
     mirrors <- if requiresBootstrap
                then do
-                   info verbosity $ "Trying to locate mirrors via DNS for " ++
+                   info $ "Trying to locate mirrors via DNS for " ++
                                     "initial bootstrap of secure " ++
                                     "repository '" ++ show remoteRepoURI ++
                                     "' ..."
 
-                   Sec.DNS.queryBootstrapMirrors verbosity remoteRepoURI
+                   Sec.DNS.queryBootstrapMirrors remoteRepoURI
                else pure []
 
     withRepo mirrors $ \r -> do
-      when requiresBootstrap $ Sec.uncheckClientErrors $
+      liftIO $ when requiresBootstrap $ Sec.uncheckClientErrors $
         Sec.bootstrap r
           (map Sec.KeyId    remoteRepoRootKeys)
           (Sec.KeyThreshold (fromIntegral remoteRepoKeyThreshold))
       callback $ SecureRepo r
   where
     -- Initialize local or remote repo depending on the URI
-    withRepo :: [URI] -> (forall down. Sec.Repository down -> IO a) -> IO a
+    withRepo :: [URI] -> (forall down. Sec.Repository down -> CabalM a) -> CabalM a
     withRepo _ callback | uriScheme remoteRepoURI == "file:" = do
-      dir <- Sec.makeAbsolute $ Sec.fromFilePath (uriPath remoteRepoURI)
-      Sec.Local.withRepository dir
-                               cache
-                               Sec.hackageRepoLayout
-                               Sec.hackageIndexLayout
-                               logTUF
-                               callback
-    withRepo mirrors callback =
-      Sec.Remote.withRepository httpLib
-                                (remoteRepoURI:mirrors)
-                                Sec.Remote.defaultRepoOpts
+      runCabalMInIO $ \liftC -> do
+        dir <- Sec.makeAbsolute $ Sec.fromFilePath (uriPath remoteRepoURI)
+        Sec.Local.withRepository dir
                                 cache
                                 Sec.hackageRepoLayout
                                 Sec.hackageIndexLayout
-                                logTUF
-                                callback
+                                (liftC . logTUF)
+                                (liftC . callback)
+    withRepo mirrors callback =
+      runCabalMInIO $ \liftC -> do
+        Sec.Remote.withRepository httpLib
+                                  (remoteRepoURI:mirrors)
+                                  Sec.Remote.defaultRepoOpts
+                                  cache
+                                  Sec.hackageRepoLayout
+                                  Sec.hackageIndexLayout
+                                  (liftC . logTUF)
+                                  (liftC . callback)
 
     cache :: Sec.Cache
     cache = Sec.Cache {
@@ -279,5 +280,5 @@ initSecureRepo verbosity httpLib RemoteRepo{..} cachePath = \callback -> do
     -- We display any TUF progress only in verbose mode, including any transient
     -- verification errors. If verification fails, then the final exception that
     -- is thrown will of course be shown.
-    logTUF :: Sec.LogMessage -> IO ()
-    logTUF = info verbosity . Sec.pretty
+    logTUF :: Sec.LogMessage -> CabalM ()
+    logTUF = info . Sec.pretty

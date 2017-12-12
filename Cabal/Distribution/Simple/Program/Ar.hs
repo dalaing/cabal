@@ -21,6 +21,7 @@ module Distribution.Simple.Program.Ar (
 import Prelude ()
 import Distribution.Compat.Prelude
 
+import Control.Monad.Trans (liftIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Distribution.Compat.CopyFile (filesEqual)
@@ -39,8 +40,9 @@ import Distribution.Simple.Utils
          ( defaultTempFileOptions, dieWithLocation', withTempDirectory )
 import Distribution.System
          ( Arch(..), OS(..), Platform(..) )
+import Distribution.Monad ( CabalM(..), askVerbosity, runCabalMInIO)
 import Distribution.Verbosity
-         ( Verbosity, deafening, verbose )
+         ( deafening, verbose )
 import System.Directory (doesFileExist, renameFile)
 import System.FilePath ((</>), splitFileName)
 import System.IO
@@ -49,13 +51,13 @@ import System.IO
 
 -- | Call @ar@ to create a library archive from a bunch of object files.
 --
-createArLibArchive :: Verbosity -> LocalBuildInfo
-                   -> FilePath -> [FilePath] -> IO ()
-createArLibArchive verbosity lbi targetPath files = do
-  (ar, _) <- requireProgram verbosity arProgram progDb
+createArLibArchive :: LocalBuildInfo
+                   -> FilePath -> [FilePath] -> CabalM ()
+createArLibArchive lbi targetPath files = do
+  (ar, _) <- requireProgram arProgram progDb
 
   let (targetDir, targetName) = splitFileName targetPath
-  withTempDirectory verbosity targetDir "objs" $ \ tmpDir -> do
+  withTempDirectory targetDir "objs" $ \ tmpDir -> do
   let tmpPath = tmpDir </> targetName
 
   -- The args to use with "ar" are actually rather subtle and system-dependent.
@@ -72,6 +74,8 @@ createArLibArchive verbosity lbi targetPath files = do
   -- When we need to call ar multiple times we use "ar q" and for the last
   -- call on OSX we use "ar qs" so that it'll make the index.
 
+
+  verbosity <- askVerbosity
   let simpleArgs  = case hostOS of
              OSX -> ["-r", "-s"]
              _   -> ["-r"]
@@ -101,18 +105,18 @@ createArLibArchive verbosity lbi targetPath files = do
   if oldVersionManualOverride || responseArgumentsNotSupported
     then
       sequence_
-        [ runProgramInvocation verbosity inv
+        [ runProgramInvocation inv
         | inv <- multiStageProgramInvocation
                    simple (initial, middle, final) files ]
     else
-      withResponseFile verbosity defaultTempFileOptions tmpDir "ar.rsp" Nothing files $
-        \path -> runProgramInvocation verbosity $ invokeWithResponesFile path
+      withResponseFile defaultTempFileOptions tmpDir "ar.rsp" Nothing files $
+        \path -> runProgramInvocation $ invokeWithResponesFile path
 
   unless (hostArch == Arm -- See #1537
           || hostOS == AIX) $ -- AIX uses its own "ar" format variant
-    wipeMetadata verbosity tmpPath
-  equal <- filesEqual tmpPath targetPath
-  unless equal $ renameFile tmpPath targetPath
+    wipeMetadata tmpPath
+  equal <- liftIO $ filesEqual tmpPath targetPath
+  unless equal $ liftIO $ renameFile tmpPath targetPath
 
   where
     progDb = withPrograms lbi
@@ -128,15 +132,16 @@ createArLibArchive verbosity lbi targetPath files = do
 -- (@-D@) flag that always writes zero for the mtime, UID and GID, and 0644
 -- for the file mode. However detecting whether @-D@ is supported seems
 -- rather harder than just re-implementing this feature.
-wipeMetadata :: Verbosity -> FilePath -> IO ()
-wipeMetadata verbosity path = do
+wipeMetadata :: FilePath -> CabalM ()
+wipeMetadata path = do
     -- Check for existence first (ReadWriteMode would create one otherwise)
-    exists <- doesFileExist path
+    exists <- liftIO $ doesFileExist path
     unless exists $ wipeError "Temporary file disappeared"
-    withBinaryFile path ReadWriteMode $ \ h -> hFileSize h >>= wipeArchive h
+    runCabalMInIO $ \liftC ->
+      withBinaryFile path ReadWriteMode $ \ h -> hFileSize h >>= liftC . wipeArchive h
 
   where
-    wipeError msg = dieWithLocation' verbosity path Nothing $
+    wipeError msg = dieWithLocation' path Nothing $
         "Distribution.Simple.Program.Ar.wipeMetadata: " ++ msg
     archLF = "!<arch>\x0a" -- global magic, 8 bytes
     x60LF = "\x60\x0a" -- header magic, 2 bytes
@@ -150,19 +155,19 @@ wipeMetadata verbosity path = do
     headerSize = 60
 
     -- http://en.wikipedia.org/wiki/Ar_(Unix)#File_format_details
-    wipeArchive :: Handle -> Integer -> IO ()
+    wipeArchive :: Handle -> Integer -> CabalM ()
     wipeArchive h archiveSize = do
-        global <- BS.hGet h (BS.length archLF)
+        global <- liftIO $ BS.hGet h (BS.length archLF)
         unless (global == archLF) $ wipeError "Bad global header"
         wipeHeader (toInteger $ BS.length archLF)
 
       where
-        wipeHeader :: Integer -> IO ()
+        wipeHeader :: Integer -> CabalM ()
         wipeHeader offset = case compare offset archiveSize of
             EQ -> return ()
             GT -> wipeError (atOffset "Archive truncated")
             LT -> do
-                header <- BS.hGet h headerSize
+                header <- liftIO $ BS.hGet h headerSize
                 unless (BS.length header == headerSize) $
                     wipeError (atOffset "Short header")
                 let magic = BS.drop 58 header
@@ -178,13 +183,15 @@ wipeMetadata verbosity path = do
                 let replacement = BS.concat [ name, metadata, size, magic ]
                 unless (BS.length replacement == headerSize) $
                     wipeError (atOffset "Something has gone terribly wrong")
-                hSeek h AbsoluteSeek offset
-                BS.hPut h replacement
+
+                liftIO $ do
+                  hSeek h AbsoluteSeek offset
+                  BS.hPut h replacement
 
                 let nextHeader = offset + toInteger headerSize +
                         -- Odd objects are padded with an extra '\x0a'
                         if odd objSize then objSize + 1 else objSize
-                hSeek h AbsoluteSeek nextHeader
+                liftIO $ hSeek h AbsoluteSeek nextHeader
                 wipeHeader nextHeader
 
           where

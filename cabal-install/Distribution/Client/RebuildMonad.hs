@@ -14,6 +14,7 @@ module Distribution.Client.RebuildMonad (
     runRebuild,
     execRebuild,
     askRoot,
+    liftCabalM,
 
     -- * Setting up file monitoring
     monitorFiles,
@@ -61,7 +62,7 @@ import Distribution.Client.Glob hiding (matchFileGlob)
 import qualified Distribution.Client.Glob as Glob (matchFileGlob)
 
 import Distribution.Simple.Utils (debug)
-import Distribution.Verbosity    (Verbosity)
+import Distribution.Monad        (CabalM)
 
 import Control.Monad.State as State
 import Control.Monad.Reader as Reader
@@ -73,8 +74,11 @@ import System.Directory
 -- input files and values they depend on change. The crucial operations are
 -- 'rerunIfChanged' and 'monitorFiles'.
 --
-newtype Rebuild a = Rebuild (ReaderT FilePath (StateT [MonitorFilePath] IO) a)
+newtype Rebuild a = Rebuild (ReaderT FilePath (StateT [MonitorFilePath] CabalM) a)
   deriving (Functor, Applicative, Monad, MonadIO)
+
+liftCabalM :: CabalM a -> Rebuild a
+liftCabalM = Rebuild . lift . lift
 
 -- | Use this wihin the body action of 'rerunIfChanged' to declare that the
 -- action depends on the given files. This can be based on what the action
@@ -88,15 +92,15 @@ monitorFiles :: [MonitorFilePath] -> Rebuild ()
 monitorFiles filespecs = Rebuild (State.modify (filespecs++))
 
 -- | Run a 'Rebuild' IO action.
-unRebuild :: FilePath -> Rebuild a -> IO (a, [MonitorFilePath])
+unRebuild :: FilePath -> Rebuild a -> CabalM (a, [MonitorFilePath])
 unRebuild rootDir (Rebuild action) = runStateT (runReaderT action rootDir) []
 
 -- | Run a 'Rebuild' IO action.
-runRebuild :: FilePath -> Rebuild a -> IO a
+runRebuild :: FilePath -> Rebuild a -> CabalM a
 runRebuild rootDir (Rebuild action) = evalStateT (runReaderT action rootDir) []
 
 -- | Run a 'Rebuild' IO action.
-execRebuild :: FilePath -> Rebuild a -> IO [MonitorFilePath]
+execRebuild :: FilePath -> Rebuild a -> CabalM [MonitorFilePath]
 execRebuild rootDir (Rebuild action) = execStateT (runReaderT action rootDir) []
 
 -- | The root that relative paths are interpreted as being relative to.
@@ -113,26 +117,24 @@ askRoot = Rebuild Reader.ask
 -- Do not share 'FileMonitor's between different uses of 'rerunIfChanged'.
 --
 rerunIfChanged :: (Binary a, Binary b)
-               => Verbosity
-               -> FileMonitor a b
+               => FileMonitor a b
                -> a
                -> Rebuild b
                -> Rebuild b
-rerunIfChanged verbosity monitor key action = do
+rerunIfChanged monitor key action = do
     rootDir <- askRoot
     changed <- liftIO $ checkFileMonitorChanged monitor rootDir key
     case changed of
       MonitorUnchanged result files -> do
-        liftIO $ debug verbosity $ "File monitor '" ++ monitorName
-                                                    ++ "' unchanged."
+        liftCabalM $ debug $ "File monitor '" ++ monitorName ++ "' unchanged."
         monitorFiles files
         return result
 
       MonitorChanged reason -> do
-        liftIO $ debug verbosity $ "File monitor '" ++ monitorName
-                                ++ "' changed: " ++ showReason reason
+        liftCabalM $ debug $ "File monitor '" ++ monitorName
+                ++ "' changed: " ++ showReason reason
         startTime <- liftIO $ beginUpdateFileMonitor
-        (result, files) <- liftIO $ unRebuild rootDir action
+        (result, files) <- liftCabalM $ unRebuild rootDir action
         liftIO $ updateFileMonitor monitor rootDir
                                    (Just startTime) files key result
         monitorFiles files

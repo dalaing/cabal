@@ -105,6 +105,8 @@ import Distribution.Text
          ( display )
 import Distribution.Verbosity
          ( normal, Verbosity )
+import Distribution.Monad
+         ( CabalM )
 import Distribution.Version
 import qualified Distribution.Compat.Graph as Graph
 
@@ -683,8 +685,8 @@ applySandboxInstallPolicy
 -- * Interface to the standard resolver
 -- ------------------------------------------------------------
 
-chooseSolver :: Verbosity -> PreSolver -> CompilerInfo -> IO Solver
-chooseSolver _verbosity preSolver _cinfo =
+chooseSolver :: PreSolver -> CompilerInfo -> CabalM Solver
+chooseSolver preSolver _cinfo =
     case preSolver of
       AlwaysModular -> do
         return Modular

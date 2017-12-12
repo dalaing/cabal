@@ -45,7 +45,7 @@ import qualified Distribution.Compat.Graph as Graph
 import           Distribution.Compat.Graph (Graph, Node)
 import qualified Distribution.Compat.Binary as Binary
 import           Distribution.Simple.Utils
-import           Distribution.Verbosity
+import           Distribution.Monad
 import qualified Paths_cabal_install as Our (version)
 
 import Prelude ()
@@ -576,18 +576,17 @@ postBuildProjectStatus plan previousPackagesUpToDate
 
 
 
-updatePostBuildProjectStatus :: Verbosity
-                             -> DistDirLayout
+updatePostBuildProjectStatus :: DistDirLayout
                              -> ElaboratedInstallPlan
                              -> BuildStatusMap
                              -> BuildOutcomes
-                             -> IO PostBuildProjectStatus
-updatePostBuildProjectStatus verbosity distDirLayout
+                             -> CabalM PostBuildProjectStatus
+updatePostBuildProjectStatus distDirLayout
                              elaboratedInstallPlan
                              pkgsBuildStatus buildOutcomes = do
 
     -- Read the previous up-to-date set, update it and write it back
-    previousUpToDate   <- readPackagesUpToDateCacheFile distDirLayout
+    previousUpToDate   <- liftIO $ readPackagesUpToDateCacheFile distDirLayout
     let currentBuildStatus@PostBuildProjectStatus{..}
                         = postBuildProjectStatus
                             elaboratedInstallPlan
@@ -595,42 +594,42 @@ updatePostBuildProjectStatus verbosity distDirLayout
                             pkgsBuildStatus
                             buildOutcomes
     let currentUpToDate = packagesProbablyUpToDate
-    writePackagesUpToDateCacheFile distDirLayout currentUpToDate
+    liftIO $ writePackagesUpToDateCacheFile distDirLayout currentUpToDate
 
     -- Report various possibly interesting things
     -- We additionally intersect with the packagesBuildInplace so that
     -- we don't show huge numbers of boring packages from the store.
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages definitely up to date: "
      ++ displayPackageIdSet (packagesDefinitelyUpToDate
           `Set.intersection` packagesBuildInplace)
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages previously probably up to date: "
      ++ displayPackageIdSet (previousUpToDate
           `Set.intersection` packagesBuildInplace)
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages now probably up to date: "
      ++ displayPackageIdSet (packagesProbablyUpToDate
           `Set.intersection` packagesBuildInplace)
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages newly up to date: "
      ++ displayPackageIdSet (packagesDefinitelyUpToDate
             `Set.difference` previousUpToDate
           `Set.intersection` packagesBuildInplace)
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages out to date: "
      ++ displayPackageIdSet (packagesOutOfDate
           `Set.intersection` packagesBuildInplace)
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages invalid due to dep change: "
      ++ displayPackageIdSet packagesInvalidByChangedLibDeps
 
-    debugNoWrap verbosity $
+    debugNoWrap $
         "packages invalid due to build failure: "
      ++ displayPackageIdSet packagesInvalidByFailedBuild
 
@@ -669,20 +668,18 @@ writePackagesUpToDateCacheFile DistDirLayout{distProjectCacheFile} upToDate =
 -- temporarily, in case the compiler wants to learn this information via the
 -- filesystem, and returns any environment variable overrides the compiler
 -- needs.
-createPackageEnvironment :: Verbosity
-                         -> FilePath
+createPackageEnvironment :: FilePath
                          -> ElaboratedInstallPlan
                          -> ElaboratedSharedConfig
                          -> PostBuildProjectStatus
-                         -> IO [(String, Maybe String)]
-createPackageEnvironment verbosity
-                         path
+                         -> CabalM [(String, Maybe String)]
+createPackageEnvironment path
                          elaboratedPlan
                          elaboratedShared
                          buildStatus
   | compilerFlavor (pkgConfigCompiler elaboratedShared) == GHC
   = do
-    envFileM <- writePlanGhcEnvironment
+    envFileM <- liftIO $ writePlanGhcEnvironment
       path
       elaboratedPlan
       elaboratedShared
@@ -690,11 +687,11 @@ createPackageEnvironment verbosity
     case envFileM of
       Just envFile -> return [("GHC_ENVIRONMENT", Just envFile)]
       Nothing -> do
-        warn verbosity "the configured version of GHC does not support reading package lists from the environment; commands that need the current project's package database are likely to fail"
+        warn "the configured version of GHC does not support reading package lists from the environment; commands that need the current project's package database are likely to fail"
         return []
   | otherwise
   = do
-    warn verbosity "package environment configuration is not supported for the currently configured compiler; commands that need the current project's package database are likely to fail"
+    warn "package environment configuration is not supported for the currently configured compiler; commands that need the current project's package database are likely to fail"
     return []
 
 -- Writing .ghc.environment files

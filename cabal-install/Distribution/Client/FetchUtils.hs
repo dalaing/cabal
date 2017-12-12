@@ -44,7 +44,9 @@ import Distribution.Simple.Utils
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
-         ( Verbosity, verboseUnmarkOutput )
+         ( verboseUnmarkOutput )
+import Distribution.Monad
+         ( CabalM, runCabalMInIO, liftIO, localVerbosity )
 import Distribution.Client.GlobalFlags
          ( RepoContext(..) )
 
@@ -117,11 +119,10 @@ checkRepoTarballFetched repo pkgid = do
 
 -- | Fetch a package if we don't have it already.
 --
-fetchPackage :: Verbosity
-             -> RepoContext
+fetchPackage :: RepoContext
              -> UnresolvedPkgLoc
-             -> IO ResolvedPkgLoc
-fetchPackage verbosity repoCtxt loc = case loc of
+             -> CabalM ResolvedPkgLoc
+fetchPackage repoCtxt loc = case loc of
     LocalUnpackedPackage dir  ->
       return (LocalUnpackedPackage dir)
     LocalTarballPackage  file ->
@@ -135,29 +136,31 @@ fetchPackage verbosity repoCtxt loc = case loc of
       path <- downloadTarballPackage uri
       return (RemoteTarballPackage uri path)
     RepoTarballPackage repo pkgid Nothing -> do
-      local <- fetchRepoTarball verbosity repoCtxt repo pkgid
+      local <- fetchRepoTarball repoCtxt repo pkgid
       return (RepoTarballPackage repo pkgid local)
   where
     downloadTarballPackage uri = do
       transport <- repoContextGetTransport repoCtxt
-      transportCheckHttps verbosity transport uri
-      notice verbosity ("Downloading " ++ show uri)
-      tmpdir <- getTemporaryDirectory
-      (path, hnd) <- openTempFile tmpdir "cabal-.tar.gz"
-      hClose hnd
-      _ <- downloadURI transport verbosity uri path
+      transportCheckHttps transport uri
+      notice ("Downloading " ++ show uri)
+      path <- liftIO $ do
+        tmpdir <- getTemporaryDirectory
+        (path', hnd) <- openTempFile tmpdir "cabal-.tar.gz"
+        hClose hnd
+        return path'
+      _ <- downloadURI transport uri path
       return path
 
 
 -- | Fetch a repo package if we don't have it already.
 --
-fetchRepoTarball :: Verbosity -> RepoContext -> Repo -> PackageId -> IO FilePath
-fetchRepoTarball verbosity repoCtxt repo pkgid = do
-  fetched <- doesFileExist (packageFile repo pkgid)
+fetchRepoTarball :: RepoContext -> Repo -> PackageId -> CabalM FilePath
+fetchRepoTarball repoCtxt repo pkgid = do
+  fetched <- liftIO $ doesFileExist (packageFile repo pkgid)
   if fetched
-    then do info verbosity $ display pkgid ++ " has already been downloaded."
+    then do info $ display pkgid ++ " has already been downloaded."
             return (packageFile repo pkgid)
-    else do setupMessage verbosity "Downloading" pkgid
+    else do setupMessage "Downloading" pkgid
             downloadRepoPackage
   where
     downloadRepoPackage = case repo of
@@ -165,37 +168,38 @@ fetchRepoTarball verbosity repoCtxt repo pkgid = do
 
       RepoRemote{..} -> do
         transport <- repoContextGetTransport repoCtxt
-        remoteRepoCheckHttps verbosity transport repoRemote
+        remoteRepoCheckHttps transport repoRemote
         let uri  = packageURI  repoRemote pkgid
             dir  = packageDir  repo       pkgid
             path = packageFile repo       pkgid
-        createDirectoryIfMissing True dir
-        _ <- downloadURI transport verbosity uri path
+        liftIO $ createDirectoryIfMissing True dir
+        _ <- downloadURI transport uri path
         return path
 
       RepoSecure{} -> repoContextWithSecureRepo repoCtxt repo $ \rep -> do
         let dir  = packageDir  repo pkgid
             path = packageFile repo pkgid
-        createDirectoryIfMissing True dir
-        Sec.uncheckClientErrors $ do
-          info verbosity ("Writing " ++ path)
-          Sec.downloadPackage' rep pkgid path
+        liftIO $ createDirectoryIfMissing True dir
+        runCabalMInIO $ \liftC ->
+          Sec.uncheckClientErrors $ do
+            liftC $ info ("Writing " ++ path)
+            Sec.downloadPackage' rep pkgid path
         return path
 
 -- | Downloads an index file to [config-dir/packages/serv-id] without
 -- hackage-security. You probably don't want to call this directly;
 -- use 'updateRepo' instead.
 --
-downloadIndex :: HttpTransport -> Verbosity -> RemoteRepo -> FilePath -> IO DownloadResult
-downloadIndex transport verbosity remoteRepo cacheDir = do
-  remoteRepoCheckHttps verbosity transport remoteRepo
+downloadIndex :: HttpTransport -> RemoteRepo -> FilePath -> CabalM DownloadResult
+downloadIndex transport remoteRepo cacheDir = do
+  remoteRepoCheckHttps transport remoteRepo
   let uri = (remoteRepoURI remoteRepo) {
               uriPath = uriPath (remoteRepoURI remoteRepo)
                           `FilePath.Posix.combine` "00-index.tar.gz"
             }
       path = cacheDir </> "00-index" <.> "tar.gz"
-  createDirectoryIfMissing True cacheDir
-  downloadURI transport verbosity uri path
+  liftIO $ createDirectoryIfMissing True cacheDir
+  downloadURI transport uri path
 
 
 -- ------------------------------------------------------------
@@ -214,29 +218,29 @@ type AsyncFetchMap = Map UnresolvedPkgLoc
 -- location) to a completion var for that package. So the body action should
 -- lookup the location and use 'asyncFetchPackage' to get the result.
 --
-asyncFetchPackages :: Verbosity
-                   -> RepoContext
+asyncFetchPackages :: RepoContext
                    -> [UnresolvedPkgLoc]
-                   -> (AsyncFetchMap -> IO a)
-                   -> IO a
-asyncFetchPackages verbosity repoCtxt pkglocs body = do
+                   -> (AsyncFetchMap -> CabalM a)
+                   -> CabalM a
+asyncFetchPackages repoCtxt pkglocs body = do
     --TODO: [nice to have] use parallel downloads?
 
-    asyncDownloadVars <- sequence [ do v <- newEmptyMVar
-                                       return (pkgloc, v)
-                                  | pkgloc <- pkglocs ]
+    asyncDownloadVars <- liftIO $ sequence [ do v <- newEmptyMVar
+                                                return (pkgloc, v)
+                                           | pkgloc <- pkglocs ]
 
-    let fetchPackages :: IO ()
+    let fetchPackages :: CabalM ()
         fetchPackages =
           forM_ asyncDownloadVars $ \(pkgloc, var) -> do
             -- Suppress marking here, because 'withAsync' means
             -- that we get nondeterministic interleaving
-            result <- try $ fetchPackage (verboseUnmarkOutput verbosity)
-                                repoCtxt pkgloc
-            putMVar var result
+            result <- runCabalMInIO $ \liftC ->
+              try $ liftC $ localVerbosity verboseUnmarkOutput $ fetchPackage repoCtxt pkgloc
+            liftIO $ putMVar var result
 
-    withAsync fetchPackages $ \_ ->
-      body (Map.fromList asyncDownloadVars)
+    runCabalMInIO $ \liftC ->
+      withAsync (liftC fetchPackages) $ \_ ->
+        liftC $ body (Map.fromList asyncDownloadVars)
 
 
 -- | Expect to find a download in progress in the given 'AsyncFetchMap'
@@ -249,15 +253,14 @@ asyncFetchPackages verbosity repoCtxt pkglocs body = do
 -- components and/or qualified goals, and these all go through the
 -- download phase so we end up using 'waitAsyncFetchPackage' twice on
 -- the same package. C.f. #4461.
-waitAsyncFetchPackage :: Verbosity
-                      -> AsyncFetchMap
+waitAsyncFetchPackage :: AsyncFetchMap
                       -> UnresolvedPkgLoc
-                      -> IO ResolvedPkgLoc
-waitAsyncFetchPackage verbosity downloadMap srcloc =
+                      -> CabalM ResolvedPkgLoc
+waitAsyncFetchPackage downloadMap srcloc =
     case Map.lookup srcloc downloadMap of
       Just hnd -> do
-        debug verbosity $ "Waiting for download of " ++ show srcloc
-        either throwIO return =<< readMVar hnd
+        debug $ "Waiting for download of " ++ show srcloc
+        liftIO $ either throwIO return =<< readMVar hnd
       Nothing -> fail "waitAsyncFetchPackage: package not being downloaded"
 
 

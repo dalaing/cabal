@@ -22,7 +22,9 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, liftIO )
 import Distribution.Simple.Utils
          ( wrapText, die' )
 
@@ -73,19 +75,19 @@ buildCommand = Client.installCommand {
 buildAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
             -> [String] -> GlobalFlags -> IO ()
 buildAction (configFlags, configExFlags, installFlags, haddockFlags)
-            targetStrings globalFlags = do
+            targetStrings globalFlags = flip runCabalM verbosity $ do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext cliConfig
 
-    targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+    targetSelectors <- either reportTargetSelectorProblems return
+                   =<< liftIO (readTargetSelectors (localPackages baseCtx) targetStrings)
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan -> do
 
             -- Interpret the targets on the command line as build targets
             -- (as opposed to say repl or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either reportTargetProblems return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
@@ -99,17 +101,17 @@ buildAction (configFlags, configExFlags, installFlags, haddockFlags)
                                     elaboratedPlan
             elaboratedPlan'' <-
               if buildSettingOnlyDeps (buildSettings baseCtx)
-                then either (reportCannotPruneDependencies verbosity) return $
+                then either reportCannotPruneDependencies return $
                      pruneInstallPlanToDependencies (Map.keysSet targets)
                                                     elaboratedPlan'
                 else return elaboratedPlan'
 
             return (elaboratedPlan'', targets)
 
-    printPlan verbosity baseCtx buildCtx
+    printPlan baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    buildOutcomes <- runProjectBuildPhase baseCtx buildCtx
+    runProjectPostBuildPhase baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
@@ -176,9 +178,9 @@ data TargetProblem =
    | TargetProblemNoTargets   TargetSelector
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: [TargetProblem] -> CabalM a
+reportTargetProblems =
+    die' . unlines . map renderTargetProblem
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =
@@ -188,7 +190,7 @@ renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
 renderTargetProblem(TargetProblemNoTargets targetSelector) =
     renderTargetProblemNoTargets "build" targetSelector
 
-reportCannotPruneDependencies :: Verbosity -> CannotPruneDependencies -> IO a
-reportCannotPruneDependencies verbosity =
-    die' verbosity . renderCannotPruneDependencies
+reportCannotPruneDependencies :: CannotPruneDependencies -> CabalM a
+reportCannotPruneDependencies =
+    die' . renderCannotPruneDependencies
 

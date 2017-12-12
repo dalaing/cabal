@@ -32,6 +32,7 @@ import Distribution.System
 import Distribution.TestSuite
 import Distribution.Text
 import Distribution.Verbosity
+import Distribution.Monad
 
 import qualified Control.Exception as CE
 import System.Directory
@@ -50,34 +51,34 @@ runTest :: PD.PackageDescription
         -> TestFlags
         -> PD.TestSuite
         -> IO TestSuiteLog
-runTest pkg_descr lbi clbi flags suite = do
+runTest pkg_descr lbi clbi flags suite = flip runCabalM verbosity $ do
     let isCoverageEnabled = LBI.testCoverage lbi
         way = guessWay lbi
 
-    pwd <- getCurrentDirectory
-    existingEnv <- getEnvironment
+    pwd <- liftIO getCurrentDirectory
+    existingEnv <- liftIO getEnvironment
 
     let cmd = LBI.buildDir lbi </> stubName suite
                   </> stubName suite <.> exeExtension
     -- Check that the test executable exists.
-    exists <- doesFileExist cmd
+    exists <- liftIO $ doesFileExist cmd
     unless exists $
-      die' verbosity $ "Error: Could not find test program \"" ++ cmd
-                    ++ "\". Did you build the package first?"
+      die' $ "Error: Could not find test program \"" ++ cmd
+             ++ "\". Did you build the package first?"
 
     -- Remove old .tix files if appropriate.
-    unless (fromFlag $ testKeepTix flags) $ do
+    unless (fromFlag $ testKeepTix flags) $ liftIO $ do
         let tDir = tixDir distPref way testName'
         exists' <- doesDirectoryExist tDir
         when exists' $ removeDirectoryRecursive tDir
 
     -- Create directory for HPC files.
-    createDirectoryIfMissing True $ tixDir distPref way testName'
+    liftIO $ createDirectoryIfMissing True $ tixDir distPref way testName'
 
     -- Write summary notices indicating start of test suite
-    notice verbosity $ summarizeSuiteStart testName'
+    notice $ summarizeSuiteStart testName'
 
-    suiteLog <- CE.bracket openCabalTemp deleteIfExists $ \tempLog -> do
+    suiteLog <- runCabalMInIO $ \liftC -> CE.bracket openCabalTemp deleteIfExists $ \tempLog -> do
 
         (rOut, wOut) <- createPipe
 
@@ -99,7 +100,7 @@ runTest pkg_descr lbi clbi flags suite = do
                     cpath <- canonicalizePath $ LBI.componentBuildDir lbi clbi
                     return (addLibraryPath os (cpath : paths) shellEnv)
                   else return shellEnv
-                createProcessWithEnv verbosity cmd opts Nothing (Just shellEnv')
+                liftC $ createProcessWithEnv cmd opts Nothing (Just shellEnv')
                                      -- these handles are closed automatically
                                      CreatePipe (UseHandle wOut) (UseHandle wOut)
 
@@ -113,8 +114,9 @@ runTest pkg_descr lbi clbi flags suite = do
         length logText `seq` return ()
 
         exitcode <- waitForProcess process
+
         unless (exitcode == ExitSuccess) $ do
-            debug verbosity $ cmd ++ " returned " ++ show exitcode
+          liftC $ debug $ cmd ++ " returned " ++ show exitcode
 
         -- Generate final log file name
         let finalLogName l = testLogDir
@@ -140,20 +142,20 @@ runTest pkg_descr lbi clbi flags suite = do
             whenPrinting = when $ (details > Never)
                 && (not (suitePassed $ testLogs suiteLog) || details == Always)
                 && verbosity >= normal
-        whenPrinting $ putStr $ unlines $ lines logText
+        whenPrinting $ liftIO $ putStr $ unlines $ lines logText
 
         return suiteLog
 
     -- Write summary notice to terminal indicating end of test suite
-    notice verbosity $ summarizeSuiteFinish suiteLog
+    notice $ summarizeSuiteFinish suiteLog
 
     when isCoverageEnabled $
-        markupTest verbosity lbi distPref (display $ PD.package pkg_descr) suite
+        markupTest lbi distPref (display $ PD.package pkg_descr) suite
 
     return suiteLog
   where
     testName' = unUnqualComponentName $ PD.testName suite
-    
+
     deleteIfExists file = do
         exists <- doesFileExist file
         when exists $ removeFile file
@@ -246,7 +248,8 @@ stubRunTests tests = do
   where
     stubRunTests' (Test t) = do
         l <- run t >>= finish
-        summarizeTest normal Always l
+        flip runCabalM normal $
+          summarizeTest Always l
         return l
       where
         finish (Finished result) =

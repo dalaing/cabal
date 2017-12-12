@@ -150,7 +150,7 @@ setup' cmd args = do
         then runProgramM cabalProgram full_args
         else do
             pdfile <- liftIO $ tryFindPackageDesc (testCurrentDir env)
-            pdesc <- liftIO $ readGenericPackageDescription (testVerbosity env) pdfile
+            pdesc <- liftCabalM $ readGenericPackageDescription pdfile
             if buildType (packageDescription pdesc) == Simple
                 then runM (testSetupPath env) full_args
                 -- Run the Custom script!
@@ -755,8 +755,7 @@ hasCabalForGhc :: TestM Bool
 hasCabalForGhc = do
     env <- getTestEnv
     ghc_program <- requireProgramM ghcProgram
-    (runner_ghc_program, _) <- liftIO $ requireProgram
-        (testVerbosity env)
+    (runner_ghc_program, _) <- liftCabalM $ requireProgram
         ghcProgram
         (runnerProgramDb (testScriptEnv env))
     -- TODO: I guess, to be more robust what we should check for
@@ -882,7 +881,7 @@ withDelay m = do
     case testMtimeChangeDelay env of
         Nothing -> do
             -- Figure out how long we need to delay for recompilation tests
-            (_, mtimeChange) <- liftIO $ calibrateMtimeChangeDelay
+            (_, mtimeChange) <- liftCabalM calibrateMtimeChangeDelay
             withReaderT (\nenv -> nenv { testMtimeChangeDelay = Just mtimeChange }) m
         Just _ -> m
 

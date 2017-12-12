@@ -16,27 +16,27 @@ import Prelude ()
 import System.IO (TextEncoding, hSetEncoding, hPutStr, hClose)
 
 import Distribution.Compat.Prelude
+import Distribution.Monad
 import Distribution.Simple.Utils (TempFileOptions, withTempFileEx, debug)
-import Distribution.Verbosity
 
 withResponseFile
-  :: Verbosity
-  -> TempFileOptions
+  :: TempFileOptions
   -> FilePath           -- ^ Working directory to create response file in.
   -> FilePath           -- ^ Template for response file name.
   -> Maybe TextEncoding -- ^ Encoding to use for response file contents.
   -> [String]           -- ^ Arguments to put into response file.
-  -> (FilePath -> IO a)
-  -> IO a
-withResponseFile verbosity tmpFileOpts workDir fileNameTemplate encoding arguments f =
+  -> (FilePath -> CabalM a)
+  -> CabalM a
+withResponseFile tmpFileOpts workDir fileNameTemplate encoding arguments f =
   withTempFileEx tmpFileOpts workDir fileNameTemplate $ \responseFileName hf -> do
-    traverse_ (hSetEncoding hf) encoding
     let responseContents = unlines $ map escapeResponseFileArg arguments
-    hPutStr hf responseContents
-    hClose hf
-    debug verbosity $ responseFileName ++ " contents: <<<"
-    debug verbosity responseContents
-    debug verbosity $ ">>> " ++ responseFileName
+    liftIO $ do
+      traverse_ (hSetEncoding hf) encoding
+      hPutStr hf responseContents
+      hClose hf
+    debug $ responseFileName ++ " contents: <<<"
+    debug responseContents
+    debug $ ">>> " ++ responseFileName
     f responseFileName
 
 -- Support a gcc-like response file syntax.  Each separate

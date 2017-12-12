@@ -46,8 +46,8 @@ import Distribution.System
          ( Platform )
 import Distribution.Text
          ( display )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, liftIO, askVerbosity )
 
 import Control.Monad
          ( filterM )
@@ -68,8 +68,7 @@ import Control.Monad
 
 -- | Fetch a list of packages and their dependencies.
 --
-fetch :: Verbosity
-      -> PackageDBStack
+fetch :: PackageDBStack
       -> RepoContext
       -> Compiler
       -> Platform
@@ -77,67 +76,67 @@ fetch :: Verbosity
       -> GlobalFlags
       -> FetchFlags
       -> [UserTarget]
-      -> IO ()
-fetch verbosity _ _ _ _ _ _ _ [] =
-    notice verbosity "No packages requested. Nothing to do."
+      -> CabalM ()
+fetch _ _ _ _ _ _ _ [] =
+    notice "No packages requested. Nothing to do."
 
-fetch verbosity packageDBs repoCtxt comp platform progdb
+fetch packageDBs repoCtxt comp platform progdb
       globalFlags fetchFlags userTargets = do
 
-    mapM_ (checkTarget verbosity) userTargets
+    mapM_ checkTarget userTargets
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-    sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
-    pkgConfigDb       <- readPkgConfigDb      verbosity progdb
+    installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+    sourcePkgDb       <- getSourcePackages    repoCtxt
+    pkgConfigDb       <- readPkgConfigDb      progdb
 
-    pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
+    pkgSpecifiers <- resolveUserTargets repoCtxt
                        (fromFlag $ globalWorldFile globalFlags)
                        (packageIndex sourcePkgDb)
                        userTargets
 
     pkgs  <- planPackages
-               verbosity comp platform fetchFlags
+               comp platform fetchFlags
                installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
 
-    pkgs' <- filterM (fmap not . isFetched . packageSource) pkgs
+    pkgs' <- liftIO $ filterM (fmap not . isFetched . packageSource) pkgs
     if null pkgs'
       --TODO: when we add support for remote tarballs then this message
       -- will need to be changed because for remote tarballs we fetch them
       -- at the earlier phase.
-      then notice verbosity $ "No packages need to be fetched. "
+      then notice $ "No packages need to be fetched. "
                            ++ "All the requested packages are already local "
                            ++ "or cached locally."
       else if dryRun
-             then notice verbosity $ unlines $
+             then notice $ unlines $
                      "The following packages would be fetched:"
                    : map (display . packageId) pkgs'
 
-             else mapM_ (fetchPackage verbosity repoCtxt . packageSource) pkgs'
+             else mapM_ (fetchPackage repoCtxt . packageSource) pkgs'
 
   where
     dryRun = fromFlag (fetchDryRun fetchFlags)
 
-planPackages :: Verbosity
-             -> Compiler
+planPackages :: Compiler
              -> Platform
              -> FetchFlags
              -> InstalledPackageIndex
              -> SourcePackageDb
              -> PkgConfigDb
              -> [PackageSpecifier UnresolvedSourcePackage]
-             -> IO [UnresolvedSourcePackage]
-planPackages verbosity comp platform fetchFlags
+             -> CabalM [UnresolvedSourcePackage]
+planPackages comp platform fetchFlags
              installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
 
   | includeDependencies = do
-      solver <- chooseSolver verbosity
-                (fromFlag (fetchSolver fetchFlags)) (compilerInfo comp)
-      notice verbosity "Resolving dependencies..."
-      installPlan <- foldProgress logMsg (die' verbosity) return $
+      solver <- chooseSolver
+                  (fromFlag (fetchSolver fetchFlags)) (compilerInfo comp)
+      notice "Resolving dependencies..."
+      verbosity <- askVerbosity
+      installPlan <- foldProgress logMsg die' return $
                        resolveDependencies
                          platform (compilerInfo comp) pkgConfigDb
                          solver
-                         resolverParams
+                         (resolverParams verbosity)
 
       -- The packages we want to fetch are those packages the 'InstallPlan'
       -- that are in the 'InstallPlan.Configured' state.
@@ -147,11 +146,12 @@ planPackages verbosity comp platform fetchFlags
             <- SolverInstallPlan.toList installPlan ]
 
   | otherwise =
-      either (die' verbosity . unlines . map show) return $
-        resolveWithoutDependencies resolverParams
+      askVerbosity >>= \verb ->
+        either (die' . unlines . map show) return $
+          resolveWithoutDependencies (resolverParams verb)
 
   where
-    resolverParams =
+    resolverParams verb =
 
         setMaxBackjumps (if maxBackjumps < 0 then Nothing
                                              else Just maxBackjumps)
@@ -168,7 +168,7 @@ planPackages verbosity comp platform fetchFlags
 
       . setAllowBootLibInstalls allowBootLibInstalls
 
-      . setSolverVerbosity verbosity
+      . setSolverVerbosity verb
 
       . addConstraints
           [ let pc = PackageConstraint
@@ -186,7 +186,7 @@ planPackages verbosity comp platform fetchFlags
       $ standardInstallPolicy installedPkgIndex sourcePkgDb pkgSpecifiers
 
     includeDependencies = fromFlag (fetchDeps fetchFlags)
-    logMsg message rest = debug verbosity message >> rest
+    logMsg message rest = debug message >> rest
 
     stanzas           = [ TestStanzas | testsEnabled ]
                      ++ [ BenchStanzas | benchmarksEnabled ]
@@ -202,22 +202,22 @@ planPackages verbosity comp platform fetchFlags
     allowBootLibInstalls = fromFlag (fetchAllowBootLibInstalls fetchFlags)
 
 
-checkTarget :: Verbosity -> UserTarget -> IO ()
-checkTarget verbosity target = case target of
+checkTarget :: UserTarget -> CabalM ()
+checkTarget target = case target of
     UserTargetRemoteTarball _uri
-      -> die' verbosity $ "The 'fetch' command does not yet support remote tarballs. "
+      -> die' $ "The 'fetch' command does not yet support remote tarballs. "
             ++ "In the meantime you can use the 'unpack' commands."
     _ -> return ()
 
-fetchPackage :: Verbosity -> RepoContext -> PackageLocation a -> IO ()
-fetchPackage verbosity repoCtxt pkgsrc = case pkgsrc of
+fetchPackage :: RepoContext -> PackageLocation a -> CabalM ()
+fetchPackage repoCtxt pkgsrc = case pkgsrc of
     LocalUnpackedPackage _dir  -> return ()
     LocalTarballPackage  _file -> return ()
 
     RemoteTarballPackage _uri _ ->
-      die' verbosity $ "The 'fetch' command does not yet support remote tarballs. "
+      die' $ "The 'fetch' command does not yet support remote tarballs. "
          ++ "In the meantime you can use the 'unpack' commands."
 
     RepoTarballPackage repo pkgid _ -> do
-      _ <- fetchRepoTarball verbosity repoCtxt repo pkgid
+      _ <- fetchRepoTarball repoCtxt repo pkgid
       return ()

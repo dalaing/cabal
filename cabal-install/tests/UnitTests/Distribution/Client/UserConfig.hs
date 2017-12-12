@@ -23,6 +23,7 @@ import Distribution.Client.Utils (removeExistingFile)
 import Distribution.Simple.Setup (Flag (..), ConfigFlags (..), fromFlag)
 import Distribution.Simple.Utils (withTempDirectory)
 import Distribution.Verbosity (silent)
+import Distribution.Monad (runCabalM, liftIO)
 
 tests :: [TestTree]
 tests = [ testCase "nullDiffOnCreate" nullDiffOnCreateTest
@@ -33,62 +34,63 @@ tests = [ testCase "nullDiffOnCreate" nullDiffOnCreateTest
         ]
 
 nullDiffOnCreateTest :: Assertion
-nullDiffOnCreateTest = bracketTest $ \configFile -> do
+nullDiffOnCreateTest = bracketTest $ \configFile -> flip runCabalM silent $ do
     -- Create a new default config file in our test directory.
-    _ <- loadConfig silent (Flag configFile)
+    _ <- loadConfig (Flag configFile)
     -- Now we read it in and compare it against the default.
-    diff <- userConfigDiff silent (globalFlags configFile) []
-    assertBool (unlines $ "Following diff should be empty:" : diff) $ null diff
+    diff <- userConfigDiff (globalFlags configFile) []
+    liftIO $ assertBool (unlines $ "Following diff should be empty:" : diff) $ null diff
 
 
 canDetectDifference :: Assertion
-canDetectDifference = bracketTest $ \configFile -> do
+canDetectDifference = bracketTest $ \configFile -> flip runCabalM silent $ do
     -- Create a new default config file in our test directory.
-    _ <- loadConfig silent (Flag configFile)
-    appendFile configFile "verbose: 0\n"
-    diff <- userConfigDiff silent (globalFlags configFile) []
-    assertBool (unlines $ "Should detect a difference:" : diff) $
+    _ <- loadConfig (Flag configFile)
+    liftIO $appendFile configFile "verbose: 0\n"
+    diff <- userConfigDiff (globalFlags configFile) []
+    liftIO $ assertBool (unlines $ "Should detect a difference:" : diff) $
         diff == [ "+ verbose: 0" ]
 
 
 canUpdateConfig :: Assertion
-canUpdateConfig = bracketTest $ \configFile -> do
+canUpdateConfig = bracketTest $ \configFile -> flip runCabalM silent $ do
     -- Write a trivial cabal file.
-    writeFile configFile "tests: True\n"
+    liftIO $ writeFile configFile "tests: True\n"
     -- Update the config file.
-    userConfigUpdate silent (globalFlags configFile) []
+    userConfigUpdate (globalFlags configFile) []
     -- Load it again.
-    updated <- loadConfig silent (Flag configFile)
-    assertBool ("Field 'tests' should be True") $
+    updated <- loadConfig (Flag configFile)
+    liftIO $ assertBool ("Field 'tests' should be True") $
         fromFlag (configTests $ savedConfigureFlags updated)
 
 
 doubleUpdateConfig :: Assertion
-doubleUpdateConfig = bracketTest $ \configFile -> do
+doubleUpdateConfig = bracketTest $ \configFile -> flip runCabalM silent $ do
     -- Create a new default config file in our test directory.
-    _ <- loadConfig silent (Flag configFile)
+    _ <- loadConfig (Flag configFile)
     -- Update it twice.
-    replicateM_ 2 $ userConfigUpdate silent (globalFlags configFile) []
+    replicateM_ 2 $ userConfigUpdate (globalFlags configFile) []
     -- Load it again.
-    updated <- loadConfig silent (Flag configFile)
+    updated <- loadConfig (Flag configFile)
 
-    assertBool ("Field 'remote-repo' doesn't contain duplicates") $
-        listUnique (map show . fromNubList . globalRemoteRepos $ savedGlobalFlags updated)
-    assertBool ("Field 'extra-prog-path' doesn't contain duplicates") $
-        listUnique (map show . fromNubList . configProgramPathExtra $ savedConfigureFlags updated)
-    assertBool ("Field 'build-summary' doesn't contain duplicates") $
-        listUnique (map show . fromNubList . installSummaryFile $ savedInstallFlags updated)
+    liftIO $ do
+      assertBool ("Field 'remote-repo' doesn't contain duplicates") $
+          listUnique (map show . fromNubList . globalRemoteRepos $ savedGlobalFlags updated)
+      assertBool ("Field 'extra-prog-path' doesn't contain duplicates") $
+          listUnique (map show . fromNubList . configProgramPathExtra $ savedConfigureFlags updated)
+      assertBool ("Field 'build-summary' doesn't contain duplicates") $
+          listUnique (map show . fromNubList . installSummaryFile $ savedInstallFlags updated)
 
 
 newDefaultConfig :: Assertion
-newDefaultConfig = do
-    sysTmpDir <- getTemporaryDirectory
-    withTempDirectory silent sysTmpDir "cabal-test" $ \tmpDir -> do
+newDefaultConfig = flip runCabalM silent $ do
+    sysTmpDir <- liftIO getTemporaryDirectory
+    withTempDirectory sysTmpDir "cabal-test" $ \tmpDir -> do
         let configFile  = tmpDir </> "tmp.config"
-        _ <- createDefaultConfigFile silent [] configFile
-        exists <- doesFileExist configFile
-        assertBool ("Config file should be written to " ++ configFile) exists
-
+        _ <- createDefaultConfigFile [] configFile
+        liftIO $ do
+          exists <- doesFileExist configFile
+          assertBool ("Config file should be written to " ++ configFile) exists
 
 globalFlags :: FilePath -> GlobalFlags
 globalFlags configFile = mempty { globalConfigFile = Flag configFile }

@@ -78,6 +78,7 @@ import Distribution.Simple.Utils
 
 import Distribution.License
 import Distribution.Version
+import Distribution.Monad
 import Distribution.Text
 
 import System.Environment (getArgs, getProgName)
@@ -134,56 +135,73 @@ defaultMainHelper args =
 configureAction :: ConfigFlags -> [String] -> IO ()
 configureAction flags args = do
   noExtraFlags args
-  let verbosity = fromFlag (configVerbosity flags)
-  rawSystemExit verbosity "sh" $
-    "configure"
-    : configureArgs backwardsCompatHack flags
+  let verbosity = fromFlag $ configVerbosity flags
+  flip runCabalM verbosity $ do
+    rawSystemExit "sh" $
+      "configure"
+      : configureArgs backwardsCompatHack flags
   where backwardsCompatHack = True
 
 copyAction :: CopyFlags -> [String] -> IO ()
 copyAction flags args = do
   noExtraFlags args
-  let destArgs = case fromFlag $ copyDest flags of
+  let verbosity = fromFlag $ copyVerbosity flags
+      destArgs = case fromFlag $ copyDest flags of
         NoCopyDest      -> ["install"]
         CopyTo path     -> ["copy", "destdir=" ++ path]
         CopyToDb _      -> error "CopyToDb not supported via Make"
 
-  rawSystemExit (fromFlag $ copyVerbosity flags) "make" destArgs
+  flip runCabalM verbosity $
+    rawSystemExit "make" destArgs
 
 installAction :: InstallFlags -> [String] -> IO ()
 installAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ installVerbosity flags) "make" ["install"]
-  rawSystemExit (fromFlag $ installVerbosity flags) "make" ["register"]
+  let verbosity = fromFlag $ installVerbosity flags
+  flip runCabalM verbosity $ do
+    rawSystemExit "make" ["install"]
+    rawSystemExit "make" ["register"]
 
 haddockAction :: HaddockFlags -> [String] -> IO ()
 haddockAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ haddockVerbosity flags) "make" ["docs"]
+  let verbosity = fromFlag $ haddockVerbosity flags
+      run = flip runCabalM verbosity
+  run (rawSystemExit "make" ["docs"])
     `catchIO` \_ ->
-    rawSystemExit (fromFlag $ haddockVerbosity flags) "make" ["doc"]
+    run (rawSystemExit "make" ["doc"])
 
 buildAction :: BuildFlags -> [String] -> IO ()
 buildAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ buildVerbosity flags) "make" []
+  let verbosity = fromFlag $ buildVerbosity flags
+  flip runCabalM verbosity $
+    rawSystemExit "make" []
 
 cleanAction :: CleanFlags -> [String] -> IO ()
 cleanAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ cleanVerbosity flags) "make" ["clean"]
+  let verbosity = fromFlag $ cleanVerbosity flags
+  flip runCabalM verbosity $
+    rawSystemExit "make" ["clean"]
 
 sdistAction :: SDistFlags -> [String] -> IO ()
 sdistAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ sDistVerbosity flags) "make" ["dist"]
+  let verbosity = fromFlag $ sDistVerbosity flags
+  flip runCabalM verbosity $
+    rawSystemExit "make" ["dist"]
 
 registerAction :: RegisterFlags -> [String] -> IO ()
 registerAction  flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ regVerbosity flags) "make" ["register"]
+  let verbosity = fromFlag $ regVerbosity flags
+  flip runCabalM verbosity $
+    rawSystemExit "make" ["register"]
 
 unregisterAction :: RegisterFlags -> [String] -> IO ()
 unregisterAction flags args = do
   noExtraFlags args
-  rawSystemExit (fromFlag $ regVerbosity flags) "make" ["unregister"]
+  let verbosity = fromFlag $ regVerbosity flags
+  flip runCabalM verbosity $
+    rawSystemExit "make" ["unregister"]

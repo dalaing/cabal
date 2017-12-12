@@ -102,6 +102,8 @@ import Distribution.Utils.NubList
          ( fromNubList )
 import Distribution.Verbosity
          ( Verbosity, modifyVerbosity, verbose )
+import Distribution.Monad
+         ( CabalM )
 import Distribution.Text
 import Distribution.ParseUtils
          ( ParseResult(..), locatedErrorMsg, showPWarning )
@@ -141,12 +143,10 @@ lookupLocalPackageConfig field ProjectConfig {
 
 -- | Use a 'RepoContext' based on the 'BuildTimeSettings'.
 --
-projectConfigWithBuilderRepoContext :: Verbosity
-                                    -> BuildTimeSettings
-                                    -> (RepoContext -> IO a) -> IO a
-projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
+projectConfigWithBuilderRepoContext :: BuildTimeSettings
+                                    -> (RepoContext -> CabalM a) -> CabalM a
+projectConfigWithBuilderRepoContext BuildTimeSettings{..} =
     withRepoContext'
-      verbosity
       buildSettingRemoteRepos
       buildSettingLocalRepos
       buildSettingCacheDir
@@ -160,15 +160,12 @@ projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
 -- that doesn't have an http transport. And that avoids having to have access
 -- to the 'BuildTimeSettings'
 --
-projectConfigWithSolverRepoContext :: Verbosity
-                                   -> ProjectConfigShared
+projectConfigWithSolverRepoContext :: ProjectConfigShared
                                    -> ProjectConfigBuildOnly
-                                   -> (RepoContext -> IO a) -> IO a
-projectConfigWithSolverRepoContext verbosity
-                                   ProjectConfigShared{..}
+                                   -> (RepoContext -> CabalM a) -> CabalM a
+projectConfigWithSolverRepoContext ProjectConfigShared{..}
                                    ProjectConfigBuildOnly{..} =
     withRepoContext'
-      verbosity
       (fromNubList projectConfigRemoteRepos)
       (fromNubList projectConfigLocalRepos)
       (fromFlagOrDefault (error "projectConfigWithSolverRepoContext: projectConfigCacheDir")
@@ -415,25 +412,25 @@ renderBadProjectRoot (BadProjectRootExplicitFile projectFile) =
 -- | Read all the config relevant for a project. This includes the project
 -- file if any, plus other global config.
 --
-readProjectConfig :: Verbosity -> Flag FilePath -> DistDirLayout -> Rebuild ProjectConfig
-readProjectConfig verbosity configFileFlag distDirLayout = do
-    global <- readGlobalConfig             verbosity configFileFlag
-    local  <- readProjectLocalConfig       verbosity distDirLayout
-    freeze <- readProjectLocalFreezeConfig verbosity distDirLayout
-    extra  <- readProjectLocalExtraConfig  verbosity distDirLayout
+readProjectConfig :: Flag FilePath -> DistDirLayout -> Rebuild ProjectConfig
+readProjectConfig configFileFlag distDirLayout = do
+    global <- readGlobalConfig             configFileFlag
+    local  <- readProjectLocalConfig       distDirLayout
+    freeze <- readProjectLocalFreezeConfig distDirLayout
+    extra  <- readProjectLocalExtraConfig  distDirLayout
     return (global <> local <> freeze <> extra)
 
 
 -- | Reads an explicit @cabal.project@ file in the given project root dir,
 -- or returns the default project config for an implicitly defined project.
 --
-readProjectLocalConfig :: Verbosity -> DistDirLayout -> Rebuild ProjectConfig
-readProjectLocalConfig verbosity DistDirLayout{distProjectFile} = do
+readProjectLocalConfig :: DistDirLayout -> Rebuild ProjectConfig
+readProjectLocalConfig DistDirLayout{distProjectFile} = do
   usesExplicitProjectRoot <- liftIO $ doesFileExist projectFile
   if usesExplicitProjectRoot
     then do
       monitorFiles [monitorFileHashed projectFile]
-      addProjectFileProvenance <$> liftIO readProjectFile
+      liftCabalM $ addProjectFileProvenance <$> readProjectFile
     else do
       monitorFiles [monitorNonExistentFile projectFile]
       return defaultImplicitProjectConfig
@@ -441,9 +438,9 @@ readProjectLocalConfig verbosity DistDirLayout{distProjectFile} = do
   where
     projectFile = distProjectFile ""
     readProjectFile =
-          reportParseResult verbosity "project file" projectFile
+          reportParseResult "project file" projectFile
         . parseProjectConfig
-      =<< readFile projectFile
+      =<< liftIO (readFile projectFile)
 
     addProjectFileProvenance config =
       config {
@@ -467,41 +464,41 @@ readProjectLocalConfig verbosity DistDirLayout{distProjectFile} = do
 -- or returns empty. This file gets written by @cabal configure@, or in
 -- principle can be edited manually or by other tools.
 --
-readProjectLocalExtraConfig :: Verbosity -> DistDirLayout
+readProjectLocalExtraConfig :: DistDirLayout
                             -> Rebuild ProjectConfig
-readProjectLocalExtraConfig verbosity distDirLayout =
-    readProjectExtensionFile verbosity distDirLayout "local"
+readProjectLocalExtraConfig distDirLayout =
+    readProjectExtensionFile distDirLayout "local"
                              "project local configuration file"
 
 -- | Reads a @cabal.project.freeze@ file in the given project root dir,
 -- or returns empty. This file gets written by @cabal freeze@, or in
 -- principle can be edited manually or by other tools.
 --
-readProjectLocalFreezeConfig :: Verbosity -> DistDirLayout
+readProjectLocalFreezeConfig :: DistDirLayout
                              -> Rebuild ProjectConfig
-readProjectLocalFreezeConfig verbosity distDirLayout =
-    readProjectExtensionFile verbosity distDirLayout "freeze"
+readProjectLocalFreezeConfig distDirLayout =
+    readProjectExtensionFile distDirLayout "freeze"
                              "project freeze file"
 
 -- | Reads a named config file in the given project root dir, or returns empty.
 --
-readProjectExtensionFile :: Verbosity -> DistDirLayout -> String -> FilePath
+readProjectExtensionFile :: DistDirLayout -> String -> FilePath
                          -> Rebuild ProjectConfig
-readProjectExtensionFile verbosity DistDirLayout{distProjectFile}
+readProjectExtensionFile DistDirLayout{distProjectFile}
                          extensionName extensionDescription = do
     exists <- liftIO $ doesFileExist extensionFile
     if exists
       then do monitorFiles [monitorFileHashed extensionFile]
-              liftIO readExtensionFile
+              liftCabalM readExtensionFile
       else do monitorFiles [monitorNonExistentFile extensionFile]
               return mempty
   where
     extensionFile = distProjectFile extensionName
 
     readExtensionFile =
-          reportParseResult verbosity extensionDescription extensionFile
+          reportParseResult extensionDescription extensionFile
         . parseProjectConfig
-      =<< readFile extensionFile
+      =<< liftIO (readFile extensionFile)
 
 
 -- | Parse the 'ProjectConfig' format.
@@ -548,22 +545,22 @@ writeProjectConfigFile file =
 
 -- | Read the user's @~/.cabal/config@ file.
 --
-readGlobalConfig :: Verbosity -> Flag FilePath -> Rebuild ProjectConfig
-readGlobalConfig verbosity configFileFlag = do
-    config     <- liftIO (loadConfig verbosity configFileFlag)
-    configFile <- liftIO (getConfigFilePath configFileFlag)
+readGlobalConfig :: Flag FilePath -> Rebuild ProjectConfig
+readGlobalConfig configFileFlag = do
+    config     <- liftCabalM $ loadConfig configFileFlag
+    configFile <- liftIO $ getConfigFilePath configFileFlag
     monitorFiles [monitorFileHashed configFile]
     return (convertLegacyGlobalConfig config)
 
-reportParseResult :: Verbosity -> String -> FilePath -> ParseResult a -> IO a
-reportParseResult verbosity _filetype filename (ParseOk warnings x) = do
+reportParseResult :: String -> FilePath -> ParseResult a -> CabalM a
+reportParseResult _filetype filename (ParseOk warnings x) = do
     unless (null warnings) $
       let msg = unlines (map (showPWarning filename) warnings)
-       in warn verbosity msg
+       in warn msg
     return x
-reportParseResult verbosity filetype filename (ParseFailed err) =
+reportParseResult filetype filename (ParseFailed err) =
     let (line, msg) = locatedErrorMsg err
-     in die' verbosity $ "Error parsing " ++ filetype ++ " " ++ filename
+     in die' $ "Error parsing " ++ filetype ++ " " ++ filename
            ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
 
 
@@ -890,17 +887,17 @@ mplusMaybeT ma mb = do
 -- Note here is where we convert from project-root relative paths to absolute
 -- paths.
 --
-readSourcePackage :: Verbosity -> ProjectPackageLocation
+readSourcePackage :: ProjectPackageLocation
                   -> Rebuild (PackageSpecifier UnresolvedSourcePackage)
-readSourcePackage verbosity (ProjectPackageLocalCabalFile cabalFile) =
-    readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile)
+readSourcePackage (ProjectPackageLocalCabalFile cabalFile) =
+    readSourcePackage (ProjectPackageLocalDirectory dir cabalFile)
   where
     dir = takeDirectory cabalFile
 
-readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile) = do
+readSourcePackage (ProjectPackageLocalDirectory dir cabalFile) = do
     monitorFiles [monitorFileHashed cabalFile]
     root <- askRoot
-    pkgdesc <- liftIO $ readGenericPackageDescription verbosity (root </> cabalFile)
+    pkgdesc <- liftCabalM $ readGenericPackageDescription (root </> cabalFile)
     return $ SpecificSourcePackage SourcePackage {
       packageInfoId        = packageId pkgdesc,
       packageDescription   = pkgdesc,
@@ -908,10 +905,10 @@ readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile) = do
       packageDescrOverride = Nothing
     }
 
-readSourcePackage _ (ProjectPackageNamed (Dependency pkgname verrange)) =
+readSourcePackage (ProjectPackageNamed (Dependency pkgname verrange)) =
     return $ NamedPackage pkgname [PackagePropertyVersion verrange]
 
-readSourcePackage _verbosity _ =
+readSourcePackage _ =
     fail $ "TODO: add support for fetching and reading local tarballs, remote "
         ++ "tarballs, remote repos and passing named packages through"
 

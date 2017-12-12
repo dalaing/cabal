@@ -40,6 +40,7 @@ import Distribution.System
 import Distribution.Utils.NubList
 import Distribution.Version
 import Distribution.Verbosity
+import Distribution.Monad
 
 -- -----------------------------------------------------------------------------
 -- Types
@@ -59,38 +60,40 @@ doctest :: PackageDescription
         -> [PPSuffixHandler]
         -> DoctestFlags
         -> IO ()
-doctest pkg_descr lbi suffixes doctestFlags = do
-  let verbosity     = flag doctestVerbosity
-      distPref      = flag doctestDistPref
-      flag f        = fromFlag $ f doctestFlags
+doctest pkg_descr lbi suffixes doctestFlags = flip runCabalM verbosity $ do
+  let
       tmpFileOpts   = defaultTempFileOptions
       lbi'          = lbi { withPackageDB = withPackageDB lbi
                             ++ [SpecificPackageDB (internalPackageDBPath lbi distPref)] }
 
   (doctestProg, _version, _) <-
-    requireProgramVersion verbosity doctestProgram
+    requireProgramVersion doctestProgram
       (orLaterVersion (mkVersion [0,11,3])) (withPrograms lbi)
 
   withAllComponentsInBuildOrder pkg_descr lbi $ \component clbi -> do
-     componentInitialBuildSteps distPref pkg_descr lbi clbi verbosity
-     preprocessComponent pkg_descr component lbi clbi False verbosity suffixes
+     componentInitialBuildSteps distPref pkg_descr lbi clbi
+     preprocessComponent pkg_descr component lbi clbi False suffixes
 
      case component of
        CLib lib -> do
-         withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+         withTempDirectoryEx tmpFileOpts (buildDir lbi) "tmp" $
            \tmp -> do
-             inFiles <- map snd <$> getLibSourceFiles verbosity lbi lib clbi
-             args    <- mkDoctestArgs verbosity tmp lbi' clbi inFiles (libBuildInfo lib)
-             runDoctest verbosity (compiler lbi) (hostPlatform lbi) doctestProg args
+             inFiles <- map snd <$> getLibSourceFiles lbi lib clbi
+             args    <- mkDoctestArgs tmp lbi' clbi inFiles (libBuildInfo lib)
+             runDoctest (compiler lbi) (hostPlatform lbi) doctestProg args
        CExe exe -> do
-         withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+         withTempDirectoryEx tmpFileOpts (buildDir lbi) "tmp" $
            \tmp -> do
-             inFiles <- map snd <$> getExeSourceFiles verbosity lbi exe clbi
-             args    <- mkDoctestArgs verbosity tmp lbi' clbi inFiles (buildInfo exe)
-             runDoctest verbosity (compiler lbi) (hostPlatform lbi) doctestProg args
+             inFiles <- map snd <$> getExeSourceFiles lbi exe clbi
+             args    <- mkDoctestArgs tmp lbi' clbi inFiles (buildInfo exe)
+             runDoctest (compiler lbi) (hostPlatform lbi) doctestProg args
        CFLib _  -> return () -- do not doctest foreign libs
        CTest _  -> return () -- do not doctest tests
        CBench _ -> return () -- do not doctest benchmarks
+  where
+    verbosity     = flag doctestVerbosity
+    distPref      = flag doctestDistPref
+    flag f        = fromFlag $ f doctestFlags
 
 -- -----------------------------------------------------------------------------
 -- Contributions to DoctestArgs (see also Haddock.hs for very similar code).
@@ -107,14 +110,13 @@ componentGhcOptions verbosity lbi bi clbi odir =
                        "doctest only supports GHC and GHCJS"
   in f verbosity lbi bi clbi odir
 
-mkDoctestArgs :: Verbosity
-              -> FilePath
+mkDoctestArgs :: FilePath
               -> LocalBuildInfo
               -> ComponentLocalBuildInfo
               -> [FilePath]
               -> BuildInfo
-              -> IO DoctestArgs
-mkDoctestArgs verbosity tmp lbi clbi inFiles bi = do
+              -> CabalM DoctestArgs
+mkDoctestArgs tmp lbi clbi inFiles bi = do
   let vanillaOpts = (componentGhcOptions normal lbi bi clbi (buildDir lbi))
         { ghcOptOptimisation = mempty -- no optimizations when runnign doctest
         -- disable -Wmissing-home-modules
@@ -137,9 +139,9 @@ mkDoctestArgs verbosity tmp lbi clbi inFiles bi = do
           then return vanillaOpts
           else if withSharedLib lbi
           then return sharedOpts
-          else die' verbosity $ "Must have vanilla or shared lirbaries "
+          else die' $ "Must have vanilla or shared lirbaries "
                ++ "enabled in order to run doctest"
-  ghcVersion <- maybe (die' verbosity "Compiler has no GHC version")
+  ghcVersion <- maybe (die' "Compiler has no GHC version")
                       return
                       (compilerCompatVersion GHC (compiler lbi))
   return $ DoctestArgs
@@ -150,24 +152,22 @@ mkDoctestArgs verbosity tmp lbi clbi inFiles bi = do
 
 -- -----------------------------------------------------------------------------
 -- Call doctest with the specified arguments.
-runDoctest :: Verbosity
-           -> Compiler
+runDoctest :: Compiler
            -> Platform
            -> ConfiguredProgram
            -> DoctestArgs
-           -> IO ()
-runDoctest verbosity comp platform doctestProg args = do
-  renderArgs verbosity comp platform args $
+           -> CabalM ()
+runDoctest comp platform doctestProg args = do
+  renderArgs comp platform args $
     \(flags, files) -> do
-      runProgram verbosity doctestProg (flags <> files)
+      runProgram doctestProg (flags <> files)
 
-renderArgs :: Verbosity
-           -> Compiler
+renderArgs :: Compiler
            -> Platform
            -> DoctestArgs
-           -> (([String],[FilePath]) -> IO a)
-           -> IO a
-renderArgs _verbosity comp platform args k = do
+           -> (([String],[FilePath]) -> CabalM a)
+           -> CabalM a
+renderArgs comp platform args k = do
   k (flags, argTargets args)
   where
     flags :: [String]

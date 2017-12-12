@@ -5,7 +5,7 @@ import Distribution.Client.Compat.Prelude
 import Data.Monoid ( Any(..) )
 import System.Directory ( doesFileExist )
 
-import Distribution.Verbosity
+import Distribution.Monad
 
 import Distribution.Simple.Configure ( localBuildInfoFile )
 import Distribution.Simple.Setup ( Flag, flagToMaybe, toFlag )
@@ -31,7 +31,7 @@ import Distribution.Client.Setup
 newtype Check a = Check {
   runCheck :: Any          -- Did any previous check fail?
            -> a            -- value returned by previous checks
-           -> IO (Any, a)  -- Did this check fail? What value is returned?
+           -> CabalM (Any, a)  -- Did this check fail? What value is returned?
 }
 
 instance Semigroup (Check a) where
@@ -76,9 +76,8 @@ instance Monoid (Check a) where
 -- these required settings will be checked first upon determining that
 -- a previous configuration exists.
 reconfigure
-  :: ((ConfigFlags, ConfigExFlags) -> [String] -> GlobalFlags -> IO ())
+  :: ((ConfigFlags, ConfigExFlags) -> [String] -> GlobalFlags -> CabalM ())
      -- ^ configure action
-  -> Verbosity
      -- ^ Verbosity setting
   -> FilePath
      -- ^ \"dist\" prefix
@@ -95,10 +94,9 @@ reconfigure
   -> [String]     -- ^ Extra arguments
   -> GlobalFlags  -- ^ Global flags
   -> SavedConfig
-  -> IO SavedConfig
+  -> CabalM SavedConfig
 reconfigure
   configureAction
-  verbosity
   dist
   useSandbox
   skipAddSourceDepsCheck
@@ -109,10 +107,10 @@ reconfigure
   config
   = do
 
-  savedFlags@(_, _) <- readConfigFlags dist
+  savedFlags@(_, _) <- liftIO $ readConfigFlags dist
 
-  useNix <- fmap isJust (findNixExpr globalFlags config)
-  alreadyInNixShell <- inNixShell
+  useNix <- liftIO $ fmap isJust (findNixExpr globalFlags config)
+  alreadyInNixShell <- liftIO $ inNixShell
 
   if useNix && not alreadyInNixShell
     then do
@@ -127,7 +125,7 @@ reconfigure
       -- No, because 'nixShell' doesn't spawn a new process if it is already
       -- running in a Nix shell.
 
-      nixInstantiate verbosity dist False globalFlags config
+      nixInstantiate dist False globalFlags config
       return config
 
     else do
@@ -153,6 +151,7 @@ reconfigure
     -- Changing the verbosity does not require reconfiguration, but the new
     -- verbosity should be used if reconfiguring.
     checkVerb = Check $ \_ (configFlags, configExFlags) -> do
+      verbosity <- askVerbosity
       let configFlags' = configFlags { configVerbosity = toFlag verbosity}
       return (mempty, (configFlags', configExFlags))
 
@@ -160,9 +159,9 @@ reconfigure
     checkDist = Check $ \_ (configFlags, configExFlags) -> do
       -- Always set the chosen @--build-dir@ before saving the flags,
       -- or bad things could happen.
-      savedDist <- findSavedDistPref config (configDistPref configFlags)
+      savedDist <- liftIO $ findSavedDistPref config (configDistPref configFlags)
       let distChanged = dist /= savedDist
-      when distChanged $ info verbosity "build directory changed"
+      when distChanged $ info "build directory changed"
       let configFlags' = configFlags { configDistPref = toFlag dist }
       return (Any distChanged, (configFlags', configExFlags))
 
@@ -171,30 +170,30 @@ reconfigure
 
       -- Has the package ever been configured? If not, reconfiguration is
       -- required.
-      configured <- doesFileExist buildConfig
-      unless configured $ info verbosity "package has never been configured"
+      configured <- liftIO $doesFileExist buildConfig
+      unless configured $ info "package has never been configured"
 
       -- Is the configuration older than the sandbox configuration file?
       -- If so, reconfiguration is required.
-      sandboxConfig <- getSandboxConfigFilePath globalFlags
-      sandboxConfigNewer <- existsAndIsMoreRecentThan sandboxConfig buildConfig
+      sandboxConfig <- liftIO $ getSandboxConfigFilePath globalFlags
+      sandboxConfigNewer <- liftIO $ existsAndIsMoreRecentThan sandboxConfig buildConfig
       when sandboxConfigNewer $
-        info verbosity "sandbox was created after the package was configured"
+        info "sandbox was created after the package was configured"
 
       -- Is the @cabal.config@ file newer than @dist/setup.config@? Then we need
       -- to force reconfigure. Note that it's possible to use @cabal.config@
       -- even without sandboxes.
       userPackageEnvironmentFileModified <-
-        existsAndIsMoreRecentThan userPackageEnvironmentFile buildConfig
+        liftIO $ existsAndIsMoreRecentThan userPackageEnvironmentFile buildConfig
       when userPackageEnvironmentFileModified $
-        info verbosity ("user package environment file ('"
+        info ("user package environment file ('"
         ++ userPackageEnvironmentFile ++ "') was modified")
 
       -- Is the configuration older than the package description?
-      descrFile <- maybe (defaultPackageDesc verbosity) return
+      descrFile <- maybe (defaultPackageDesc) return
                    (flagToMaybe (configCabalFilePath configFlags))
-      outdated <- existsAndIsMoreRecentThan descrFile buildConfig
-      when outdated $ info verbosity (descrFile ++ " was changed")
+      outdated <- liftIO $ existsAndIsMoreRecentThan descrFile buildConfig
+      when outdated $ info (descrFile ++ " was changed")
 
       let failed =
             Any outdated
@@ -214,14 +213,14 @@ reconfigure
             | otherwise = skipAddSourceDepsCheck
 
       when (skipAddSourceDepsCheck' == SkipAddSourceDepsCheck) $
-        info verbosity "skipping add-source deps check"
+        info "skipping add-source deps check"
 
       -- Were any add-source dependencies reinstalled in the sandbox?
       depsReinstalled <-
         case skipAddSourceDepsCheck' of
           DontSkipAddSourceDepsCheck ->
             maybeReinstallAddSourceDeps
-            verbosity numJobsFlag configFlags globalFlags
+            numJobsFlag configFlags globalFlags
             (useSandbox, config')
           SkipAddSourceDepsCheck -> do
             return NoDepsReinstalled
@@ -229,5 +228,5 @@ reconfigure
       case depsReinstalled of
         NoDepsReinstalled -> return (mempty, flags)
         ReinstalledSomeDeps -> do
-          info verbosity "some add-source dependencies were reinstalled"
+          info "some add-source dependencies were reinstalled"
           return (Any True, flags)

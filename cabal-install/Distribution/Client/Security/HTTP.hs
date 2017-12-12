@@ -25,6 +25,8 @@ import qualified Network.HTTP         as HTTP
 -- Cabal/cabal-install
 import Distribution.Verbosity
          ( Verbosity )
+import Distribution.Monad
+         ( CabalM, runCabalM, runCabalMInIO, liftIO )
 import Distribution.Client.HttpUtils
          ( HttpTransport(..), HttpCode )
 import Distribution.Client.Utils
@@ -59,52 +61,49 @@ import qualified Hackage.Security.Util.Lens as Lens
 --   is a source of inefficiency; and it means that the security library cannot
 --   insist on a minimum download rate (potential security attack).
 --   Fixing it however would require changing the 'HttpTransport'.
-transportAdapter :: Verbosity -> IO HttpTransport -> HttpLib
+transportAdapter :: Verbosity -> CabalM HttpTransport -> HttpLib
 transportAdapter verbosity getTransport = HttpLib{
-      httpGet      = \headers uri callback -> do
-                        transport <- getTransport
-                        get verbosity transport headers uri callback
-    , httpGetRange = \headers uri range callback -> do
-                        transport <- getTransport
-                        getRange verbosity transport headers uri range callback
+      httpGet      = \headers uri callback -> flip runCabalM verbosity $ do
+                          transport <- getTransport
+                          get transport headers uri (\x -> liftIO .  callback x)
+    , httpGetRange = \headers uri range callback -> flip runCabalM verbosity $ do
+                          transport <- getTransport
+                          getRange transport headers uri range (\x y -> liftIO . callback x y)
     }
 
 get :: Throws SomeRemoteError
-    => Verbosity
-    -> HttpTransport
+    => HttpTransport
     -> [HttpRequestHeader] -> URI
-    -> ([HttpResponseHeader] -> BodyReader -> IO a)
-    -> IO a
-get verbosity transport reqHeaders uri callback = wrapCustomEx $ do
-  get' verbosity transport reqHeaders uri Nothing $ \code respHeaders br ->
+    -> ([HttpResponseHeader] -> BodyReader -> CabalM a)
+    -> CabalM a
+get transport reqHeaders uri callback = wrapCustomEx $ do
+  get' transport reqHeaders uri Nothing $ \code respHeaders br ->
     case code of
       200 -> callback respHeaders br
-      _   -> throwChecked $ UnexpectedResponse uri code
+      _   -> liftIO . throwChecked $ UnexpectedResponse uri code
 
 getRange :: Throws SomeRemoteError
-         => Verbosity
-         -> HttpTransport
+         => HttpTransport
          -> [HttpRequestHeader] -> URI -> (Int, Int)
-         -> (HttpStatus -> [HttpResponseHeader] -> BodyReader -> IO a)
-         -> IO a
-getRange verbosity transport reqHeaders uri range callback = wrapCustomEx $ do
-  get' verbosity transport reqHeaders uri (Just range) $ \code respHeaders br ->
+         -> (HttpStatus -> [HttpResponseHeader] -> BodyReader -> CabalM a)
+         -> CabalM a
+getRange transport reqHeaders uri range callback = wrapCustomEx $ do
+  get' transport reqHeaders uri (Just range) $ \code respHeaders br ->
     case code of
        200 -> callback HttpStatus200OK             respHeaders br
        206 -> callback HttpStatus206PartialContent respHeaders br
-       _   -> throwChecked $ UnexpectedResponse uri code
+       _   -> liftIO . throwChecked $ UnexpectedResponse uri code
 
 -- | Internal generalization of 'get' and 'getRange'
-get' :: Verbosity
-     -> HttpTransport
+get' :: HttpTransport
      -> [HttpRequestHeader] -> URI -> Maybe (Int, Int)
-     -> (HttpCode -> [HttpResponseHeader] -> BodyReader -> IO a)
-     -> IO a
-get' verbosity transport reqHeaders uri mRange callback = do
-    tempDir <- getTemporaryDirectory
+     -> (HttpCode -> [HttpResponseHeader] -> BodyReader -> CabalM a)
+     -> CabalM a
+get' transport reqHeaders uri mRange callback = do
+    tempDir <- liftIO getTemporaryDirectory
     withTempFileName tempDir "transportAdapterGet" $ \temp -> do
-      (code, _etag) <- getHttp transport verbosity uri Nothing temp reqHeaders'
-      br <- bodyReaderFromBS =<< BS.L.readFile temp
+      (code, _etag) <- getHttp transport uri Nothing temp reqHeaders'
+      br <- liftIO $ bodyReaderFromBS =<< BS.L.readFile temp
       callback code [HttpResponseAcceptRangesBytes] br
   where
     reqHeaders' = mkReqHeaders reqHeaders mRange
@@ -165,10 +164,11 @@ instance Exception UnexpectedResponse
 
 wrapCustomEx :: ( ( Throws UnexpectedResponse
                   , Throws IOException
-                  ) => IO a)
-             -> (Throws SomeRemoteError => IO a)
-wrapCustomEx act = handleChecked (\(ex :: UnexpectedResponse) -> go ex)
+                  ) => CabalM a)
+             -> (Throws SomeRemoteError => CabalM a)
+wrapCustomEx act = runCabalMInIO $ \liftC ->
+                   handleChecked (\(ex :: UnexpectedResponse) -> go ex)
                  $ handleChecked (\(ex :: IOException)        -> go ex)
-                 $ act
+                 $ liftC act
   where
     go ex = throwChecked (SomeRemoteError ex)

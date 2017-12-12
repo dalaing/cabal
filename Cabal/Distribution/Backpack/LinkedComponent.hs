@@ -38,7 +38,6 @@ import Distribution.Package
 import Distribution.PackageDescription as PD hiding (Flag)
 import Distribution.ModuleName
 import Distribution.Simple.LocalBuildInfo
-import Distribution.Verbosity
 import Distribution.Utils.LogProgress
 
 import qualified Data.Set as Set
@@ -116,13 +115,12 @@ instance Package LinkedComponent where
     packageId = lc_pkgid
 
 toLinkedComponent
-    :: Verbosity
-    -> FullDb
+    :: FullDb
     -> PackageId
     -> LinkedComponentMap
     -> ConfiguredComponent
     -> LogProgress LinkedComponent
-toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
+toLinkedComponent db this_pid pkg_map ConfiguredComponent {
     cc_ann_id = aid@AnnotatedId { ann_id = this_cid },
     cc_component = component,
     cc_exe_deps = exe_deps,
@@ -175,6 +173,7 @@ toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
     -- OK, actually do unification
     -- TODO: the unification monad might return errors, in which
     -- case we have to deal.  Use monadic bind for now.
+    verbosity <- progressVerbosity
     (linked_shape0  :: ModuleScope,
      linked_includes0 :: [ComponentInclude OpenUnitId ModuleRenaming],
      linked_sig_includes0 :: [ComponentInclude OpenUnitId ModuleRenaming])
@@ -337,13 +336,12 @@ toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
 -- Handle mix-in linking for components.  In the absence of Backpack,
 -- every ComponentId gets converted into a UnitId by way of SimpleUnitId.
 toLinkedComponents
-    :: Verbosity
-    -> FullDb
+    :: FullDb
     -> PackageId
     -> LinkedComponentMap
     -> [ConfiguredComponent]
     -> LogProgress [LinkedComponent]
-toLinkedComponents verbosity db this_pid lc_map0 comps
+toLinkedComponents db this_pid lc_map0 comps
    = fmap snd (mapAccumM go lc_map0 comps)
  where
   go :: Map ComponentId (OpenUnitId, ModuleShape)
@@ -351,7 +349,7 @@ toLinkedComponents verbosity db this_pid lc_map0 comps
      -> LogProgress (Map ComponentId (OpenUnitId, ModuleShape), LinkedComponent)
   go lc_map cc = do
     lc <- addProgressCtx (text "In the stanza" <+> text (componentNameStanza (cc_name cc))) $
-            toLinkedComponent verbosity db this_pid lc_map cc
+            toLinkedComponent db this_pid lc_map cc
     return (extendLinkedComponentMap lc lc_map, lc)
 
 type LinkedComponentMap = Map ComponentId (OpenUnitId, ModuleShape)

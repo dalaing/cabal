@@ -30,7 +30,9 @@ import Distribution.Types.ComponentName
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
+import Distribution.Monad
+         ( CabalM, runCabalM, liftIO )
 import Distribution.Simple.Utils
          ( wrapText, die', ordNub )
 
@@ -88,24 +90,24 @@ replCommand = Client.installCommand {
 replAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
            -> [String] -> GlobalFlags -> IO ()
 replAction (configFlags, configExFlags, installFlags, haddockFlags)
-           targetStrings globalFlags = do
+           targetStrings globalFlags = flip runCabalM verbosity $ do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext cliConfig
 
-    targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+    targetSelectors <- either reportTargetSelectorProblems return
+                   =<< liftIO (readTargetSelectors (localPackages baseCtx) targetStrings)
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase baseCtx $ \elaboratedPlan -> do
 
             when (buildSettingOnlyDeps (buildSettings baseCtx)) $
-              die' verbosity $ "The repl command does not support '--only-dependencies'. "
+              die' $ "The repl command does not support '--only-dependencies'. "
                  ++ "You may wish to use 'build --only-dependencies' and then "
                  ++ "use 'repl'."
 
             -- Interpret the targets on the command line as repl targets
             -- (as opposed to say build or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either reportTargetProblems return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
@@ -117,7 +119,7 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags)
             -- components. It is ok to have two module/file targets in the
             -- same component, but not two that live in different components.
             when (Set.size (distinctTargetComponents targets) > 1) $
-              reportTargetProblems verbosity
+              reportTargetProblems
                 [TargetProblemMultipleTargets targets]
 
             let elaboratedPlan' = pruneInstallPlanToTargets
@@ -126,10 +128,10 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags)
                                     elaboratedPlan
             return (elaboratedPlan', targets)
 
-    printPlan verbosity baseCtx buildCtx
+    printPlan baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    buildOutcomes <- runProjectBuildPhase baseCtx buildCtx
+    runProjectPostBuildPhase baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
@@ -239,9 +241,9 @@ data TargetProblem =
    | TargetProblemMultipleTargets TargetsMap
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: [TargetProblem] -> CabalM a
+reportTargetProblems =
+    die' . unlines . map renderTargetProblem
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =

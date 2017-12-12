@@ -57,6 +57,7 @@ import Distribution.Simple.Program.Types
 import Distribution.Simple.Utils
 import Distribution.Compat.Exception
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Version
 
 import qualified Data.Map as Map
@@ -110,7 +111,7 @@ ghcProgram = (simpleProgram "ghc") {
 
     -- Workaround for https://ghc.haskell.org/trac/ghc/ticket/8825
     -- (spurious warning on non-english locales)
-    programPostConf    = \_verbosity ghcProg ->
+    programPostConf    = \ghcProg ->
     do let ghcProg' = ghcProg {
              programOverrideEnv = ("LANGUAGE", Just "en")
                                   : programOverrideEnv ghcProg
@@ -230,7 +231,7 @@ haskellSuiteProgram :: Program
 haskellSuiteProgram = (simpleProgram "haskell-suite") {
     -- pretend that the program exists, otherwise it won't be in the
     -- "configured" state
-    programFindLocation = \_verbosity _searchPath ->
+    programFindLocation = \_searchPath ->
       return $ Just ("haskell-suite-dummy-location", [])
   }
 
@@ -238,7 +239,7 @@ haskellSuiteProgram = (simpleProgram "haskell-suite") {
 -- haskellSuiteProgram.
 haskellSuitePkgProgram :: Program
 haskellSuitePkgProgram = (simpleProgram "haskell-suite-pkg") {
-    programFindLocation = \_verbosity _searchPath ->
+    programFindLocation = \_searchPath ->
       return $ Just ("haskell-suite-pkg-dummy-location", [])
   }
 
@@ -273,8 +274,8 @@ arProgram = simpleProgram "ar"
 
 stripProgram :: Program
 stripProgram = (simpleProgram "strip") {
-    programFindVersion = \verbosity ->
-      findProgramVersion "--version" stripExtractVersion (lessVerbose verbosity)
+    programFindVersion = localVerbosity lessVerbose .
+      findProgramVersion "--version" stripExtractVersion
   }
 
 hsc2hsProgram :: Program
@@ -303,7 +304,7 @@ cpphsProgram = (simpleProgram "cpphs") {
 
 hscolourProgram :: Program
 hscolourProgram = (simpleProgram "hscolour") {
-    programFindLocation = \v p -> findProgramOnSearchPath v p "HsColour",
+    programFindLocation = \p -> findProgramOnSearchPath p "HsColour",
     programFindVersion  = findProgramVersion "-version" $ \str ->
       -- Invoking "HsColour -version" gives a string like "HsColour 1.7"
       case words str of
@@ -315,7 +316,7 @@ hscolourProgram = (simpleProgram "hscolour") {
 --       that's being used.  Same for haddock.  @phadej pointed this out.
 doctestProgram :: Program
 doctestProgram = (simpleProgram "doctest") {
-    programFindLocation = \v p -> findProgramOnSearchPath v p "doctest"
+    programFindLocation = \p -> findProgramOnSearchPath p "doctest"
   , programFindVersion  = findProgramVersion "--version" $ \str ->
          -- "doctest version 0.11.2"
          case words str of
@@ -343,11 +344,11 @@ tarProgram :: Program
 tarProgram = (simpleProgram "tar") {
   -- See #1901. Some versions of 'tar' (OpenBSD, NetBSD, ...) don't support the
   -- '--format' option.
-  programPostConf = \verbosity tarProg -> do
-     tarHelpOutput <- getProgramInvocationOutput
-                      verbosity (programInvocation tarProg ["--help"])
-                      -- Some versions of tar don't support '--help'.
-                      `catchIO` (\_ -> return "")
+  programPostConf = \tarProg -> do
+     tarHelpOutput <- runCabalMInIO $ \liftC ->
+       (liftC $ getProgramInvocationOutput (programInvocation tarProg ["--help"]))
+        -- Some versions of tar don't support '--help'.
+       `catchIO` (\_ -> return "")
      let k = "Supports --format"
          v = if ("--format" `isInfixOf` tarHelpOutput) then "YES" else "NO"
          m = Map.insert k v (programProperties tarProg)

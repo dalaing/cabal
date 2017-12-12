@@ -4,6 +4,7 @@
 module Distribution.Utils.LogProgress (
     LogProgress,
     runLogProgress,
+    progressVerbosity,
     warnProgress,
     infoProgress,
     dieProgress,
@@ -15,6 +16,7 @@ import Distribution.Compat.Prelude
 
 import Distribution.Utils.Progress
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Simple.Utils
 import Text.PrettyPrint
 
@@ -44,21 +46,25 @@ instance Monad LogProgress where
 
 -- | Run 'LogProgress', outputting traces according to 'Verbosity',
 -- 'die' if there is an error.
-runLogProgress :: Verbosity -> LogProgress a -> NoCallStackIO a
-runLogProgress verbosity (LogProgress m) =
+runLogProgress :: LogProgress a -> CabalM a
+runLogProgress (LogProgress m) = do
+    verbosity <- askVerbosity
+    let env = LogEnv {
+                le_verbosity = verbosity,
+                le_context   = []
+              }
     foldProgress step_fn fail_fn return (m env)
   where
-    env = LogEnv {
-        le_verbosity = verbosity,
-        le_context   = []
-      }
-    step_fn :: LogMsg -> NoCallStackIO a -> NoCallStackIO a
+    step_fn :: LogMsg -> CabalM a -> CabalM a
     step_fn doc go = do
-        putStrLn (render doc)
+        liftIO $ putStrLn (render doc)
         go
-    fail_fn :: Doc -> NoCallStackIO a
-    fail_fn doc = do
-        dieNoWrap verbosity (render doc)
+    fail_fn :: Doc -> CabalM a
+    fail_fn doc =
+        dieNoWrap (render doc)
+
+progressVerbosity :: LogProgress Verbosity
+progressVerbosity = LogProgress $ pure . le_verbosity
 
 -- | Output a warning trace message in 'LogProgress'.
 warnProgress :: Doc -> LogProgress ()

@@ -35,7 +35,7 @@ import Control.Monad
          ( guard )
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Paths_cabal_install (version)
-import Distribution.Verbosity (Verbosity)
+import Distribution.Monad (CabalM, liftIO, runCabalMInIO)
 import Distribution.Simple.Utils
          ( die', info, warn, debug, notice, writeFileAtomic
          , copyFileVerbose,  withTempFile )
@@ -83,25 +83,25 @@ data DownloadResult = FileAlreadyInCache
   deriving (Eq)
 
 downloadURI :: HttpTransport
-            -> Verbosity
             -> URI      -- ^ What to download
             -> FilePath -- ^ Where to put it
-            -> IO DownloadResult
-downloadURI _transport verbosity uri path | uriScheme uri == "file:" = do
-  copyFileVerbose verbosity (uriPath uri) path
+            -> CabalM DownloadResult
+downloadURI _transport uri path | uriScheme uri == "file:" = do
+  copyFileVerbose (uriPath uri) path
   return (FileDownloaded path)
   -- Can we store the hash of the file so we can safely return path when the
   -- hash matches to avoid unnecessary computation?
 
-downloadURI transport verbosity uri path = do
+downloadURI transport uri path = do
 
     let etagPath = path <.> "etag"
-    targetExists   <- doesFileExist path
-    etagPathExists <- doesFileExist etagPath
-    -- In rare cases the target file doesn't exist, but the etag does.
-    etag <- if targetExists && etagPathExists
-              then Just <$> readFile etagPath
-              else return Nothing
+    etag <- liftIO $ do
+      targetExists   <- doesFileExist path
+      etagPathExists <- doesFileExist etagPath
+      -- In rare cases the target file doesn't exist, but the etag does.
+      if targetExists && etagPathExists
+      then Just <$> readFile etagPath
+      else return Nothing
 
     -- Only use the external http transports if we actually have to
     -- (or have been told to do so)
@@ -114,42 +114,42 @@ downloadURI transport verbosity uri path = do
           = transport
 
     withTempFileName (takeDirectory path) (takeFileName path) $ \tmpFile -> do
-      result <- getHttp transport' verbosity uri etag tmpFile []
+      result <- getHttp transport' uri etag tmpFile []
 
       -- Only write the etag if we get a 200 response code.
       -- A 304 still sends us an etag header.
       case result of
-        (200, Just newEtag) -> writeFile etagPath newEtag
+        (200, Just newEtag) -> liftIO $ writeFile etagPath newEtag
         _ -> return ()
 
       case fst result of
         200 -> do
-            info verbosity ("Downloaded to " ++ path)
-            renameFile tmpFile path
+            info ("Downloaded to " ++ path)
+            liftIO $ renameFile tmpFile path
             return (FileDownloaded path)
         304 -> do
-            notice verbosity "Skipping download: local and remote files match."
+            notice "Skipping download: local and remote files match."
             return FileAlreadyInCache
-        errCode ->  die' verbosity $ "Failed to download " ++ show uri
+        errCode ->  die' $ "Failed to download " ++ show uri
                        ++ " : HTTP code " ++ show errCode
 
 ------------------------------------------------------------------------------
 -- Utilities for repo url management
 --
 
-remoteRepoCheckHttps :: Verbosity -> HttpTransport -> RemoteRepo -> IO ()
-remoteRepoCheckHttps verbosity transport repo
+remoteRepoCheckHttps :: HttpTransport -> RemoteRepo -> CabalM ()
+remoteRepoCheckHttps transport repo
   | uriScheme (remoteRepoURI repo) == "https:"
   , not (transportSupportsHttps transport)
-              = die' verbosity $ "The remote repository '" ++ remoteRepoName repo
+              = die' $ "The remote repository '" ++ remoteRepoName repo
                    ++ "' specifies a URL that " ++ requiresHttpsErrorMessage
   | otherwise = return ()
 
-transportCheckHttps :: Verbosity -> HttpTransport -> URI -> IO ()
-transportCheckHttps verbosity transport uri
+transportCheckHttps :: HttpTransport -> URI -> CabalM ()
+transportCheckHttps transport uri
   | uriScheme uri == "https:"
   , not (transportSupportsHttps transport)
-              = die' verbosity $ "The URL " ++ show uri
+              = die' $ "The URL " ++ show uri
                    ++ " " ++ requiresHttpsErrorMessage
   | otherwise = return ()
 
@@ -163,13 +163,13 @@ requiresHttpsErrorMessage =
    ++ "external program is available, or one can be selected specifically "
    ++ "with the global flag --http-transport="
 
-remoteRepoTryUpgradeToHttps :: Verbosity -> HttpTransport -> RemoteRepo -> IO RemoteRepo
-remoteRepoTryUpgradeToHttps verbosity transport repo
+remoteRepoTryUpgradeToHttps :: HttpTransport -> RemoteRepo -> CabalM RemoteRepo
+remoteRepoTryUpgradeToHttps transport repo
   | remoteRepoShouldTryHttps repo
   , uriScheme (remoteRepoURI repo) == "http:"
   , not (transportSupportsHttps transport)
   , not (transportManuallySelected transport)
-  = die' verbosity $ "The builtin HTTP implementation does not support HTTPS, but using "
+  = die' $ "The builtin HTTP implementation does not support HTTPS, but using "
        ++ "HTTPS for authenticated uploads is recommended. "
        ++ "The transport implementations with HTTPS support are "
        ++ intercalate ", " [ name | (name, _, True, _ ) <- supportedTransports ]
@@ -208,25 +208,25 @@ data HttpTransport = HttpTransport {
       -- | GET a URI, with an optional ETag (to do a conditional fetch),
       -- write the resource to the given file and return the HTTP status code,
       -- and optional ETag.
-      getHttp  :: Verbosity -> URI -> Maybe ETag -> FilePath -> [Header]
-               -> IO (HttpCode, Maybe ETag),
+      getHttp  :: URI -> Maybe ETag -> FilePath -> [Header]
+               -> CabalM (HttpCode, Maybe ETag),
 
       -- | POST a resource to a URI, with optional auth (username, password)
       -- and return the HTTP status code and any redirect URL.
-      postHttp :: Verbosity -> URI -> String -> Maybe Auth
-               -> IO (HttpCode, String),
+      postHttp :: URI -> String -> Maybe Auth
+               -> CabalM (HttpCode, String),
 
       -- | POST a file resource to a URI using multipart\/form-data encoding,
       -- with optional auth (username, password) and return the HTTP status
       -- code and any error string.
-      postHttpFile :: Verbosity -> URI -> FilePath -> Maybe Auth
-                   -> IO (HttpCode, String),
+      postHttpFile :: URI -> FilePath -> Maybe Auth
+                   -> CabalM (HttpCode, String),
 
       -- | PUT a file resource to a URI, with optional auth
       -- (username, password), extra headers and return the HTTP status code
       -- and any error string.
-      putHttpFile :: Verbosity -> URI -> FilePath -> Maybe Auth -> [Header]
-                  -> IO (HttpCode, String),
+      putHttpFile :: URI -> FilePath -> Maybe Auth -> [Header]
+                  -> CabalM (HttpCode, String),
 
       -- | Whether this transport supports https or just http.
       transportSupportsHttps :: Bool,
@@ -243,9 +243,9 @@ type HttpCode = Int
 type ETag     = String
 type Auth     = (String, String)
 
-noPostYet :: Verbosity -> URI -> String -> Maybe (String, String)
-          -> IO (Int, String)
-noPostYet verbosity _ _ _ = die' verbosity "Posting (for report upload) is not implemented yet"
+noPostYet :: URI -> String -> Maybe (String, String)
+          -> CabalM (Int, String)
+noPostYet _ _ _ = die' "Posting (for report upload) is not implemented yet"
 
 supportedTransports :: [(String, Maybe Program, Bool,
                          ProgramDb -> Maybe HttpTransport)]
@@ -266,9 +266,9 @@ supportedTransports =
       , \_ -> Just plainHttpTransport )
     ]
 
-configureTransport :: Verbosity -> [FilePath] -> Maybe String -> IO HttpTransport
+configureTransport :: [FilePath] -> Maybe String -> CabalM HttpTransport
 
-configureTransport verbosity extraPath (Just name) =
+configureTransport extraPath (Just name) =
     -- the user secifically selected a transport by name so we'll try and
     -- configure that one
 
@@ -278,25 +278,25 @@ configureTransport verbosity extraPath (Just name) =
         let baseProgDb = modifyProgramSearchPath (\p -> map ProgramSearchPathDir extraPath ++ p) emptyProgramDb
         progdb <- case mprog of
           Nothing   -> return emptyProgramDb
-          Just prog -> snd <$> requireProgram verbosity prog baseProgDb
+          Just prog -> snd <$> requireProgram prog baseProgDb
                        --      ^^ if it fails, it'll fail here
 
         let Just transport = mkTrans progdb
         return transport { transportManuallySelected = True }
 
-      Nothing -> die' verbosity $ "Unknown HTTP transport specified: " ++ name
+      Nothing -> die' $ "Unknown HTTP transport specified: " ++ name
                     ++ ". The supported transports are "
                     ++ intercalate ", "
                          [ name' | (name', _, _, _ ) <- supportedTransports ]
 
-configureTransport verbosity extraPath Nothing = do
+configureTransport extraPath Nothing = do
     -- the user hasn't selected a transport, so we'll pick the first one we
     -- can configure successfully, provided that it supports tls
 
     -- for all the transports except plain-http we need to try and find
     -- their external executable
     let baseProgDb = modifyProgramSearchPath (\p -> map ProgramSearchPathDir extraPath ++ p) emptyProgramDb
-    progdb <- configureAllKnownPrograms  verbosity $
+    progdb <- configureAllKnownPrograms $
                 addKnownPrograms
                   [ prog | (_, Just prog, _, _) <- supportedTransports ]
                   baseProgDb
@@ -307,7 +307,7 @@ configureTransport verbosity extraPath Nothing = do
           , transport <- maybeToList (mkTrans progdb) ]
         -- there's always one because the plain one is last and never fails
     let (name, transport) = head availableTransports
-    debug verbosity $ "Selected http transport implementation: " ++ name
+    debug $ "Selected http transport implementation: " ++ name
 
     return transport { transportManuallySelected = False }
 
@@ -320,10 +320,10 @@ curlTransport :: ConfiguredProgram -> HttpTransport
 curlTransport prog =
     HttpTransport gethttp posthttp posthttpfile puthttpfile True False
   where
-    gethttp verbosity uri etag destPath reqHeaders = do
+    gethttp uri etag destPath reqHeaders = do
         withTempFile (takeDirectory destPath)
                      "curl-headers.txt" $ \tmpFile tmpHandle -> do
-          hClose tmpHandle
+          liftIO $ hClose tmpHandle
           let args = [ show uri
                    , "--output", destPath
                    , "--location"
@@ -338,11 +338,11 @@ curlTransport prog =
                    [ ["--header", show name ++ ": " ++ value]
                    | Header name value <- reqHeaders ]
 
-          resp <- getProgramInvocationOutput verbosity
+          resp <- getProgramInvocationOutput
                     (programInvocation prog args)
-          withFile tmpFile ReadMode $ \hnd -> do
+          runCabalMInIO $ \liftC -> withFile tmpFile ReadMode $ \hnd -> do
             headers <- hGetContents hnd
-            (code, _err, etag') <- parseResponse verbosity uri resp headers
+            (code, _err, etag') <- liftC $ parseResponse uri resp headers
             evaluate $ force (code, etag')
 
     posthttp = noPostYet
@@ -357,7 +357,7 @@ curlTransport prog =
       , progInvokeArgs = ["--config", "-"] ++ progInvokeArgs progInvocation
       }
 
-    posthttpfile verbosity uri path auth = do
+    posthttpfile uri path auth = do
         let args = [ show uri
                    , "--form", "package=@"++path
                    , "--write-out", "\n%{http_code}"
@@ -366,12 +366,12 @@ curlTransport prog =
                    , "--header", "Accept: text/plain"
                    , "--location"
                    ]
-        resp <- getProgramInvocationOutput verbosity $ addAuthConfig auth
+        resp <- getProgramInvocationOutput $ addAuthConfig auth
                   (programInvocation prog args)
-        (code, err, _etag) <- parseResponse verbosity uri resp ""
+        (code, err, _etag) <- parseResponse uri resp ""
         return (code, err)
 
-    puthttpfile verbosity uri path auth headers = do
+    puthttpfile uri path auth headers = do
         let args = [ show uri
                    , "--request", "PUT", "--data-binary", "@"++path
                    , "--write-out", "\n%{http_code}"
@@ -383,15 +383,15 @@ curlTransport prog =
                 ++ concat
                    [ ["--header", show name ++ ": " ++ value]
                    | Header name value <- headers ]
-        resp <- getProgramInvocationOutput verbosity $ addAuthConfig auth
+        resp <- getProgramInvocationOutput $ addAuthConfig auth
                   (programInvocation prog args)
-        (code, err, _etag) <- parseResponse verbosity uri resp ""
+        (code, err, _etag) <- parseResponse uri resp ""
         return (code, err)
 
     -- on success these curl invocations produces an output like "200"
     -- and on failure it has the server error response first
-    parseResponse :: Verbosity -> URI -> String -> String -> IO (Int, String, Maybe ETag)
-    parseResponse verbosity uri resp headers =
+    parseResponse :: URI -> String -> String -> CabalM (Int, String, Maybe ETag)
+    parseResponse uri resp headers =
       let codeerr =
             case reverse (lines resp) of
               (codeLine:rerrLines) ->
@@ -410,15 +410,15 @@ curlTransport prog =
 
        in case codeerr of
             Just (i, err) -> return (i, err, mb_etag)
-            _             -> statusParseFail verbosity uri resp
+            _             -> statusParseFail uri resp
 
 
 wgetTransport :: ConfiguredProgram -> HttpTransport
 wgetTransport prog =
   HttpTransport gethttp posthttp posthttpfile puthttpfile True False
   where
-    gethttp verbosity uri etag destPath reqHeaders =  do
-        resp <- runWGet verbosity uri args
+    gethttp uri etag destPath reqHeaders =  do
+        resp <- runWGet uri args
 
         -- wget doesn't support range requests.
         -- so, we not only ignore range request headers,
@@ -431,8 +431,8 @@ wgetTransport prog =
                            ++ " Note that the 'plain-http' transport doesn't"
                            ++ " support HTTPS.\n"
 
-        when (hasRangeHeader) $ warn verbosity warningMsg
-        (code, etag') <- parseOutput verbosity uri resp
+        when (hasRangeHeader) $ warn warningMsg
+        (code, etag') <- parseOutput uri resp
         return (code, etag')
       where
         args = [ "--output-document=" ++ destPath
@@ -455,15 +455,17 @@ wgetTransport prog =
 
     posthttp = noPostYet
 
-    posthttpfile verbosity  uri path auth =
+    posthttpfile uri path auth =
         withTempFile (takeDirectory path)
                      (takeFileName path) $ \tmpFile tmpHandle ->
         withTempFile (takeDirectory path) "response" $
         \responseFile responseHandle -> do
-          hClose responseHandle
-          (body, boundary) <- generateMultipartBody path
-          BS.hPut tmpHandle body
-          hClose tmpHandle
+          boundary <- liftIO $ do
+            hClose responseHandle
+            (body, boundary') <- generateMultipartBody path
+            BS.hPut tmpHandle body
+            hClose tmpHandle
+            return boundary'
           let args = [ "--post-file=" ++ tmpFile
                      , "--user-agent=" ++ userAgent
                      , "--server-response"
@@ -471,16 +473,16 @@ wgetTransport prog =
                      , "--header=Accept: text/plain"
                      , "--header=Content-type: multipart/form-data; " ++
                                               "boundary=" ++ boundary ]
-          out <- runWGet verbosity (addUriAuth auth uri) args
-          (code, _etag) <- parseOutput verbosity uri out
-          withFile responseFile ReadMode $ \hnd -> do
+          out <- runWGet (addUriAuth auth uri) args
+          (code, _etag) <- parseOutput uri out
+          liftIO $ withFile responseFile ReadMode $ \hnd -> do
             resp <- hGetContents hnd
             evaluate $ force (code, resp)
 
-    puthttpfile verbosity uri path auth headers =
+    puthttpfile uri path auth headers =
         withTempFile (takeDirectory path) "response" $
         \responseFile responseHandle -> do
-            hClose responseHandle
+            liftIO $ hClose responseHandle
             let args = [ "--method=PUT", "--body-file="++path
                        , "--user-agent=" ++ userAgent
                        , "--server-response"
@@ -489,9 +491,9 @@ wgetTransport prog =
                     ++ [ "--header=" ++ show name ++ ": " ++ value
                        | Header name value <- headers ]
 
-            out <- runWGet verbosity (addUriAuth auth uri) args
-            (code, _etag) <- parseOutput verbosity uri out
-            withFile responseFile ReadMode $ \hnd -> do
+            out <- runWGet (addUriAuth auth uri) args
+            (code, _etag) <- parseOutput uri out
+            liftIO $ withFile responseFile ReadMode $ \hnd -> do
               resp <- hGetContents hnd
               evaluate $ force (code, resp)
 
@@ -502,7 +504,7 @@ wgetTransport prog =
      where
       a = fromMaybe (URIAuth "" "" "") (uriAuthority uri)
 
-    runWGet verbosity uri args = do
+    runWGet uri args = do
         -- We pass the URI via STDIN because it contains the users' credentials
         -- and sensitive data should not be passed via command line arguments.
         let
@@ -511,19 +513,19 @@ wgetTransport prog =
             }
 
         -- wget returns its output on stderr rather than stdout
-        (_, resp, exitCode) <- getProgramInvocationOutputAndErrors verbosity
+        (_, resp, exitCode) <- getProgramInvocationOutputAndErrors
                                  invocation
         -- wget returns exit code 8 for server "errors" like "304 not modified"
         if exitCode == ExitSuccess || exitCode == ExitFailure 8
           then return resp
-          else die' verbosity $ "'" ++ programPath prog
+          else die' $ "'" ++ programPath prog
                   ++ "' exited with an error:\n" ++ resp
 
     -- With the --server-response flag, wget produces output with the full
     -- http server response with all headers, we want to find a line like
     -- "HTTP/1.1 200 OK", but only the last one, since we can have multiple
     -- requests due to redirects.
-    parseOutput verbosity uri resp =
+    parseOutput uri resp =
       let parsedCode = listToMaybe
                      [ code
                      | (protocol:codestr:_err) <- map words (reverse (lines resp))
@@ -535,15 +537,15 @@ wgetTransport prog =
                     | ["ETag:", etag] <- map words (reverse (lines resp)) ]
        in case parsedCode of
             Just i -> return (i, mb_etag)
-            _      -> statusParseFail verbosity uri resp
+            _      -> statusParseFail uri resp
 
 
 powershellTransport :: ConfiguredProgram -> HttpTransport
 powershellTransport prog =
     HttpTransport gethttp posthttp posthttpfile puthttpfile True False
   where
-    gethttp verbosity uri etag destPath reqHeaders = do
-      resp <- runPowershellScript verbosity $
+    gethttp uri etag destPath reqHeaders = do
+      resp <- runPowershellScript $
         webclientScript
           (setupHeaders ((useragentHeader : etagHeader) ++ reqHeaders))
           [ "$wc.DownloadFile(" ++ escape (show uri)
@@ -555,34 +557,36 @@ powershellTransport prog =
       where
         parseResponse x = case readMaybe . unlines . take 1 . lines $ trim x of
           Just i  -> return (i, Nothing) -- TODO extract real etag
-          Nothing -> statusParseFail verbosity uri x
+          Nothing -> statusParseFail uri x
         etagHeader = [ Header HdrIfNoneMatch t | t <- maybeToList etag ]
 
     posthttp = noPostYet
 
-    posthttpfile verbosity uri path auth =
+    posthttpfile uri path auth =
       withTempFile (takeDirectory path)
                    (takeFileName path) $ \tmpFile tmpHandle -> do
-        (body, boundary) <- generateMultipartBody path
-        BS.hPut tmpHandle body
-        hClose tmpHandle
-        fullPath <- canonicalizePath tmpFile
+        (boundary, fullPath) <- liftIO $ do
+          (body, boundary') <- generateMultipartBody path
+          BS.hPut tmpHandle body
+          hClose tmpHandle
+          fullPath' <- canonicalizePath tmpFile
+          return (boundary', fullPath')
 
         let contentHeader = Header HdrContentType
               ("multipart/form-data; boundary=" ++ boundary)
-        resp <- runPowershellScript verbosity $ webclientScript
+        resp <- runPowershellScript $ webclientScript
           (setupHeaders (contentHeader : extraHeaders) ++ setupAuth auth)
           (uploadFileAction "POST" uri fullPath)
-        parseUploadResponse verbosity uri resp
+        parseUploadResponse uri resp
 
-    puthttpfile verbosity uri path auth headers = do
-      fullPath <- canonicalizePath path
-      resp <- runPowershellScript verbosity $ webclientScript
+    puthttpfile uri path auth headers = do
+      fullPath <- liftIO $ canonicalizePath path
+      resp <- runPowershellScript $ webclientScript
         (setupHeaders (extraHeaders ++ headers) ++ setupAuth auth)
         (uploadFileAction "PUT" uri fullPath)
-      parseUploadResponse verbosity uri resp
+      parseUploadResponse uri resp
 
-    runPowershellScript verbosity script = do
+    runPowershellScript script = do
       let args =
             [ "-InputFormat", "None"
             -- the default execution policy doesn't allow running
@@ -591,7 +595,7 @@ powershellTransport prog =
             , "-NoProfile", "-NonInteractive"
             , "-Command", "-"
             ]
-      getProgramInvocationOutput verbosity (programInvocation prog args)
+      getProgramInvocationOutput (programInvocation prog args)
         { progInvokeInput = Just (script ++ "\nExit(0);")
         }
 
@@ -619,10 +623,10 @@ powershellTransport prog =
       , "Write-Host (-join [System.Text.Encoding]::UTF8.GetChars($bodyBytes));"
       ]
 
-    parseUploadResponse verbosity uri resp = case lines (trim resp) of
+    parseUploadResponse uri resp = case lines (trim resp) of
       (codeStr : message)
         | Just code <- readMaybe codeStr -> return (code, unlines message)
-      _ -> statusParseFail verbosity uri resp
+      _ -> statusParseFail uri resp
 
     webclientScript setup action = unlines
       [ "$wc = new-object system.net.webclient;"
@@ -655,7 +659,7 @@ plainHttpTransport :: HttpTransport
 plainHttpTransport =
     HttpTransport gethttp posthttp posthttpfile puthttpfile False False
   where
-    gethttp verbosity uri etag destPath reqHeaders = do
+    gethttp uri etag destPath reqHeaders = do
       let req = Request{
                   rqURI     = uri,
                   rqMethod  = GET,
@@ -664,18 +668,18 @@ plainHttpTransport =
                            ++ reqHeaders,
                   rqBody    = BS.empty
                 }
-      (_, resp) <- cabalBrowse verbosity Nothing (request req)
+      (_, resp) <- cabalBrowse Nothing (request req)
       let code  = convertRspCode (rspCode resp)
           etag' = lookupHeader HdrETag (rspHeaders resp)
       -- 206 Partial Content is a normal response to a range request; see #3385.
       when (code==200 || code==206) $
-        writeFileAtomic destPath $ rspBody resp
+        liftIO $ writeFileAtomic destPath $ rspBody resp
       return (code, etag')
 
     posthttp = noPostYet
 
-    posthttpfile verbosity uri path auth = do
-      (body, boundary) <- generateMultipartBody path
+    posthttpfile uri path auth = do
+      (body, boundary) <- liftIO $ generateMultipartBody path
       let headers = [ Header HdrContentType
                              ("multipart/form-data; boundary="++boundary)
                     , Header HdrContentLength (show (BS.length body))
@@ -687,11 +691,11 @@ plainHttpTransport =
                   rqHeaders = headers,
                   rqBody    = body
                 }
-      (_, resp) <- cabalBrowse verbosity auth (request req)
+      (_, resp) <- cabalBrowse auth (request req)
       return (convertRspCode (rspCode resp), rspErrorString resp)
 
-    puthttpfile verbosity uri path auth headers = do
-      body <- BS.readFile path
+    puthttpfile uri path auth headers = do
+      body <- liftIO $ BS.readFile path
       let req = Request {
                   rqURI     = uri,
                   rqMethod  = PUT,
@@ -700,7 +704,7 @@ plainHttpTransport =
                             : headers,
                   rqBody    = body
                 }
-      (_, resp) <- cabalBrowse verbosity auth (request req)
+      (_, resp) <- cabalBrowse auth (request req)
       return (convertRspCode (rspCode resp), rspErrorString resp)
 
     convertRspCode (a,b,c) = a*100 + b*10 + c
@@ -712,16 +716,16 @@ plainHttpTransport =
           -> BS.unpack (rspBody resp)
         _ -> rspReason resp
 
-    cabalBrowse verbosity auth act = do
+    cabalBrowse auth act = runCabalMInIO $ \liftC -> do
       p <- fixupEmptyProxy <$> fetchProxy True
       Exception.handleJust
         (guard . isDoesNotExistError)
-        (const . die' verbosity $ "Couldn't establish HTTP connection. "
+        (const . liftC . die' $ "Couldn't establish HTTP connection. "
                     ++ "Possible cause: HTTP proxy server is down.") $
         browse $ do
           setProxy p
-          setErrHandler (warn verbosity . ("http error: "++))
-          setOutHandler (debug verbosity)
+          setErrHandler (liftC . warn . ("http error: "++))
+          setOutHandler (liftC . debug)
           setUserAgent  userAgent
           setAllowBasicAuth False
           setAuthorityGen (\_ _ -> return auth)
@@ -740,9 +744,9 @@ userAgent = concat [ "cabal-install/", display Paths_cabal_install.version
                    , " (", display buildOS, "; ", display buildArch, ")"
                    ]
 
-statusParseFail :: Verbosity -> URI -> String -> IO a
-statusParseFail verbosity uri r =
-    die' verbosity $ "Failed to download " ++ show uri ++ " : "
+statusParseFail :: URI -> String -> CabalM a
+statusParseFail uri r =
+    die' $ "Failed to download " ++ show uri ++ " : "
        ++ "No Status Code could be parsed from response: " ++ r
 
 -- Trim

@@ -59,7 +59,8 @@ import Distribution.ParseUtils         ( FieldDescr(..), ParseResult(..)
                                        , showPWarning, simpleField
                                        , syntaxError, warning )
 import Distribution.System             ( Platform )
-import Distribution.Verbosity          ( Verbosity, normal )
+import Distribution.Verbosity          ( normal )
+import Distribution.Monad              ( CabalM, liftIO )
 import Control.Monad                   ( foldM, liftM2, unless )
 import Data.List                       ( partition, sortBy )
 import Data.Maybe                      ( isJust )
@@ -266,80 +267,80 @@ commentPackageEnvironment sandboxDir = do
 
 -- | If this package environment inherits from some other package environment,
 -- return that package environment; otherwise return mempty.
-inheritedPackageEnvironment :: Verbosity -> PackageEnvironment
-                               -> IO PackageEnvironment
-inheritedPackageEnvironment verbosity pkgEnv = do
+inheritedPackageEnvironment :: PackageEnvironment
+                               -> CabalM PackageEnvironment
+inheritedPackageEnvironment pkgEnv = do
   case (pkgEnvInherit pkgEnv) of
     NoFlag                -> return mempty
     confPathFlag@(Flag _) -> do
-      conf <- loadConfig verbosity confPathFlag
+      conf <- loadConfig confPathFlag
       return $ mempty { pkgEnvSavedConfig = conf }
 
 -- | Load the user package environment if it exists (the optional "cabal.config"
 -- file). If it does not exist locally, attempt to load an optional global one.
-userPackageEnvironment :: Verbosity -> FilePath -> Maybe FilePath
-                       -> IO PackageEnvironment
-userPackageEnvironment verbosity pkgEnvDir globalConfigLocation = do
+userPackageEnvironment :: FilePath -> Maybe FilePath
+                       -> CabalM PackageEnvironment
+userPackageEnvironment pkgEnvDir globalConfigLocation = do
     let path = pkgEnvDir </> userPackageEnvironmentFile
-    minp <- readPackageEnvironmentFile (ConstraintSourceUserConfig path)
+    minp <- liftIO $ readPackageEnvironmentFile (ConstraintSourceUserConfig path)
             mempty path
     case (minp, globalConfigLocation) of
       (Just parseRes, _)  -> processConfigParse path parseRes
       (_, Just globalLoc) -> do
-        minp' <- readPackageEnvironmentFile (ConstraintSourceUserConfig globalLoc)
+        minp' <- liftIO $ readPackageEnvironmentFile (ConstraintSourceUserConfig globalLoc)
                  mempty globalLoc
-        maybe (warn verbosity ("no constraints file found at " ++ globalLoc)
+        maybe (warn ("no constraints file found at " ++ globalLoc)
                >> return mempty)
           (processConfigParse globalLoc)
           minp'
       _ -> do
-        debug verbosity ("no user package environment file found at " ++ pkgEnvDir)
+        debug ("no user package environment file found at " ++ pkgEnvDir)
         return mempty
   where
     processConfigParse path (ParseOk warns parseResult) = do
-      unless (null warns) $ warn verbosity $
+      unless (null warns) $ warn $
         unlines (map (showPWarning path) warns)
       return parseResult
     processConfigParse path (ParseFailed err) = do
       let (line, msg) = locatedErrorMsg err
-      warn verbosity $ "Error parsing package environment file " ++ path
+      warn $ "Error parsing package environment file " ++ path
         ++ maybe "" (\n -> ":" ++ show n) line ++ ":\n" ++ msg
       return mempty
 
 -- | Same as @userPackageEnvironmentFile@, but returns a SavedConfig.
-loadUserConfig :: Verbosity -> FilePath -> Maybe FilePath -> IO SavedConfig
-loadUserConfig verbosity pkgEnvDir globalConfigLocation =
+loadUserConfig :: FilePath -> Maybe FilePath -> CabalM SavedConfig
+loadUserConfig pkgEnvDir globalConfigLocation =
     fmap pkgEnvSavedConfig $
-    userPackageEnvironment verbosity pkgEnvDir globalConfigLocation
+    userPackageEnvironment pkgEnvDir globalConfigLocation
 
 -- | Common error handling code used by 'tryLoadSandboxPackageEnvironment' and
 -- 'updatePackageEnvironment'.
-handleParseResult :: Verbosity -> FilePath
-                     -> Maybe (ParseResult PackageEnvironment)
-                     -> IO PackageEnvironment
-handleParseResult verbosity path minp =
+handleParseResult :: FilePath
+                  -> Maybe (ParseResult PackageEnvironment)
+                  -> CabalM PackageEnvironment
+handleParseResult path minp =
   case minp of
-    Nothing -> die' verbosity $
+    Nothing -> die' $
       "The package environment file '" ++ path ++ "' doesn't exist"
     Just (ParseOk warns parseResult) -> do
-      unless (null warns) $ warn verbosity $
+      unless (null warns) $ warn $
         unlines (map (showPWarning path) warns)
       return parseResult
     Just (ParseFailed err) -> do
       let (line, msg) = locatedErrorMsg err
-      die' verbosity $ "Error parsing package environment file " ++ path
+      die' $ "Error parsing package environment file " ++ path
         ++ maybe "" (\n -> ":" ++ show n) line ++ ":\n" ++ msg
 
 -- | Try to load the given package environment file, exiting with error if it
 -- doesn't exist. Also returns the path to the sandbox directory. The path
 -- parameter should refer to an existing file.
-tryLoadSandboxPackageEnvironmentFile :: Verbosity -> FilePath -> (Flag FilePath)
-                                        -> IO (FilePath, PackageEnvironment)
-tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
+tryLoadSandboxPackageEnvironmentFile :: FilePath -> (Flag FilePath)
+                                     -> CabalM (FilePath, PackageEnvironment)
+tryLoadSandboxPackageEnvironmentFile pkgEnvFile configFileFlag = do
   let pkgEnvDir = takeDirectory pkgEnvFile
-  minp   <- readPackageEnvironmentFile
+  minp   <- liftIO $ readPackageEnvironmentFile
             (ConstraintSourceSandboxConfig pkgEnvFile) mempty pkgEnvFile
-  pkgEnv <- handleParseResult verbosity pkgEnvFile minp
+  pkgEnv <- handleParseResult pkgEnvFile minp
 
   -- Get the saved sandbox directory.
   -- TODO: Use substPathTemplate with
@@ -349,19 +350,19 @@ tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
                    . pkgEnvSavedConfig $ pkgEnv
 
   -- Do some sanity checks
-  dirExists            <- doesDirectoryExist sandboxDir
+  dirExists            <- liftIO $ doesDirectoryExist sandboxDir
   -- TODO: Also check for an initialised package DB?
   unless dirExists $
-    die' verbosity ("No sandbox exists at " ++ sandboxDir)
-  info verbosity $ "Using a sandbox located at " ++ sandboxDir
+    die' ("No sandbox exists at " ++ sandboxDir)
+  info $ "Using a sandbox located at " ++ sandboxDir
 
   let base   = basePackageEnvironment
   let common = commonPackageEnvironment sandboxDir
-  user      <- userPackageEnvironment verbosity pkgEnvDir Nothing --TODO
-  inherited <- inheritedPackageEnvironment verbosity user
+  user      <- userPackageEnvironment pkgEnvDir Nothing --TODO
+  inherited <- inheritedPackageEnvironment user
 
   -- Layer the package environment settings over settings from ~/.cabal/config.
-  cabalConfig <- fmap unsetSymlinkBinDir $ loadConfig verbosity configFileFlag
+  cabalConfig <- fmap unsetSymlinkBinDir $ loadConfig configFileFlag
   return (sandboxDir,
           updateInstallDirs $
           (base `mappend` (toPkgEnv cabalConfig) `mappend`
@@ -394,14 +395,15 @@ tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
 
 -- | Create a new package environment file, replacing the existing one if it
 -- exists. Note that the path parameters should point to existing directories.
-createPackageEnvironmentFile :: Verbosity -> FilePath -> FilePath
-                                -> Compiler
-                                -> Platform
-                                -> IO ()
-createPackageEnvironmentFile verbosity sandboxDir pkgEnvFile compiler platform = do
-  notice verbosity $ "Writing a default package environment file to " ++ pkgEnvFile
-  initialPkgEnv <- initialPackageEnvironment sandboxDir compiler platform
-  writePackageEnvironmentFile pkgEnvFile initialPkgEnv
+createPackageEnvironmentFile :: FilePath -> FilePath
+                             -> Compiler
+                             -> Platform
+                             -> CabalM ()
+createPackageEnvironmentFile sandboxDir pkgEnvFile compiler platform = do
+  notice $ "Writing a default package environment file to " ++ pkgEnvFile
+  liftIO $ do
+    initialPkgEnv <- initialPackageEnvironment sandboxDir compiler platform
+    writePackageEnvironmentFile pkgEnvFile initialPkgEnv
 
 -- | Descriptions of all fields in the package environment file.
 pkgEnvFieldDescrs :: ConstraintSource -> [FieldDescr PackageEnvironment]

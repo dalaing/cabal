@@ -35,6 +35,7 @@ import Control.Concurrent.STM (STM, atomically)
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM.TChan
 import Control.Exception (SomeException, bracket_, throwIO, try)
+import Distribution.Monad (CabalM, runCabalMInIO)
 import Distribution.Client.Compat.Semaphore
 
 
@@ -161,14 +162,16 @@ newJobLimit :: Int -> IO JobLimit
 newJobLimit n =
   fmap JobLimit (newQSem n)
 
-withJobLimit :: JobLimit -> IO a -> IO a
-withJobLimit (JobLimit sem) =
-  bracket_ (waitQSem sem) (signalQSem sem)
+withJobLimit :: JobLimit -> CabalM a -> CabalM a
+withJobLimit (JobLimit sem) act =
+  runCabalMInIO $ \liftC ->
+  bracket_ (waitQSem sem) (signalQSem sem) (liftC act)
 
 newtype Lock = Lock (MVar ())
 
 newLock :: IO Lock
 newLock = fmap Lock $ newMVar ()
 
-criticalSection :: Lock -> IO a -> IO a
-criticalSection (Lock lck) act = bracket_ (takeMVar lck) (putMVar lck ()) act
+criticalSection :: Lock -> CabalM a -> CabalM a
+criticalSection (Lock lck) act =
+  runCabalMInIO $ \liftC -> bracket_ (takeMVar lck) (putMVar lck ()) (liftC act)

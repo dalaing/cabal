@@ -46,6 +46,7 @@ import Distribution.System
 import Distribution.Version
 import Distribution.ModuleName (ModuleName)
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Text
 
 import Data.Monoid
@@ -1477,9 +1478,10 @@ configureProject testdir cliConfig = do
     cleanProject testdir
 
     (projectConfig, localPackages) <-
-      rebuildProjectConfig verbosity
-                           distDirLayout
-                           cliConfig
+      flip runCabalM verbosity $
+        rebuildProjectConfig
+          distDirLayout
+          cliConfig
 
     let buildSettings = resolveBuildTimeSettings
                           verbosity cabalDirLayout
@@ -1506,10 +1508,11 @@ planProject testdir cliConfig = do
        _buildSettings) <- configureProject testdir cliConfig
 
     (elaboratedPlan, _, elaboratedShared) <-
-      rebuildInstallPlan verbosity
-                         distDirLayout cabalDirLayout
-                         projectConfig
-                         localPackages
+      flip runCabalM verbosity $
+        rebuildInstallPlan
+          distDirLayout cabalDirLayout
+          projectConfig
+          localPackages
 
     return (projDetails,
             elaboratedPlan,
@@ -1541,14 +1544,15 @@ executePlan ((distDirLayout, cabalDirLayout, _, _, buildSettings),
                              pkgsBuildStatus elaboratedPlan'
 
     buildOutcomes <-
-      rebuildTargets verbosity
-                     distDirLayout
-                     (cabalStoreDirLayout cabalDirLayout)
-                     elaboratedPlan''
-                     elaboratedShared
-                     pkgsBuildStatus
-                     -- Avoid trying to use act-as-setup mode:
-                     buildSettings { buildSettingNumJobs = 1 }
+      flip runCabalM verbosity $
+        rebuildTargets
+          distDirLayout
+          (cabalStoreDirLayout cabalDirLayout)
+          elaboratedPlan''
+          elaboratedShared
+          pkgsBuildStatus
+          -- Avoid trying to use act-as-setup mode:
+          buildSettings { buildSettingNumJobs = 1 }
 
     return (elaboratedPlan'', buildOutcomes)
 

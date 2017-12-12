@@ -82,8 +82,11 @@ import Distribution.Simple.Utils
   , wrapText
   )
 import Distribution.Verbosity
-  ( Verbosity
-  , normal
+  ( normal
+  )
+import Distribution.Monad
+  ( CabalM
+  , runCabalM
   )
 
 import qualified Distribution.Client.CmdBuild as CmdBuild
@@ -123,15 +126,14 @@ execCommand = CommandUI
 execAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
            -> [String] -> GlobalFlags -> IO ()
 execAction (configFlags, configExFlags, installFlags, haddockFlags)
-           extraArgs globalFlags = do
+           extraArgs globalFlags = flip runCabalM verbosity $ do
 
-  baseCtx <- establishProjectBaseContext verbosity cliConfig
+  baseCtx <- establishProjectBaseContext cliConfig
 
   -- To set up the environment, we'd like to select the libraries in our
   -- dependency tree that we've already built. So first we set up an install
   -- plan, but we walk the dependency tree without first executing the plan.
   buildCtx <- runProjectPreBuildPhase
-    verbosity
     baseCtx
     (\plan -> return (plan, M.empty))
 
@@ -140,14 +142,13 @@ execAction (configFlags, configExFlags, installFlags, haddockFlags)
   -- pass mempty to indicate that nothing happened and we just want the current
   -- status.
   buildStatus <- updatePostBuildProjectStatus
-    verbosity
     (distDirLayout baseCtx)
     (elaboratedPlanOriginal buildCtx)
     (pkgsBuildStatus buildCtx)
     mempty
 
   -- Some dependencies may have executables. Let's put those on the PATH.
-  extraPaths <- pathAdditions verbosity baseCtx buildCtx
+  extraPaths <- pathAdditions baseCtx buildCtx
   let programDb = modifyProgramSearchPath
                   (map ProgramSearchPathDir extraPaths ++)
                 . pkgConfigCompilerProgs
@@ -163,9 +164,9 @@ execAction (configFlags, configExFlags, installFlags, haddockFlags)
   let compiler = pkgConfigCompiler $ elaboratedShared buildCtx
       envFilesSupported = supportsPkgEnvFiles (getImplInfo compiler)
   case extraArgs of
-    [] -> die' verbosity "Please specify an executable to run"
+    [] -> die' "Please specify an executable to run"
     exe:args -> do
-      (program, _) <- requireProgram verbosity (simpleProgram exe) programDb
+      (program, _) <- requireProgram (simpleProgram exe) programDb
       let argOverrides =
             argsEquivalentOfGhcEnvironmentFile
               compiler
@@ -182,14 +183,14 @@ execAction (configFlags, configExFlags, installFlags, haddockFlags)
             else argOverrides
 
       (if envFilesSupported
-      then withTempEnvFile verbosity baseCtx buildCtx buildStatus
+      then withTempEnvFile baseCtx buildCtx buildStatus
       else \f -> f []) $ \envOverrides -> do
         let program'   = withOverrides
                            envOverrides
                            argOverrides'
                            program
             invocation = programInvocation program' args
-        runProgramInvocation verbosity invocation
+        runProgramInvocation invocation
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
@@ -210,33 +211,29 @@ matchCompilerPath elaboratedShared program =
 -- | Execute an action with a temporary .ghc.environment file reflecting the
 -- current environment. The action takes an environment containing the env
 -- variable which points ghc to the file.
-withTempEnvFile :: Verbosity
-                -> ProjectBaseContext
+withTempEnvFile :: ProjectBaseContext
                 -> ProjectBuildContext
                 -> PostBuildProjectStatus
-                -> ([(String, Maybe String)] -> IO a)
-                -> IO a
-withTempEnvFile verbosity
-                baseCtx
+                -> ([(String, Maybe String)] -> CabalM a)
+                -> CabalM a
+withTempEnvFile baseCtx
                 buildCtx
                 buildStatus
                 action =
   withTempDirectory
-   verbosity
    (distTempDirectory (distDirLayout baseCtx))
    "environment."
    (\tmpDir -> do
      envOverrides <- createPackageEnvironment
-       verbosity
        tmpDir
        (elaboratedPlanToExecute buildCtx)
        (elaboratedShared buildCtx)
        buildStatus
      action envOverrides)
 
-pathAdditions :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> IO [FilePath]
-pathAdditions verbosity ProjectBaseContext{..}ProjectBuildContext{..} = do
-  info verbosity . unlines $ "Including the following directories in PATH:"
+pathAdditions :: ProjectBaseContext -> ProjectBuildContext -> CabalM [FilePath]
+pathAdditions ProjectBaseContext{..}ProjectBuildContext{..} = do
+  info . unlines $ "Including the following directories in PATH:"
                            : paths
   return paths
   where

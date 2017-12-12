@@ -57,8 +57,8 @@ import Distribution.System
          ( Platform )
 import Distribution.Text
          ( display )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, liftIO, askVerbosity )
 
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import Distribution.Version
@@ -71,8 +71,7 @@ import Distribution.Version
 -- | Freeze all of the dependencies by writing a constraints section
 -- constraining each dependency to an exact version.
 --
-freeze :: Verbosity
-       -> PackageDBStack
+freeze :: PackageDBStack
        -> RepoContext
        -> Compiler
        -> Platform
@@ -80,31 +79,30 @@ freeze :: Verbosity
        -> Maybe SandboxPackageInfo
        -> GlobalFlags
        -> FreezeFlags
-       -> IO ()
-freeze verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+       -> CabalM ()
+freeze packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       globalFlags freezeFlags = do
 
     pkgs  <- getFreezePkgs
-               verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+               packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
                globalFlags freezeFlags
 
     if null pkgs
-      then notice verbosity $ "No packages to be frozen. "
+      then notice $ "No packages to be frozen. "
                            ++ "As this package has no dependencies."
       else if dryRun
-             then notice verbosity $ unlines $
+             then notice $ unlines $
                      "The following packages would be frozen:"
                    : formatPkgs pkgs
 
-             else freezePackages verbosity globalFlags pkgs
+             else freezePackages globalFlags pkgs
 
   where
     dryRun = fromFlag (freezeDryRun freezeFlags)
 
 -- | Get the list of packages whose versions would be frozen by the @freeze@
 -- command.
-getFreezePkgs :: Verbosity
-              -> PackageDBStack
+getFreezePkgs :: PackageDBStack
               -> RepoContext
               -> Compiler
               -> Platform
@@ -112,34 +110,33 @@ getFreezePkgs :: Verbosity
               -> Maybe SandboxPackageInfo
               -> GlobalFlags
               -> FreezeFlags
-              -> IO [SolverPlanPackage]
-getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+              -> CabalM [SolverPlanPackage]
+getFreezePkgs packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       globalFlags freezeFlags = do
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-    sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
-    pkgConfigDb       <- readPkgConfigDb      verbosity progdb
+    installedPkgIndex <- getInstalledPackages comp packageDBs progdb
+    sourcePkgDb       <- getSourcePackages    repoCtxt
+    pkgConfigDb       <- readPkgConfigDb      progdb
 
-    pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
+    pkgSpecifiers <- resolveUserTargets repoCtxt
                        (fromFlag $ globalWorldFile globalFlags)
                        (packageIndex sourcePkgDb)
                        [UserTargetLocalDir "."]
 
     sanityCheck pkgSpecifiers
     planPackages
-               verbosity comp platform mSandboxPkgInfo freezeFlags
+               comp platform mSandboxPkgInfo freezeFlags
                installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
   where
     sanityCheck pkgSpecifiers = do
       when (not . null $ [n | n@(NamedPackage _ _) <- pkgSpecifiers]) $
-        die' verbosity $ "internal error: 'resolveUserTargets' returned "
+        die' $ "internal error: 'resolveUserTargets' returned "
            ++ "unexpected named package specifiers!"
       when (length pkgSpecifiers /= 1) $
-        die' verbosity $ "internal error: 'resolveUserTargets' returned "
+        die' $ "internal error: 'resolveUserTargets' returned "
            ++ "unexpected source package specifiers!"
 
-planPackages :: Verbosity
-             -> Compiler
+planPackages :: Compiler
              -> Platform
              -> Maybe SandboxPackageInfo
              -> FreezeFlags
@@ -147,24 +144,26 @@ planPackages :: Verbosity
              -> SourcePackageDb
              -> PkgConfigDb
              -> [PackageSpecifier UnresolvedSourcePackage]
-             -> IO [SolverPlanPackage]
-planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
+             -> CabalM [SolverPlanPackage]
+planPackages comp platform mSandboxPkgInfo freezeFlags
              installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers = do
 
-  solver <- chooseSolver verbosity
+  solver <- chooseSolver
             (fromFlag (freezeSolver freezeFlags)) (compilerInfo comp)
-  notice verbosity "Resolving dependencies..."
+  notice "Resolving dependencies..."
 
-  installPlan <- foldProgress logMsg (die' verbosity) return $
+  verbosity <- askVerbosity
+
+  installPlan <- foldProgress logMsg die' return $
                    resolveDependencies
                      platform (compilerInfo comp) pkgConfigDb
                      solver
-                     resolverParams
+                     (resolverParams verbosity)
 
   return $ pruneInstallPlan installPlan pkgSpecifiers
 
   where
-    resolverParams =
+    resolverParams verb =
 
         setMaxBackjumps (if maxBackjumps < 0 then Nothing
                                              else Just maxBackjumps)
@@ -181,7 +180,7 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
       . setAllowBootLibInstalls allowBootLibInstalls
 
-      . setSolverVerbosity verbosity
+      . setSolverVerbosity verb
 
       . addConstraints
           [ let pkg = pkgSpecifierTarget pkgSpecifier
@@ -194,7 +193,7 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
       $ standardInstallPolicy installedPkgIndex sourcePkgDb pkgSpecifiers
 
-    logMsg message rest = debug verbosity message >> rest
+    logMsg message rest = debug message >> rest
 
     stanzas = [ TestStanzas | testsEnabled ]
            ++ [ BenchStanzas | benchmarksEnabled ]
@@ -236,13 +235,13 @@ pruneInstallPlan installPlan pkgSpecifiers =
                          ++ "unexpected package specifiers!"
 
 
-freezePackages :: Package pkg => Verbosity -> GlobalFlags -> [pkg] -> IO ()
-freezePackages verbosity globalFlags pkgs = do
+freezePackages :: Package pkg => GlobalFlags -> [pkg] -> CabalM ()
+freezePackages globalFlags pkgs = do
 
     pkgEnv <- fmap (createPkgEnv . addFrozenConstraints) $
-                   loadUserConfig verbosity ""
+                   loadUserConfig ""
                    (flagToMaybe . globalConstraintsFile $ globalFlags)
-    writeFileAtomic userPackageEnvironmentFile $ showPkgEnv pkgEnv
+    liftIO $ writeFileAtomic userPackageEnvironmentFile $ showPkgEnv pkgEnv
   where
     addFrozenConstraints config =
         config {

@@ -8,7 +8,7 @@ import Distribution.Client.Setup
          ( IsCandidate(..), RepoContext(..) )
 
 import Distribution.Simple.Utils (notice, warn, info, die')
-import Distribution.Verbosity (Verbosity)
+import Distribution.Monad (CabalM, liftIO)
 import Distribution.Text (display)
 import Distribution.Client.Config
 
@@ -41,16 +41,16 @@ stripExtensions exts path = foldM f path (reverse exts)
     | takeExtension p == '.':e = Just (dropExtension p)
     | otherwise = Nothing
 
-upload :: Verbosity -> RepoContext
+upload :: RepoContext
        -> Maybe Username -> Maybe Password -> IsCandidate -> [FilePath]
-       -> IO ()
-upload verbosity repoCtxt mUsername mPassword isCandidate paths = do
+       -> CabalM ()
+upload repoCtxt mUsername mPassword isCandidate paths = do
     let repos = repoContextRepos repoCtxt
     transport  <- repoContextGetTransport repoCtxt
     targetRepo <-
       case [ remoteRepo | Just remoteRepo <- map maybeRepoRemote repos ] of
-        [] -> die' verbosity "Cannot upload. No remote repositories are configured."
-        rs -> remoteRepoTryUpgradeToHttps verbosity transport (last rs)
+        [] -> die' "Cannot upload. No remote repositories are configured."
+        rs -> remoteRepoTryUpgradeToHttps transport (last rs)
     let targetRepoURI = remoteRepoURI targetRepo
         rootIfEmpty x = if null x then "/" else x
         uploadURI = targetRepoURI {
@@ -68,28 +68,28 @@ upload verbosity repoCtxt mUsername mPassword isCandidate paths = do
                   IsPublished -> ""
               ]
         }
-    Username username <- maybe promptUsername return mUsername
-    Password password <- maybe promptPassword return mPassword
+    Username username <- liftIO $ maybe promptUsername return mUsername
+    Password password <- liftIO $ maybe promptPassword return mPassword
     let auth = Just (username,password)
     forM_ paths $ \path -> do
-      notice verbosity $ "Uploading " ++ path ++ "... "
+      notice $ "Uploading " ++ path ++ "... "
       case fmap takeFileName (stripExtensions ["tar", "gz"] path) of
-        Just pkgid -> handlePackage transport verbosity uploadURI
+        Just pkgid -> handlePackage transport uploadURI
                                     (packageURI pkgid) auth isCandidate path
         -- This case shouldn't really happen, since we check in Main that we
         -- only pass tar.gz files to upload.
-        Nothing -> die' verbosity $ "Not a tar.gz file: " ++ path
+        Nothing -> die' $ "Not a tar.gz file: " ++ path
 
-uploadDoc :: Verbosity -> RepoContext
+uploadDoc :: RepoContext
           -> Maybe Username -> Maybe Password -> IsCandidate -> FilePath
-          -> IO ()
-uploadDoc verbosity repoCtxt mUsername mPassword isCandidate path = do
+          -> CabalM ()
+uploadDoc repoCtxt mUsername mPassword isCandidate path = do
     let repos = repoContextRepos repoCtxt
     transport  <- repoContextGetTransport repoCtxt
     targetRepo <-
       case [ remoteRepo | Just remoteRepo <- map maybeRepoRemote repos ] of
-        [] -> die' verbosity $ "Cannot upload. No remote repositories are configured."
-        rs -> remoteRepoTryUpgradeToHttps verbosity transport (last rs)
+        [] -> die' $ "Cannot upload. No remote repositories are configured."
+        rs -> remoteRepoTryUpgradeToHttps transport (last rs)
     let targetRepoURI = remoteRepoURI targetRepo
         rootIfEmpty x = if null x then "/" else x
         uploadURI = targetRepoURI {
@@ -116,28 +116,28 @@ uploadDoc verbosity repoCtxt mUsername mPassword isCandidate path = do
         pkgid = reverse $ tail reversePkgid
     when (reverse reverseSuffix /= "docs.tar.gz"
           || null reversePkgid || head reversePkgid /= '-') $
-      die' verbosity "Expected a file name matching the pattern <pkgid>-docs.tar.gz"
-    Username username <- maybe promptUsername return mUsername
-    Password password <- maybe promptPassword return mPassword
+      die' "Expected a file name matching the pattern <pkgid>-docs.tar.gz"
+    Username username <- liftIO $ maybe promptUsername return mUsername
+    Password password <- liftIO $ maybe promptPassword return mPassword
 
     let auth = Just (username,password)
         headers =
           [ Header HdrContentType "application/x-tar"
           , Header HdrContentEncoding "gzip"
           ]
-    notice verbosity $ "Uploading documentation " ++ path ++ "... "
-    resp <- putHttpFile transport verbosity uploadURI path auth headers
+    notice $ "Uploading documentation " ++ path ++ "... "
+    resp <- putHttpFile transport uploadURI path auth headers
     case resp of
       -- Hackage responds with 204 No Content when docs are uploaded
       -- successfully.
       (code,_) | code `elem` [200,204] -> do
-        notice verbosity $ okMessage packageUri
+        notice $ okMessage packageUri
       (code,err)  -> do
-        notice verbosity $ "Error uploading documentation "
+        notice $ "Error uploading documentation "
                         ++ path ++ ": "
                         ++ "http code " ++ show code ++ "\n"
                         ++ err
-        exitFailure
+        liftIO $ exitFailure
   where
     okMessage packageUri = case isCandidate of
       IsCandidate ->
@@ -164,46 +164,46 @@ promptPassword = do
   putStrLn ""
   return passwd
 
-report :: Verbosity -> RepoContext -> Maybe Username -> Maybe Password -> IO ()
-report verbosity repoCtxt mUsername mPassword = do
-  Username username <- maybe promptUsername return mUsername
-  Password password <- maybe promptPassword return mPassword
+report :: RepoContext -> Maybe Username -> Maybe Password -> CabalM ()
+report repoCtxt mUsername mPassword = do
+  Username username <- liftIO $ maybe promptUsername return mUsername
+  Password password <- liftIO $ maybe promptPassword return mPassword
   let auth        = (username, password)
       repos       = repoContextRepos repoCtxt
       remoteRepos = mapMaybe maybeRepoRemote repos
   forM_ remoteRepos $ \remoteRepo ->
-      do dotCabal <- defaultCabalDir
+      do dotCabal <- liftIO defaultCabalDir
          let srcDir = dotCabal </> "reports" </> remoteRepoName remoteRepo
          -- We don't want to bomb out just because we haven't built any packages
          -- from this repo yet.
-         srcExists <- doesDirectoryExist srcDir
+         srcExists <- liftIO $ doesDirectoryExist srcDir
          when srcExists $ do
-           contents <- getDirectoryContents srcDir
+           contents <- liftIO $ getDirectoryContents srcDir
            forM_ (filter (\c -> takeExtension c ==".log") contents) $ \logFile ->
-             do inp <- readFile (srcDir </> logFile)
+             do inp <- liftIO $ readFile (srcDir </> logFile)
                 let (reportStr, buildLog) = read inp :: (String,String) -- TODO: eradicateNoParse
                 case BuildReport.parse reportStr of
-                  Left errs -> warn verbosity $ "Errors: " ++ errs -- FIXME
+                  Left errs -> warn $ "Errors: " ++ errs -- FIXME
                   Right report' ->
-                    do info verbosity $ "Uploading report for "
+                    do info $ "Uploading report for "
                          ++ display (BuildReport.package report')
-                       BuildReport.uploadReports verbosity repoCtxt auth
+                       BuildReport.uploadReports repoCtxt auth
                          (remoteRepoURI remoteRepo) [(report', Just buildLog)]
                        return ()
 
-handlePackage :: HttpTransport -> Verbosity -> URI -> URI -> Auth
-              -> IsCandidate -> FilePath -> IO ()
-handlePackage transport verbosity uri packageUri auth isCandidate path =
-  do resp <- postHttpFile transport verbosity uri path auth
+handlePackage :: HttpTransport -> URI -> URI -> Auth
+              -> IsCandidate -> FilePath -> CabalM ()
+handlePackage transport uri packageUri auth isCandidate path =
+  do resp <- postHttpFile transport uri path auth
      case resp of
        (code,warnings) | code `elem` [200, 204] ->
-          notice verbosity $ okMessage isCandidate ++
+          notice $ okMessage isCandidate ++
             if null warnings then "" else "\n" ++ formatWarnings (trim warnings)
        (code,err)  -> do
-          notice verbosity $ "Error uploading " ++ path ++ ": "
+          notice $ "Error uploading " ++ path ++ ": "
                           ++ "http code " ++ show code ++ "\n"
                           ++ err
-          exitFailure
+          liftIO exitFailure
  where
   okMessage IsCandidate =
     "Package successfully uploaded as candidate. "

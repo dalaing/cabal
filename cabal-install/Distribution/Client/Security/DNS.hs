@@ -7,7 +7,7 @@ module Distribution.Client.Security.DNS
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 import Network.URI (URI(..), URIAuth(..), parseURI)
-import Distribution.Verbosity
+import Distribution.Monad
 import Control.Monad
 import Control.DeepSeq (force)
 import Control.Exception (SomeException, evaluate, try)
@@ -47,30 +47,30 @@ import Distribution.Simple.Program
 -- @_mirrors.hackage.haskell.org@ DNS entry in the same SOA doesn't
 -- constitute a significant new attack vector anyway.
 --
-queryBootstrapMirrors :: Verbosity -> URI -> IO [URI]
+queryBootstrapMirrors :: URI -> CabalM [URI]
 
 #if defined(MIN_VERSION_resolv) || defined(MIN_VERSION_windns)
 -- use @resolv@ package for performing DNS queries
-queryBootstrapMirrors verbosity repoUri
+queryBootstrapMirrors repoUri
   | Just auth <- uriAuthority repoUri = do
          let mirrorsDnsName = Name (BS.Char8.pack ("_mirrors." ++ uriRegName auth))
 
-         mirrors' <- try $ do
+         mirrors' <- liftIO $ try $ do
                   txts <- queryTXT mirrorsDnsName
                   evaluate (force $ extractMirrors (map snd txts))
 
          mirrors <- case mirrors' of
              Left e -> do
-                 warn verbosity ("Caught exception during _mirrors lookup:"++
-                                 displayException (e :: SomeException))
+                 warn ("Caught exception during _mirrors lookup:"++
+                               displayException (e :: SomeException))
                  return []
              Right v -> return v
 
          if null mirrors
-         then warn verbosity ("No mirrors found for " ++ show repoUri)
-         else do info verbosity ("located " ++ show (length mirrors) ++
+         then warn ("No mirrors found for " ++ show repoUri)
+         else do info ("located " ++ show (length mirrors) ++
                                  " mirrors for " ++ show repoUri ++ " :")
-                 forM_ mirrors $ \url -> info verbosity ("- " ++ show url)
+                 forM_ mirrors $ \url -> info ("- " ++ show url)
 
          return mirrors
 
@@ -88,36 +88,36 @@ extractMirrors txtChunks = mapMaybe (parseURI . snd) . sort $ vals
 ----------------------------------------------------------------------------
 #else /* !defined(MIN_VERSION_resolv) */
 -- use external method via @nslookup@
-queryBootstrapMirrors verbosity repoUri
+queryBootstrapMirrors repoUri
   | Just auth <- uriAuthority repoUri = do
-        progdb <- configureAllKnownPrograms verbosity $
+        progdb <- configureAllKnownPrograms $
                   addKnownProgram nslookupProg emptyProgramDb
 
         case lookupProgram nslookupProg progdb of
           Nothing -> do
-              warn verbosity "'nslookup' tool missing - can't locate mirrors"
+              warn "'nslookup' tool missing - can't locate mirrors"
               return []
 
           Just nslookup -> do
               let mirrorsDnsName = "_mirrors." ++ uriRegName auth
 
               mirrors' <- try $ do
-                  out <- getProgramInvocationOutput verbosity $
+                  out <- getProgramInvocationOutput $
                          programInvocation nslookup ["-query=TXT", mirrorsDnsName]
                   evaluate (force $ extractMirrors mirrorsDnsName out)
 
               mirrors <- case mirrors' of
                 Left e -> do
-                    warn verbosity ("Caught exception during _mirrors lookup:"++
+                    warn ("Caught exception during _mirrors lookup:"++
                                     displayException (e :: SomeException))
                     return []
                 Right v -> return v
 
               if null mirrors
-              then warn verbosity ("No mirrors found for " ++ show repoUri)
-              else do info verbosity ("located " ++ show (length mirrors) ++
+              then warn ("No mirrors found for " ++ show repoUri)
+              else do info ("located " ++ show (length mirrors) ++
                                       " mirrors for " ++ show repoUri ++ " :")
-                      forM_ mirrors $ \url -> info verbosity ("- " ++ show url)
+                      forM_ mirrors $ \url -> info ("- " ++ show url)
 
               return mirrors
 

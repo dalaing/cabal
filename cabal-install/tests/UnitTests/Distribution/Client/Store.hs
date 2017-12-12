@@ -12,6 +12,7 @@ import Distribution.Package (UnitId, mkUnitId)
 import Distribution.Compiler (CompilerId(..), CompilerFlavor(..))
 import Distribution.Version  (mkVersion)
 import Distribution.Verbosity (Verbosity, silent)
+import Distribution.Monad (CabalM, runCabalM, liftIO)
 import Distribution.Simple.Utils (withTempDirectory)
 
 import Distribution.Client.Store
@@ -32,7 +33,8 @@ tests =
 
 testListEmpty :: Assertion
 testListEmpty =
-  withTempDirectory verbosity "." "store-" $ \tmp -> do
+  flip runCabalM verbosity $
+  withTempDirectory "." "store-" $ \tmp -> liftIO $ do
     let storeDirLayout = defaultStoreDirLayout (tmp </> "store")
 
     assertStoreEntryExists storeDirLayout compid unitid False
@@ -44,9 +46,10 @@ testListEmpty =
 
 testInstallSerial :: Assertion
 testInstallSerial =
-  withTempDirectory verbosity "." "store-" $ \tmp -> do
+  flip runCabalM verbosity $
+  withTempDirectory "." "store-" $ \tmp -> liftIO $ do
     let storeDirLayout = defaultStoreDirLayout (tmp </> "store")
-        copyFiles file content dir = do
+        copyFiles file content dir = liftIO $ do
           -- we copy into a prefix inside the tmp dir and return the prefix
           let destprefix = dir </> "prefix"
           createDirectory destprefix
@@ -83,7 +86,8 @@ testInstallSerial =
 
 testInstallParallel :: Assertion
 testInstallParallel =
-  withTempDirectory verbosity "." "store-" $ \tmp -> do
+  flip runCabalM verbosity $
+  withTempDirectory "." "store-" $ \tmp -> liftIO $ do
     let storeDirLayout = defaultStoreDirLayout (tmp </> "store")
 
     sync1 <- newEmptyMVar
@@ -102,9 +106,10 @@ testInstallParallel =
                  register = do
                    modifyMVar_ regv (return . (+1))
                    threadDelay 200000
-             o <- newStoreEntry verbosity storeDirLayout
-                                compid unitid
-                                copyFiles register
+             o <- flip runCabalM verbosity $
+                    newStoreEntry storeDirLayout
+                                  compid unitid
+                                  copyFiles register
              putMVar outv (n, o)
       | n <- [0..9 :: Int] ]
 
@@ -137,19 +142,20 @@ testInstallParallel =
 
 assertNewStoreEntry :: FilePath -> StoreDirLayout
                     -> CompilerId -> UnitId
-                    -> (FilePath -> IO (FilePath,[FilePath])) -> IO ()
+                    -> (FilePath -> CabalM (FilePath,[FilePath])) -> CabalM ()
                     -> NewStoreEntryOutcome
                     -> Assertion
 assertNewStoreEntry tmp storeDirLayout compid unitid
-                    copyFiles register expectedOutcome = do
+                    copyFiles register expectedOutcome = flip runCabalM verbosity $ do
     entries <- runRebuild tmp $ getStoreEntries storeDirLayout compid
-    outcome <- newStoreEntry verbosity storeDirLayout
+    outcome <- newStoreEntry storeDirLayout
                              compid unitid
                              copyFiles register
-    assertEqual "newStoreEntry outcome" expectedOutcome outcome
-    assertStoreEntryExists storeDirLayout compid unitid True
-    let expected = Set.insert unitid entries
-    assertStoreContent tmp storeDirLayout compid expected
+    liftIO $ do
+      assertEqual "newStoreEntry outcome" expectedOutcome outcome
+      assertStoreEntryExists storeDirLayout compid unitid True
+      let expected = Set.insert unitid entries
+      assertStoreContent tmp storeDirLayout compid expected
 
 
 assertStoreEntryExists :: StoreDirLayout
@@ -164,7 +170,9 @@ assertStoreContent :: FilePath -> StoreDirLayout
                    -> CompilerId -> Set.Set UnitId
                    -> Assertion
 assertStoreContent tmp storeDirLayout compid expected = do
-    actual <- runRebuild tmp $ getStoreEntries storeDirLayout compid
+    actual <- flip runCabalM verbosity $
+                runRebuild tmp $
+                  getStoreEntries storeDirLayout compid
     assertEqual "store content" actual expected
 
 

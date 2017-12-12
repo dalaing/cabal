@@ -12,7 +12,7 @@ import Distribution.Simple.Program
 import Distribution.Simple.Compiler as Compiler
 import Distribution.Simple.Utils
 import Distribution.Simple.BuildPaths
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Version
 import Distribution.Text
 import Distribution.Package
@@ -26,24 +26,24 @@ import Language.Haskell.Extension
 import Distribution.Simple.Program.Builtin
 
 configure
-  :: Verbosity -> Maybe FilePath -> Maybe FilePath
-  -> ProgramDb -> IO (Compiler, Maybe Platform, ProgramDb)
-configure verbosity mbHcPath hcPkgPath progdb0 = do
+  :: Maybe FilePath -> Maybe FilePath
+  -> ProgramDb -> CabalM (Compiler, Maybe Platform, ProgramDb)
+configure mbHcPath hcPkgPath progdb0 = do
 
   -- We have no idea how a haskell-suite tool is named, so we require at
   -- least some information from the user.
   hcPath <-
     let msg = "You have to provide name or path of a haskell-suite tool (-w PATH)"
-    in maybe (die' verbosity msg) return mbHcPath
+    in maybe (die' msg) return mbHcPath
 
   when (isJust hcPkgPath) $
-    warn verbosity "--with-hc-pkg option is ignored for haskell-suite"
+    warn "--with-hc-pkg option is ignored for haskell-suite"
 
   (comp, confdCompiler, progdb1) <- configureCompiler hcPath progdb0
 
   -- Update our pkg tool. It uses the same executable as the compiler, but
   -- all command start with "pkg"
-  (confdPkg, _) <- requireProgram verbosity haskellSuitePkgProgram progdb1
+  (confdPkg, _) <- requireProgram haskellSuitePkgProgram progdb1
   let progdb2 =
         updateProgram
           confdPkg
@@ -59,18 +59,18 @@ configure verbosity mbHcPath hcPkgPath progdb0 = do
       let
         haskellSuiteProgram' =
           haskellSuiteProgram
-            { programFindLocation = \v p -> findProgramOnSearchPath v p hcPath }
+            { programFindLocation = \p -> findProgramOnSearchPath p hcPath }
 
       -- NB: cannot call requireProgram right away — it'd think that
       -- the program is already configured and won't reconfigure it again.
       -- Instead, call configureProgram directly first.
-      progdb1 <- configureProgram verbosity haskellSuiteProgram' progdb0'
-      (confdCompiler, progdb2) <- requireProgram verbosity haskellSuiteProgram' progdb1
+      progdb1 <- configureProgram haskellSuiteProgram' progdb0'
+      (confdCompiler, progdb2) <- requireProgram haskellSuiteProgram' progdb1
 
-      extensions <- getExtensions verbosity confdCompiler
-      languages  <- getLanguages  verbosity confdCompiler
+      extensions <- getExtensions confdCompiler
+      languages  <- getLanguages  confdCompiler
       (compName, compVersion) <-
-        getCompilerVersion verbosity confdCompiler
+        getCompilerVersion confdCompiler
 
       let
         comp = Compiler {
@@ -84,53 +84,53 @@ configure verbosity mbHcPath hcPkgPath progdb0 = do
 
       return (comp, confdCompiler, progdb2)
 
-hstoolVersion :: Verbosity -> FilePath -> IO (Maybe Version)
+hstoolVersion :: FilePath -> CabalM (Maybe Version)
 hstoolVersion = findProgramVersion "--hspkg-version" id
 
-numericVersion :: Verbosity -> FilePath -> IO (Maybe Version)
+numericVersion :: FilePath -> CabalM (Maybe Version)
 numericVersion = findProgramVersion "--compiler-version" (last . words)
 
-getCompilerVersion :: Verbosity -> ConfiguredProgram -> IO (String, Version)
-getCompilerVersion verbosity prog = do
-  output <- rawSystemStdout verbosity (programPath prog) ["--compiler-version"]
+getCompilerVersion :: ConfiguredProgram -> CabalM (String, Version)
+getCompilerVersion prog = do
+  output <- rawSystemStdout (programPath prog) ["--compiler-version"]
   let
     parts = words output
     name = concat $ init parts -- there shouldn't be any spaces in the name anyway
     versionStr = last parts
   version <-
-    maybe (die' verbosity "haskell-suite: couldn't determine compiler version") return $
+    maybe (die' "haskell-suite: couldn't determine compiler version") return $
       simpleParse versionStr
   return (name, version)
 
-getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Maybe Compiler.Flag)]
-getExtensions verbosity prog = do
+getExtensions :: ConfiguredProgram -> CabalM [(Extension, Maybe Compiler.Flag)]
+getExtensions prog = do
   extStrs <-
     lines `fmap`
-    rawSystemStdout verbosity (programPath prog) ["--supported-extensions"]
+    rawSystemStdout (programPath prog) ["--supported-extensions"]
   return
     [ (ext, Just $ "-X" ++ display ext) | Just ext <- map simpleParse extStrs ]
 
-getLanguages :: Verbosity -> ConfiguredProgram -> IO [(Language, Compiler.Flag)]
-getLanguages verbosity prog = do
+getLanguages :: ConfiguredProgram -> CabalM [(Language, Compiler.Flag)]
+getLanguages prog = do
   langStrs <-
     lines `fmap`
-    rawSystemStdout verbosity (programPath prog) ["--supported-languages"]
+    rawSystemStdout (programPath prog) ["--supported-languages"]
   return
     [ (ext, "-G" ++ display ext) | Just ext <- map simpleParse langStrs ]
 
 -- Other compilers do some kind of a packagedb stack check here. Not sure
 -- if we need something like that as well.
-getInstalledPackages :: Verbosity -> PackageDBStack -> ProgramDb
-                     -> IO InstalledPackageIndex
-getInstalledPackages verbosity packagedbs progdb =
-  liftM (PackageIndex.fromList . concat) $ for packagedbs $ \packagedb ->
-    do str <-
-        getDbProgramOutput verbosity haskellSuitePkgProgram progdb
-                ["dump", packageDbOpt packagedb]
-         `catchExit` \_ -> die' verbosity $ "pkg dump failed"
+getInstalledPackages :: PackageDBStack -> ProgramDb
+                     -> CabalM InstalledPackageIndex
+getInstalledPackages packagedbs progdb =
+  fmap (PackageIndex.fromList . concat) $ for packagedbs $ \packagedb ->
+    do str <- runCabalMInIO $ \liftC -> do
+        liftC (getDbProgramOutput haskellSuitePkgProgram progdb
+                ["dump", packageDbOpt packagedb])
+         `catchExit` \_ -> liftC $ die' $ "pkg dump failed"
        case parsePackages str of
          Right ok -> return ok
-         _       -> die' verbosity "failed to parse output of 'pkg dump'"
+         _       -> die' "failed to parse output of 'pkg dump'"
 
   where
     parsePackages str =
@@ -149,9 +149,9 @@ getInstalledPackages verbosity packagedbs progdb =
           where (ys,zs) = break p xs
 
 buildLib
-  :: Verbosity -> PackageDescription -> LocalBuildInfo
-  -> Library -> ComponentLocalBuildInfo -> IO ()
-buildLib verbosity pkg_descr lbi lib clbi = do
+  :: PackageDescription -> LocalBuildInfo
+  -> Library -> ComponentLocalBuildInfo -> CabalM ()
+buildLib pkg_descr lbi lib clbi = do
   -- In future, there should be a mechanism for the compiler to request any
   -- number of the above parameters (or their parts) — in particular,
   -- pieces of PackageDescription.
@@ -166,7 +166,7 @@ buildLib verbosity pkg_descr lbi lib clbi = do
       progdb = withPrograms lbi
       pkgid = packageId pkg_descr
 
-  runDbProgram verbosity haskellSuiteProgram progdb $
+  runDbProgram haskellSuiteProgram progdb $
     [ "compile", "--build-dir", odir ] ++
     concat [ ["-i", d] | d <- srcDirs ] ++
     concat [ ["-I", d] | d <- [autogenComponentModulesDir lbi clbi
@@ -184,18 +184,17 @@ buildLib verbosity pkg_descr lbi lib clbi = do
 
 
 installLib
-  :: Verbosity
-  -> LocalBuildInfo
+  :: LocalBuildInfo
   -> FilePath  -- ^install location
   -> FilePath  -- ^install location for dynamic libraries
   -> FilePath  -- ^Build location
   -> PackageDescription
   -> Library
   -> ComponentLocalBuildInfo
-  -> IO ()
-installLib verbosity lbi targetDir dynlibTargetDir builtDir pkg lib clbi = do
+  -> CabalM ()
+installLib lbi targetDir dynlibTargetDir builtDir pkg lib clbi = do
   let progdb = withPrograms lbi
-  runDbProgram verbosity haskellSuitePkgProgram progdb $
+  runDbProgram haskellSuitePkgProgram progdb $
     [ "install-library"
     , "--build-dir", builtDir
     , "--target-dir", targetDir
@@ -204,22 +203,21 @@ installLib verbosity lbi targetDir dynlibTargetDir builtDir pkg lib clbi = do
     ] ++ map display (allLibModules lib clbi)
 
 registerPackage
-  :: Verbosity
-  -> ProgramDb
+  :: ProgramDb
   -> PackageDBStack
   -> InstalledPackageInfo
-  -> IO ()
-registerPackage verbosity progdb packageDbs installedPkgInfo = do
-  (hspkg, _) <- requireProgram verbosity haskellSuitePkgProgram progdb
+  -> CabalM ()
+registerPackage progdb packageDbs installedPkgInfo = do
+  (hspkg, _) <- requireProgram haskellSuitePkgProgram progdb
 
-  runProgramInvocation verbosity $
+  runProgramInvocation $
     (programInvocation hspkg
       ["update", packageDbOpt $ last packageDbs])
       { progInvokeInput = Just $ showInstalledPackageInfo installedPkgInfo }
 
-initPackageDB :: Verbosity -> ProgramDb -> FilePath -> IO ()
-initPackageDB verbosity progdb dbPath =
-  runDbProgram verbosity haskellSuitePkgProgram progdb
+initPackageDB :: ProgramDb -> FilePath -> CabalM ()
+initPackageDB progdb dbPath =
+  runDbProgram haskellSuitePkgProgram progdb
     ["init", dbPath]
 
 packageDbOpt :: PackageDB -> String

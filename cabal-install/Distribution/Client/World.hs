@@ -36,8 +36,8 @@ import Distribution.Types.Dependency
 import Distribution.PackageDescription
          ( FlagAssignment, mkFlagAssignment, unFlagAssignment
          , mkFlagName, unFlagName )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, runCabalMInIO, liftIO )
 import Distribution.Simple.Utils
          ( die', info, chattyTry, writeFileAtomic )
 import Distribution.Text
@@ -62,13 +62,13 @@ data WorldPkgInfo = WorldPkgInfo Dependency FlagAssignment
 -- | Adds packages to the world file; creates the file if it doesn't
 -- exist yet. Version constraints and flag assignments for a package are
 -- updated if already present. IO errors are non-fatal.
-insert :: Verbosity -> FilePath -> [WorldPkgInfo] -> IO ()
+insert :: FilePath -> [WorldPkgInfo] -> CabalM ()
 insert = modifyWorld $ unionBy equalUDep
 
 -- | Removes packages from the world file.
 -- Note: Currently unused as there is no mechanism in Cabal (yet) to
 -- handle uninstalls. IO errors are non-fatal.
-delete :: Verbosity -> FilePath -> [WorldPkgInfo] -> IO ()
+delete :: FilePath -> [WorldPkgInfo] -> CabalM ()
 delete = modifyWorld $ flip (deleteFirstsBy equalUDep)
 
 -- | WorldPkgInfo values are considered equal if they refer to
@@ -85,14 +85,13 @@ modifyWorld :: ([WorldPkgInfo] -> [WorldPkgInfo]
                         -- ^ Function that defines how
                         -- the list of user packages are merged with
                         -- existing world packages.
-            -> Verbosity
             -> FilePath               -- ^ Location of the world file
             -> [WorldPkgInfo] -- ^ list of user supplied packages
-            -> IO ()
-modifyWorld _ _         _     []   = return ()
-modifyWorld f verbosity world pkgs =
+            -> CabalM ()
+modifyWorld _ _     []   = return ()
+modifyWorld f world pkgs = runCabalMInIO $ \liftC ->
   chattyTry "Error while updating world-file. " $ do
-    pkgsOldWorld <- getContents verbosity world
+    pkgsOldWorld <- liftC $ getContents world
     -- Filter out packages that are not in the world file:
     let pkgsNewWorld = nubBy equalUDep $ f pkgs pkgsOldWorld
     -- 'Dependency' is not an Ord instance, so we need to check for
@@ -100,20 +99,19 @@ modifyWorld f verbosity world pkgs =
     if not (all (`elem` pkgsOldWorld) pkgsNewWorld &&
             all (`elem` pkgsNewWorld) pkgsOldWorld)
       then do
-        info verbosity "Updating world file..."
+        liftC $ info "Updating world file..."
         writeFileAtomic world . B.pack $ unlines
             [ (display pkg) | pkg <- pkgsNewWorld]
       else
-        info verbosity "World file is already up to date."
-
+        liftC $ info "World file is already up to date."
 
 -- | Returns the content of the world file as a list
-getContents :: Verbosity -> FilePath -> IO [WorldPkgInfo]
-getContents verbosity world = do
-  content <- safelyReadFile world
+getContents :: FilePath -> CabalM [WorldPkgInfo]
+getContents world = do
+  content <- liftIO $ safelyReadFile world
   let result = map simpleParse (lines $ B.unpack content)
   case sequence result of
-    Nothing -> die' verbosity "Could not parse world file."
+    Nothing -> die' "Could not parse world file."
     Just xs -> return xs
   where
   safelyReadFile :: FilePath -> IO B.ByteString

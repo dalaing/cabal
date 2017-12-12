@@ -36,11 +36,11 @@ import Distribution.Client.Utils ( byteStringToFilePath, filePathToByteString
 
 import Distribution.Simple.Utils ( die', debug )
 import Distribution.Compat.Exception   ( tryIO )
-import Distribution.Verbosity    ( Verbosity )
+import Distribution.Monad        ( CabalM, runCabalMInIO, liftIO )
 
 import qualified Data.ByteString.Lazy as BS
 import Control.Exception         ( evaluate, throw, Exception )
-import Control.Monad             ( liftM, unless )
+import Control.Monad             ( liftM, forM, unless )
 import Control.Monad.Writer.Lazy (WriterT(..), runWriterT, tell)
 import Data.List                 ( (\\), intersect, nub, find )
 import Data.Maybe                ( catMaybes )
@@ -61,12 +61,12 @@ defaultIndexFileName :: FilePath
 defaultIndexFileName = "00-index.tar"
 
 -- | Given a path, ensure that it refers to a local build tree.
-buildTreeRefFromPath :: Verbosity -> BuildTreeRefType -> FilePath -> IO (Maybe BuildTreeRef)
-buildTreeRefFromPath verbosity refType dir = do
-  dirExists <- doesDirectoryExist dir
+buildTreeRefFromPath :: BuildTreeRefType -> FilePath -> CabalM (Maybe BuildTreeRef)
+buildTreeRefFromPath refType dir = do
+  dirExists <- liftIO $ doesDirectoryExist dir
   unless dirExists $
-    die' verbosity $ "directory '" ++ dir ++ "' does not exist"
-  _ <- tryFindAddSourcePackageDesc verbosity dir "Error adding source reference."
+    die' $ "directory '" ++ dir ++ "' does not exist"
+  _ <- tryFindAddSourcePackageDesc dir "Error adding source reference."
   return . Just $ BuildTreeRef refType dir
 
 -- | Given a tar archive entry, try to parse it as a local build tree reference.
@@ -93,9 +93,9 @@ readBuildTreeRefsFromFile :: FilePath -> IO [BuildTreeRef]
 readBuildTreeRefsFromFile = liftM (readBuildTreeRefs . Tar.read) . BS.readFile
 
 -- | Read build tree references from an index cache
-readBuildTreeRefsFromCache :: Verbosity -> FilePath -> IO [BuildTreeRef]
-readBuildTreeRefsFromCache verbosity indexPath = do
-    (mRefs, _prefs) <- readCacheStrict verbosity (SandboxIndex indexPath) buildTreeRef
+readBuildTreeRefsFromCache :: FilePath -> CabalM [BuildTreeRef]
+readBuildTreeRefsFromCache indexPath = do
+    (mRefs, _prefs) <- readCacheStrict (SandboxIndex indexPath) buildTreeRef
     return (catMaybes mRefs)
   where
     buildTreeRef pkgEntry =
@@ -120,48 +120,49 @@ writeBuildTreeRef (BuildTreeRef refType path) = Tar.simpleEntry tarPath content
 
 -- | Check that the provided path is either an existing directory, or a tar
 -- archive in an existing directory.
-validateIndexPath :: Verbosity -> FilePath -> IO FilePath
-validateIndexPath verbosity path' = do
-   path <- makeAbsoluteToCwd path'
+validateIndexPath :: FilePath -> CabalM FilePath
+validateIndexPath path' = do
+   path <- liftIO $ makeAbsoluteToCwd path'
    if (== ".tar") . takeExtension $ path
      then return path
-     else do dirExists <- doesDirectoryExist path
+     else do dirExists <- liftIO $ doesDirectoryExist path
              unless dirExists $
-               die' verbosity $ "directory does not exist: '" ++ path ++ "'"
+               die' $ "directory does not exist: '" ++ path ++ "'"
              return $ path </> defaultIndexFileName
 
 -- | Create an empty index file.
-createEmpty :: Verbosity -> FilePath -> IO ()
-createEmpty verbosity path = do
-  indexExists <- doesFileExist path
+createEmpty :: FilePath -> CabalM ()
+createEmpty path = do
+  indexExists <- liftIO $ doesFileExist path
   if indexExists
-    then debug verbosity $ "Package index already exists: " ++ path
+    then debug $ "Package index already exists: " ++ path
     else do
-    debug verbosity $ "Creating the index file '" ++ path ++ "'"
-    createDirectoryIfMissing True (takeDirectory path)
+    debug $ "Creating the index file '" ++ path ++ "'"
+    liftIO $ createDirectoryIfMissing True (takeDirectory path)
     -- Equivalent to 'tar cvf empty.tar --files-from /dev/null'.
     let zeros = BS.replicate (512*20) 0
-    BS.writeFile path zeros
+    liftIO $ BS.writeFile path zeros
 
 -- | Add given local build tree references to the index.
-addBuildTreeRefs :: Verbosity -> FilePath -> [FilePath] -> BuildTreeRefType
-                    -> IO ()
-addBuildTreeRefs _         _   []  _ =
+addBuildTreeRefs :: FilePath -> [FilePath] -> BuildTreeRefType
+                    -> CabalM ()
+addBuildTreeRefs _   []  _ =
   error "Distribution.Client.Sandbox.Index.addBuildTreeRefs: unexpected"
-addBuildTreeRefs verbosity path l' refType = do
-  checkIndexExists verbosity path
-  l <- liftM nub . mapM tryCanonicalizePath $ l'
-  treesInIndex <- fmap (map buildTreePath) (readBuildTreeRefsFromFile path)
+addBuildTreeRefs path l' refType = do
+  checkIndexExists path
+  l <- liftIO $ liftM nub . mapM tryCanonicalizePath $ l'
+  treesInIndex <- liftIO $ fmap (map buildTreePath) (readBuildTreeRefsFromFile path)
   -- Add only those paths that aren't already in the index.
-  treesToAdd <- mapM (buildTreeRefFromPath verbosity refType) (l \\ treesInIndex)
+  treesToAdd <- mapM (buildTreeRefFromPath refType) (l \\ treesInIndex)
   let entries = map writeBuildTreeRef (catMaybes treesToAdd)
   unless (null entries) $ do
-    withBinaryFile path ReadWriteMode $ \h -> do
-      block <- Tar.hSeekEndEntryOffset h Nothing
-      debug verbosity $ "Writing at tar block: " ++ show block
-      BS.hPut h (Tar.write entries)
-      debug verbosity $ "Successfully appended to '" ++ path ++ "'"
-    updatePackageIndexCacheFile verbosity $ SandboxIndex path
+    runCabalMInIO $ \liftC ->
+      withBinaryFile path ReadWriteMode $ \h -> do
+        block <- Tar.hSeekEndEntryOffset h Nothing
+        liftC $ debug $ "Writing at tar block: " ++ show block
+        BS.hPut h (Tar.write entries)
+        liftC $ debug $ "Successfully appended to '" ++ path ++ "'"
+    updatePackageIndexCacheFile $ SandboxIndex path
 
 data DeleteSourceError = ErrNonregisteredSource { nrPath :: FilePath }
                        | ErrNonexistentSource   { nePath :: FilePath } deriving Show
@@ -170,33 +171,34 @@ data DeleteSourceError = ErrNonregisteredSource { nrPath :: FilePath }
 --
 -- Returns a tuple with either removed build tree refs or errors and a function
 -- that converts from a provided build tree ref to corresponding full directory path.
-removeBuildTreeRefs :: Verbosity -> FilePath -> [FilePath]
-                       -> IO ([Either DeleteSourceError FilePath],
+removeBuildTreeRefs :: FilePath -> [FilePath]
+                    -> CabalM ([Either DeleteSourceError FilePath],
                               (FilePath -> FilePath))
-removeBuildTreeRefs _         _   [] =
+removeBuildTreeRefs _   [] =
   error "Distribution.Client.Sandbox.Index.removeBuildTreeRefs: unexpected"
-removeBuildTreeRefs verbosity indexPath l = do
-  checkIndexExists verbosity indexPath
+removeBuildTreeRefs indexPath l = do
+  checkIndexExists indexPath
   let tmpFile = indexPath <.> "tmp"
 
-  canonRes <- mapM (\btr -> do res <- tryIO $ canonicalizePath btr
-                               return $ case res of
-                                 Right pth -> Right (btr, pth)
-                                 Left _ -> Left $ ErrNonexistentSource btr) l
+  canonRes <- liftIO $ forM l $ \btr ->
+                do res <- tryIO $ canonicalizePath btr
+                   return $ case res of
+                              Right pth -> Right (btr, pth)
+                              Left _ -> Left $ ErrNonexistentSource btr
   let (failures, convDict) = partitionEithers canonRes
       allRefs = fmap snd convDict
 
   -- Performance note: on my system, it takes 'index --remove-source'
   -- approx. 3,5s to filter a 65M file. Real-life indices are expected to be
   -- much smaller.
-  removedRefs <- doRemove convDict tmpFile
+  removedRefs <- liftIO $ doRemove convDict tmpFile
 
-  renameFile tmpFile indexPath
-  debug verbosity $ "Successfully renamed '" ++ tmpFile
+  liftIO $ renameFile tmpFile indexPath
+  debug $ "Successfully renamed '" ++ tmpFile
     ++ "' to '" ++ indexPath ++ "'"
 
   unless (null removedRefs) $
-    updatePackageIndexCacheFile verbosity $ SandboxIndex indexPath
+    updatePackageIndexCacheFile $ SandboxIndex indexPath
 
   let results = fmap Right removedRefs
                 ++ fmap Left failures
@@ -236,11 +238,11 @@ data ListIgnoredBuildTreeRefs = ListIgnored | DontListIgnored
 data RefTypesToList = OnlySnapshots | OnlyLinks | LinksAndSnapshots
 
 -- | List the local build trees that are referred to from the index.
-listBuildTreeRefs :: Verbosity -> ListIgnoredBuildTreeRefs -> RefTypesToList
-                     -> FilePath
-                     -> IO [FilePath]
-listBuildTreeRefs verbosity listIgnored refTypesToList path = do
-  checkIndexExists verbosity path
+listBuildTreeRefs :: ListIgnoredBuildTreeRefs -> RefTypesToList
+                  -> FilePath
+                  -> CabalM [FilePath]
+listBuildTreeRefs listIgnored refTypesToList path = do
+  checkIndexExists path
   buildTreeRefs <-
     case listIgnored of
       DontListIgnored -> do
@@ -250,12 +252,12 @@ listBuildTreeRefs verbosity listIgnored refTypesToList path = do
           _                 -> do
             allPathsFiltered <- fmap (map buildTreePath . filter predicate)
                                 listWithIgnored
-            _ <- evaluate (length allPathsFiltered)
+            _ <- liftIO $ evaluate (length allPathsFiltered)
             return (paths `intersect` allPathsFiltered)
 
       ListIgnored -> fmap (map buildTreePath . filter predicate) listWithIgnored
 
-  _ <- evaluate (length buildTreeRefs)
+  _ <- liftIO $ evaluate (length buildTreeRefs)
   return buildTreeRefs
 
     where
@@ -265,17 +267,17 @@ listBuildTreeRefs verbosity listIgnored refTypesToList path = do
         OnlyLinks         -> (==) LinkRef     . buildTreeRefType
         LinksAndSnapshots -> const True
 
-      listWithIgnored :: IO [BuildTreeRef]
-      listWithIgnored = readBuildTreeRefsFromFile path
+      listWithIgnored :: CabalM [BuildTreeRef]
+      listWithIgnored = liftIO $ readBuildTreeRefsFromFile path
 
-      listWithoutIgnored :: IO [FilePath]
+      listWithoutIgnored :: CabalM [FilePath]
       listWithoutIgnored = fmap (map buildTreePath)
-                         $ readBuildTreeRefsFromCache verbosity path
+                         $ readBuildTreeRefsFromCache path
 
 
 -- | Check that the package index file exists and exit with error if it does not.
-checkIndexExists :: Verbosity -> FilePath -> IO ()
-checkIndexExists verbosity path = do
-  indexExists <- doesFileExist path
+checkIndexExists :: FilePath -> CabalM ()
+checkIndexExists path = do
+  indexExists <- liftIO $ doesFileExist path
   unless indexExists $
-    die' verbosity $ "index does not exist: '" ++ path ++ "'"
+    die' $ "index does not exist: '" ++ path ++ "'"

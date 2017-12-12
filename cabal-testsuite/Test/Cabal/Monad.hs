@@ -8,6 +8,7 @@ module Test.Cabal.Monad (
     cabalTest,
     -- * The monad
     TestM,
+    liftCabalM,
     runTestM,
     -- * Helper functions
     programPathM,
@@ -73,10 +74,12 @@ import Distribution.Text
 import Distribution.Package
 
 import Distribution.Verbosity
+import Distribution.Monad
 
 import qualified Control.Exception as E
 import Control.Monad
 import Control.Monad.Trans.Reader
+import Control.Monad.Trans.Class
 import Control.Monad.IO.Class
 import Data.Maybe
 import Control.Applicative
@@ -212,7 +215,12 @@ cabalTest' mode m = runTestM mode $ do
     skipUnless =<< isAvailableProgram cabalProgram
     withReaderT (\nenv -> nenv { testCabalInstallAsSetup = True }) m
 
-type TestM = ReaderT TestEnv IO
+type TestM = ReaderT TestEnv CabalM
+
+liftCabalM :: CabalM a -> TestM a
+liftCabalM m = do
+  env <- getTestEnv
+  lift . localVerbosity (const . testVerbosity $ env) $ m
 
 gitProgram :: Program
 gitProgram = simpleProgram "git"
@@ -224,7 +232,7 @@ cabalProgram :: Program
 cabalProgram = (simpleProgram "cabal") {
         -- Do NOT search for executable named cabal, it's probably
         -- not the one you were intending to test
-        programFindLocation = \_ _ -> return Nothing
+        programFindLocation = \_ -> return Nothing
     }
 
 diffProgram :: Program
@@ -241,100 +249,100 @@ runTestM mode m = do
     script_dir <- canonicalizePath script_dir0
     lbi <- getPersistBuildConfig dist_dir
     let verbosity = normal -- TODO: configurable
-    senv <- mkScriptEnv verbosity lbi
-    -- Add test suite specific programs
-    let program_db0 =
-            addKnownPrograms
-                ([gitProgram, hackageRepoToolProgram, cabalProgram, diffProgram] ++ builtinPrograms)
-                (withPrograms lbi)
-    -- Reconfigure according to user flags
-    let cargs = testCommonArgs args
+    flip runCabalM verbosity $ do
+      senv <- mkScriptEnv lbi
+      -- Add test suite specific programs
+      let program_db0 =
+              addKnownPrograms
+                  ([gitProgram, hackageRepoToolProgram, cabalProgram, diffProgram] ++ builtinPrograms)
+                  (withPrograms lbi)
+      -- Reconfigure according to user flags
+      let cargs = testCommonArgs args
 
-    -- Reconfigure GHC
-    (comp, platform, program_db2) <- case argGhcPath cargs of
-        Nothing -> return (compiler lbi, hostPlatform lbi, program_db0)
-        Just ghc_path -> do
-            -- All the things that get updated paths from
-            -- configCompilerEx.  The point is to make sure
-            -- we reconfigure these when we need them.
-            let program_db1 = unconfigureProgram "ghc"
-                            . unconfigureProgram "ghc-pkg"
-                            . unconfigureProgram "hsc2hs"
-                            . unconfigureProgram "haddock"
-                            . unconfigureProgram "hpc"
-                            . unconfigureProgram "runghc"
-                            . unconfigureProgram "gcc"
-                            . unconfigureProgram "ld"
-                            . unconfigureProgram "ar"
-                            . unconfigureProgram "strip"
-                            $ program_db0
-            -- TODO: this actually leaves a pile of things unconfigured.
-            -- Optimal strategy for us is to lazily configure them, so
-            -- we don't pay for things we don't need.  A bit difficult
-            -- to do in the current design.
-            configCompilerEx
-                (Just (compilerFlavor (compiler lbi)))
-                (Just ghc_path)
-                Nothing
-                program_db1
-                verbosity
+      -- Reconfigure GHC
+      (comp, platform, program_db2) <- case argGhcPath cargs of
+          Nothing -> return (compiler lbi, hostPlatform lbi, program_db0)
+          Just ghc_path -> do
+              -- All the things that get updated paths from
+              -- configCompilerEx.  The point is to make sure
+              -- we reconfigure these when we need them.
+              let program_db1 = unconfigureProgram "ghc"
+                              . unconfigureProgram "ghc-pkg"
+                              . unconfigureProgram "hsc2hs"
+                              . unconfigureProgram "haddock"
+                              . unconfigureProgram "hpc"
+                              . unconfigureProgram "runghc"
+                              . unconfigureProgram "gcc"
+                              . unconfigureProgram "ld"
+                              . unconfigureProgram "ar"
+                              . unconfigureProgram "strip"
+                              $ program_db0
+              -- TODO: this actually leaves a pile of things unconfigured.
+              -- Optimal strategy for us is to lazily configure them, so
+              -- we don't pay for things we don't need.  A bit difficult
+              -- to do in the current design.
+              configCompilerEx
+                  (Just (compilerFlavor (compiler lbi)))
+                  (Just ghc_path)
+                  Nothing
+                  program_db1
 
-    program_db3 <-
-        reconfigurePrograms verbosity
-            ([("cabal", p)   | p <- maybeToList (argCabalInstallPath cargs)] ++
-             [("hackage-repo-tool", p)
-                             | p <- maybeToList (argHackageRepoToolPath cargs)] ++
-             [("haddock", p) | p <- maybeToList (argHaddockPath cargs)])
-            [] -- --prog-options not supported ATM
-            program_db2
-    -- configCompilerEx only marks some programs as known, so to pick
-    -- them up we must configure them
-    program_db <- configureAllKnownPrograms verbosity program_db3
+      program_db3 <-
+          reconfigurePrograms
+              ([("cabal", p)   | p <- maybeToList (argCabalInstallPath cargs)] ++
+              [("hackage-repo-tool", p)
+                              | p <- maybeToList (argHackageRepoToolPath cargs)] ++
+              [("haddock", p) | p <- maybeToList (argHaddockPath cargs)])
+              [] -- --prog-options not supported ATM
+              program_db2
+      -- configCompilerEx only marks some programs as known, so to pick
+      -- them up we must configure them
+      program_db <- configureAllKnownPrograms program_db3
 
-    let db_stack =
-            case argGhcPath (testCommonArgs args) of
-                Nothing -> withPackageDB lbi
-                -- Can't use the build package db stack since they
-                -- are all for the wrong versions!  TODO: Make
-                -- this configurable
-                Just _  -> [GlobalPackageDB]
-        env = TestEnv {
-                    testSourceDir = script_dir,
-                    testSubName = script_base,
-                    testMode = mode,
-                    testProgramDb = program_db,
-                    testPlatform = platform,
-                    testCompiler = comp,
-                    testPackageDBStack = db_stack,
-                    testVerbosity = verbosity,
-                    testMtimeChangeDelay = Nothing,
-                    testScriptEnv = senv,
-                    testSetupPath = dist_dir </> "setup" </> "setup",
-                    testSkipSetupTests =  argSkipSetupTests (testCommonArgs args),
-                    testHaveCabalShared = withSharedLib lbi,
-                    testEnvironment =
-                        -- Try to avoid Unicode output
-                        [ ("LC_ALL", Just "C")
-                        -- Hermetic builds (knot-tied)
-                        , ("HOME", Just (testHomeDir env))],
-                    testShouldFail = False,
-                    testRelativeCurrentDir = ".",
-                    testHavePackageDb = False,
-                    testHaveSandbox = False,
-                    testHaveRepo = False,
-                    testHaveSourceCopy = False,
-                    testCabalInstallAsSetup = False,
-                    testCabalProjectFile = "cabal.project",
-                    testPlan = Nothing,
-                    testRecordDefaultMode = DoNotRecord,
-                    testRecordUserMode = Nothing,
-                    testRecordNormalizer = id
-                }
-    let go = do cleanup
-                r <- m
-                check_expect (argAccept (testCommonArgs args))
-                return r
-    runReaderT go env
+      let db_stack =
+              case argGhcPath (testCommonArgs args) of
+                  Nothing -> withPackageDB lbi
+                  -- Can't use the build package db stack since they
+                  -- are all for the wrong versions!  TODO: Make
+                  -- this configurable
+                  Just _  -> [GlobalPackageDB]
+          env = TestEnv {
+                      testSourceDir = script_dir,
+                      testSubName = script_base,
+                      testMode = mode,
+                      testProgramDb = program_db,
+                      testPlatform = platform,
+                      testCompiler = comp,
+                      testPackageDBStack = db_stack,
+                      testVerbosity = verbosity,
+                      testMtimeChangeDelay = Nothing,
+                      testScriptEnv = senv,
+                      testSetupPath = dist_dir </> "setup" </> "setup",
+                      testSkipSetupTests =  argSkipSetupTests (testCommonArgs args),
+                      testHaveCabalShared = withSharedLib lbi,
+                      testEnvironment =
+                          -- Try to avoid Unicode output
+                          [ ("LC_ALL", Just "C")
+                          -- Hermetic builds (knot-tied)
+                          , ("HOME", Just (testHomeDir env))],
+                      testShouldFail = False,
+                      testRelativeCurrentDir = ".",
+                      testHavePackageDb = False,
+                      testHaveSandbox = False,
+                      testHaveRepo = False,
+                      testHaveSourceCopy = False,
+                      testCabalInstallAsSetup = False,
+                      testCabalProjectFile = "cabal.project",
+                      testPlan = Nothing,
+                      testRecordDefaultMode = DoNotRecord,
+                      testRecordUserMode = Nothing,
+                      testRecordNormalizer = id
+                  }
+      let go = do cleanup
+                  r <- m
+                  check_expect (argAccept (testCommonArgs args))
+                  return r
+      runReaderT go env
   where
     cleanup = do
         env <- getTestEnv
@@ -472,8 +480,8 @@ resub search replace s =
 requireProgramM :: Program -> TestM ConfiguredProgram
 requireProgramM program = do
     env <- getTestEnv
-    (configured_program, _) <- liftIO $
-        requireProgram (testVerbosity env) program (testProgramDb env)
+    (configured_program, _) <- liftCabalM $
+        requireProgram program (testProgramDb env)
     return configured_program
 
 programPathM :: Program -> TestM FilePath
@@ -487,7 +495,7 @@ isAvailableProgram program = do
         Just _ -> return True
         Nothing -> do
             -- It might not have been configured. Try to configure.
-            progdb <- liftIO $ configureProgram (testVerbosity env) program (testProgramDb env)
+            progdb <- liftCabalM $ configureProgram program (testProgramDb env)
             case lookupProgram program progdb of
                 Just _  -> return True
                 Nothing -> return False

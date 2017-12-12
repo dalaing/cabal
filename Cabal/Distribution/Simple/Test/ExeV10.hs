@@ -26,6 +26,7 @@ import Distribution.System
 import Distribution.TestSuite
 import Distribution.Text
 import Distribution.Verbosity
+import Distribution.Monad
 
 import Control.Concurrent (forkIO)
 import System.Directory
@@ -41,35 +42,35 @@ runTest :: PD.PackageDescription
         -> TestFlags
         -> PD.TestSuite
         -> IO TestSuiteLog
-runTest pkg_descr lbi clbi flags suite = do
+runTest pkg_descr lbi clbi flags suite = flip runCabalM verbosity $ do
     let isCoverageEnabled = LBI.testCoverage lbi
         way = guessWay lbi
         tixDir_ = tixDir distPref way testName'
 
-    pwd <- getCurrentDirectory
-    existingEnv <- getEnvironment
+    pwd <- liftIO getCurrentDirectory
+    existingEnv <- liftIO getEnvironment
 
     let cmd = LBI.buildDir lbi </> testName'
                   </> testName' <.> exeExtension
     -- Check that the test executable exists.
-    exists <- doesFileExist cmd
-    unless exists $ die' verbosity $ "Error: Could not find test program \"" ++ cmd
+    exists <- liftIO $ doesFileExist cmd
+    unless exists $ die' $ "Error: Could not find test program \"" ++ cmd
                           ++ "\". Did you build the package first?"
 
     -- Remove old .tix files if appropriate.
-    unless (fromFlag $ testKeepTix flags) $ do
+    unless (fromFlag $ testKeepTix flags) $ liftIO $ do
         exists' <- doesDirectoryExist tixDir_
         when exists' $ removeDirectoryRecursive tixDir_
 
     -- Create directory for HPC files.
-    createDirectoryIfMissing True tixDir_
+    liftIO $ createDirectoryIfMissing True tixDir_
 
     -- Write summary notices indicating start of test suite
-    notice verbosity $ summarizeSuiteStart $ testName'
+    notice $ summarizeSuiteStart $ testName'
 
     (wOut, wErr, logText) <- case details of
         Direct -> return (stdout, stderr, "")
-        _ -> do
+        _ -> liftIO $ do
             (rOut, wOut) <- createPipe
 
             -- Read test executable's output lazily (returns immediately)
@@ -92,13 +93,14 @@ runTest pkg_descr lbi clbi flags suite = do
         shellEnv = [("HPCTIXFILE", tixFile) | isCoverageEnabled] ++ pkgPathEnv
 
     -- Add (DY)LD_LIBRARY_PATH if needed
-    shellEnv' <- if LBI.withDynExe lbi
+    shellEnv' <- liftIO $
+                    if LBI.withDynExe lbi
                     then do let (Platform _ os) = LBI.hostPlatform lbi
                             paths <- LBI.depLibraryPaths True False lbi clbi
                             return (addLibraryPath os paths shellEnv)
                     else return shellEnv
 
-    exit <- rawSystemIOWithEnv verbosity cmd opts Nothing (Just shellEnv')
+    exit <- rawSystemIOWithEnv cmd opts Nothing (Just shellEnv')
                                -- these handles are automatically closed
                                Nothing (Just wOut) (Just wErr)
 
@@ -106,15 +108,16 @@ runTest pkg_descr lbi clbi flags suite = do
     -- readable test log.
     let suiteLog = buildLog exit
 
-    -- Write summary notice to log file indicating start of test suite
-    appendFile (logFile suiteLog) $ summarizeSuiteStart $ testName'
+    liftIO $ do
+      -- Write summary notice to log file indicating start of test suite
+      appendFile (logFile suiteLog) $ summarizeSuiteStart $ testName'
 
-    -- Append contents of temporary log file to the final human-
-    -- readable log file
-    appendFile (logFile suiteLog) logText
+      -- Append contents of temporary log file to the final human-
+      -- readable log file
+      appendFile (logFile suiteLog) logText
 
-    -- Write end-of-suite summary notice to log file
-    appendFile (logFile suiteLog) $ summarizeSuiteFinish suiteLog
+      -- Write end-of-suite summary notice to log file
+      appendFile (logFile suiteLog) $ summarizeSuiteFinish suiteLog
 
     -- Show the contents of the human-readable log file on the terminal
     -- if there is a failure and/or detailed output is requested
@@ -123,13 +126,13 @@ runTest pkg_descr lbi clbi flags suite = do
               details == Failures && not (suitePassed $ testLogs suiteLog))
             -- verbosity overrides show-details
             && verbosity >= normal
-    whenPrinting $ putStr $ unlines $ lines logText
+    whenPrinting $ liftIO $ putStr $ unlines $ lines logText
 
     -- Write summary notice to terminal indicating end of test suite
-    notice verbosity $ summarizeSuiteFinish suiteLog
+    notice $ summarizeSuiteFinish suiteLog
 
     when isCoverageEnabled $
-        markupTest verbosity lbi distPref (display $ PD.package pkg_descr) suite
+        markupTest lbi distPref (display $ PD.package pkg_descr) suite
 
     return suiteLog
   where

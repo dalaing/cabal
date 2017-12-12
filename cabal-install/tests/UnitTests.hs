@@ -6,6 +6,7 @@ import Test.Tasty
 
 import Distribution.Simple.Utils
 import Distribution.Verbosity
+import Distribution.Monad
 
 import Distribution.Compat.Time
 
@@ -76,14 +77,16 @@ tests mtimeChangeCalibrated =
 
 main :: IO ()
 main = do
-  (mtimeChange, mtimeChange') <- calibrateMtimeChangeDelay
-  let toMillis :: Int -> Double
-      toMillis x = fromIntegral x / 1000.0
-  notice normal $ "File modification time resolution calibration completed, "
-    ++ "maximum delay observed: "
-    ++ (show . toMillis $ mtimeChange ) ++ " ms. "
-    ++ "Will be using delay of " ++ (show . toMillis $ mtimeChange')
-    ++ " for test runs."
+  mtimeChange' <- flip runCabalM normal $ do
+    (mtimeChange, mtimeChange') <- calibrateMtimeChangeDelay
+    let toMillis :: Int -> Double
+        toMillis x = fromIntegral x / 1000.0
+    notice $ "File modification time resolution calibration completed, "
+      ++ "maximum delay observed: "
+      ++ (show . toMillis $ mtimeChange ) ++ " ms. "
+      ++ "Will be using delay of " ++ (show . toMillis $ mtimeChange')
+      ++ " for test runs."
+    pure mtimeChange'
   defaultMainWithIngredients
          (includingOptions extraOptions : defaultIngredients)
          (tests mtimeChange')

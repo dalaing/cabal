@@ -23,6 +23,7 @@ import Distribution.Simple.Program.GHC
 import Distribution.Simple.Program
 import Distribution.Simple.Compiler
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.System
 import Distribution.Simple.Setup (Flag(..))
 
@@ -49,9 +50,10 @@ canonicalizePackageDB x = return x
 
 -- | Create a 'ScriptEnv' from a 'LocalBuildInfo' configured with
 -- the GHC that we want to use.
-mkScriptEnv :: Verbosity -> LocalBuildInfo -> IO ScriptEnv
-mkScriptEnv verbosity lbi = do
-  package_db <- mapM canonicalizePackageDB (withPackageDB lbi)
+mkScriptEnv :: LocalBuildInfo -> CabalM ScriptEnv
+mkScriptEnv lbi = do
+  verbosity <- askVerbosity
+  package_db <- liftIO $ mapM canonicalizePackageDB (withPackageDB lbi)
   return $ ScriptEnv
     { runnerVerbosity       = verbosity
     , runnerProgramDb       = withPrograms  lbi
@@ -83,12 +85,13 @@ runghc senv mb_cwd env_overrides script_path args = do
 -- script with 'runghc'.
 runnerCommand :: ScriptEnv -> Maybe FilePath -> [(String, Maybe String)]
               -> FilePath -> [String] -> IO (FilePath, [String])
-runnerCommand senv _mb_cwd _env_overrides script_path args = do
-    (prog, _) <- requireProgram verbosity runghcProgram (runnerProgramDb senv)
-    return (programPath prog,
-            runghc_args ++ ["--"] ++ map ("--ghc-arg="++) ghc_args ++ [script_path] ++ args)
+runnerCommand senv _mb_cwd _env_overrides script_path args =
+    let verbosity = runnerVerbosity senv
+    in flip runCabalM verbosity $ do
+      (prog, _) <- requireProgram runghcProgram (runnerProgramDb senv)
+      return (programPath prog,
+              runghc_args ++ ["--"] ++ map ("--ghc-arg="++) ghc_args ++ [script_path] ++ args)
   where
-    verbosity = runnerVerbosity senv
     runghc_args = []
     ghc_args = runnerGhcArgs senv
 

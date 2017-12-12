@@ -40,7 +40,8 @@ import Distribution.Types.ComponentRequestedSpec
        (ComponentRequestedSpec(..))
 import Distribution.Types.Dependency
        (Dependency(..), depPkgName, simplifyDependency)
-import Distribution.Verbosity                        (Verbosity, silent)
+import Distribution.Verbosity                        (silent)
+import Distribution.Monad                            (CabalM, liftIO, localVerbosity)
 import Distribution.Version
        (Version, LowerBound(..), UpperBound(..)
        ,asVersionIntervals, majorBoundVersion)
@@ -53,10 +54,10 @@ import System.Exit                                   (exitFailure)
 import Control.Exception                             (throwIO)
 
 -- | Entry point for the 'outdated' command.
-outdated :: Verbosity -> OutdatedFlags -> RepoContext
+outdated :: OutdatedFlags -> RepoContext
          -> Compiler -> Platform
-         -> IO ()
-outdated verbosity0 outdatedFlags repoContext comp platform = do
+         -> CabalM ()
+outdated outdatedFlags repoContext comp platform = do
   let freezeFile    = fromFlagOrDefault False (outdatedFreezeFile outdatedFlags)
       newFreezeFile = fromFlagOrDefault False
                       (outdatedNewFreezeFile outdatedFlags)
@@ -73,38 +74,39 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
                         Just (IgnoreMajorVersionBumpsSome pkgs) ->
                           let minorSet = S.fromList pkgs
                           in \pkgname -> pkgname `S.member` minorSet
-      verbosity     = if quiet then silent else verbosity0
+      quietVerbosity v = if quiet then silent else v
 
-  sourcePkgDb <- IndexUtils.getSourcePackages verbosity repoContext
-  let pkgIndex = packageIndex sourcePkgDb
-  deps <- if freezeFile
-          then depsFromFreezeFile verbosity
-          else if newFreezeFile
-               then depsFromNewFreezeFile verbosity
-               else depsFromPkgDesc       verbosity comp platform
-  debug verbosity $ "Dependencies loaded: "
-    ++ (intercalate ", " $ map display deps)
-  let outdatedDeps = listOutdated deps pkgIndex
-                     (ListOutdatedSettings ignorePred minorPred)
-  when (not quiet) $
-    showResult verbosity outdatedDeps simpleOutput
-  if (exitCode && (not . null $ outdatedDeps))
-    then exitFailure
-    else return ()
+  localVerbosity quietVerbosity $ do
+    sourcePkgDb <- IndexUtils.getSourcePackages repoContext
+    let pkgIndex = packageIndex sourcePkgDb
+    deps <- if freezeFile
+            then depsFromFreezeFile
+            else if newFreezeFile
+                then depsFromNewFreezeFile
+                else depsFromPkgDesc       comp platform
+    debug $ "Dependencies loaded: "
+      ++ (intercalate ", " $ map display deps)
+    let outdatedDeps = listOutdated deps pkgIndex
+                      (ListOutdatedSettings ignorePred minorPred)
+    when (not quiet) $
+      showResult outdatedDeps simpleOutput
+    if (exitCode && (not . null $ outdatedDeps))
+      then liftIO $ exitFailure
+      else return ()
 
 -- | Print either the list of all outdated dependencies, or a message
 -- that there are none.
-showResult :: Verbosity -> [(Dependency,Version)] -> Bool -> IO ()
-showResult verbosity outdatedDeps simpleOutput =
+showResult :: [(Dependency,Version)] -> Bool -> CabalM ()
+showResult outdatedDeps simpleOutput =
   if (not . null $ outdatedDeps)
     then
     do when (not simpleOutput) $
-         notice verbosity "Outdated dependencies:"
+         notice "Outdated dependencies:"
        for_ outdatedDeps $ \(d@(Dependency pn _), v) ->
          let outdatedDep = if simpleOutput then display pn
                            else display d ++ " (latest: " ++ display v ++ ")"
-         in notice verbosity outdatedDep
-    else notice verbosity "All dependencies are up to date."
+         in notice outdatedDep
+    else notice "All dependencies are up to date."
 
 -- | Convert a list of 'UserConstraint's to a 'Dependency' list.
 userConstraintsToDependencies :: [UserConstraint] -> [Dependency]
@@ -112,47 +114,47 @@ userConstraintsToDependencies ucnstrs =
   mapMaybe (packageConstraintToDependency . userToPackageConstraint) ucnstrs
 
 -- | Read the list of dependencies from the freeze file.
-depsFromFreezeFile :: Verbosity -> IO [Dependency]
-depsFromFreezeFile verbosity = do
-  cwd        <- getCurrentDirectory
-  userConfig <- loadUserConfig verbosity cwd Nothing
+depsFromFreezeFile :: CabalM [Dependency]
+depsFromFreezeFile = do
+  cwd        <- liftIO getCurrentDirectory
+  userConfig <- loadUserConfig cwd Nothing
   let ucnstrs = map fst . configExConstraints . savedConfigureExFlags $
                 userConfig
       deps    = userConstraintsToDependencies ucnstrs
-  debug verbosity "Reading the list of dependencies from the freeze file"
+  debug "Reading the list of dependencies from the freeze file"
   return deps
 
 -- | Read the list of dependencies from the new-style freeze file.
-depsFromNewFreezeFile :: Verbosity -> IO [Dependency]
-depsFromNewFreezeFile verbosity = do
-  projectRoot <- either throwIO return =<<
-                 findProjectRoot Nothing
+depsFromNewFreezeFile :: CabalM [Dependency]
+depsFromNewFreezeFile = do
+  projectRoot <- liftIO $ either (throwIO) return =<<
+                            findProjectRoot Nothing
                  {- TODO: Support '--project-file': -} Nothing
   let distDirLayout = defaultDistDirLayout projectRoot
                       {- TODO: Support dist dir override -} Nothing
   projectConfig  <- runRebuild (distProjectRootDirectory distDirLayout) $
-                    readProjectLocalFreezeConfig verbosity distDirLayout
+                    readProjectLocalFreezeConfig distDirLayout
   let ucnstrs = map fst . projectConfigConstraints . projectConfigShared
                 $ projectConfig
       deps    = userConstraintsToDependencies ucnstrs
-  debug verbosity
+  debug
     "Reading the list of dependencies from the new-style freeze file"
   return deps
 
 -- | Read the list of dependencies from the package description.
-depsFromPkgDesc :: Verbosity -> Compiler  -> Platform -> IO [Dependency]
-depsFromPkgDesc verbosity comp platform = do
-  cwd  <- getCurrentDirectory
-  path <- tryFindPackageDesc cwd
-  gpd  <- readGenericPackageDescription verbosity path
+depsFromPkgDesc :: Compiler  -> Platform -> CabalM [Dependency]
+depsFromPkgDesc comp platform = do
+  cwd  <- liftIO getCurrentDirectory
+  path <- liftIO $ tryFindPackageDesc cwd
+  gpd  <- readGenericPackageDescription path
   let cinfo = compilerInfo comp
       epd = finalizePD mempty (ComponentRequestedSpec True True)
             (const True) platform cinfo [] gpd
   case epd of
-    Left _        -> die' verbosity "finalizePD failed"
+    Left _        -> die' "finalizePD failed"
     Right (pd, _) -> do
       let bd = allBuildDepends pd
-      debug verbosity
+      debug
         "Reading the list of dependencies from the package description"
       return bd
 

@@ -13,6 +13,7 @@ import Distribution.Text (simpleParse)
 import Distribution.Compat.Binary
 import Distribution.Simple.Utils (withTempDirectory)
 import Distribution.Verbosity (silent)
+import Distribution.Monad (runCabalM, liftIO)
 
 import Distribution.Client.FileMonitor
 import Distribution.Compat.Time
@@ -76,7 +77,8 @@ tests mtimeChange =
 -- we rely on file mtimes having a reasonable resolution
 testFileMTimeSanity :: Int -> Assertion
 testFileMTimeSanity mtimeChange =
-  withTempDirectory silent "." "file-status-" $ \dir -> do
+  flip runCabalM silent $
+  withTempDirectory "." "file-status-" $ \dir -> liftIO $ do
     replicateM_ 10 $ do
       IO.writeFile (dir </> "a") "content"
       t1 <- getModTime (dir </> "a")
@@ -88,7 +90,8 @@ testFileMTimeSanity mtimeChange =
 -- We rely on directories changing mtime when entries are added or removed
 testDirChangeSanity :: Int -> Assertion
 testDirChangeSanity mtimeChange =
-  withTempDirectory silent "." "dir-mtime-" $ \dir -> do
+  flip runCabalM silent $
+  withTempDirectory "." "dir-mtime-" $ \dir -> liftIO $ do
 
     expectMTimeChange dir "file add" $
       IO.writeFile (dir </> "file") "content"
@@ -849,9 +852,10 @@ updateMonitorWithTimestamp (RootPath root) monitor timestamp files key result =
 
 withFileMonitor :: Eq a => (RootPath -> FileMonitor a b -> IO c) -> IO c
 withFileMonitor action = do
-  withTempDirectory silent "." "file-status-" $ \root -> do
-    let file    = root <.> "monitor"
-        monitor = newFileMonitor file
-    finally (action (RootPath root) monitor) $ do
-      exists <- IO.doesFileExist file
-      when exists $ IO.removeFile file
+  flip runCabalM silent $
+    withTempDirectory "." "file-status-" $ \root -> liftIO $ do
+      let file    = root <.> "monitor"
+          monitor = newFileMonitor file
+      finally (action (RootPath root) monitor) $ do
+        exists <- IO.doesFileExist file
+        when exists $ IO.removeFile file

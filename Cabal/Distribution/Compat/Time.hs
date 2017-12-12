@@ -18,6 +18,7 @@ import System.Directory ( getModificationTime )
 
 import Distribution.Simple.Utils ( withTempDirectory )
 import Distribution.Verbosity ( silent )
+import Distribution.Monad
 
 import System.FilePath
 
@@ -181,9 +182,10 @@ getCurTime = posixTimeToModTime `fmap` getPOSIXTime -- Uses 'gettimeofday'.
 -- recommended delay to use before testing for file modification change.
 -- The returned delay is never smaller
 -- than 10 ms, but never larger than 1 second.
-calibrateMtimeChangeDelay :: IO (Int, Int)
+calibrateMtimeChangeDelay :: CabalM (Int, Int)
 calibrateMtimeChangeDelay =
-  withTempDirectory silent "." "calibration-" $ \dir -> do
+  localVerbosity (const silent) $
+  withTempDirectory "." "calibration-" $ \dir -> liftIO $ do
     let fileName = dir </> "probe"
     mtimes <- for [1..25] $ \(i::Int) -> time $ do
       writeFile fileName $ show i

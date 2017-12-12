@@ -25,6 +25,7 @@ import Distribution.Backpack
 import Distribution.Simple.GHC.ImplInfo
 import Distribution.PackageDescription hiding (Flag)
 import Distribution.ModuleName
+import Distribution.Monad
 import Distribution.Simple.Compiler hiding (Flag)
 import qualified Distribution.Simple.Compiler as Compiler (Flag)
 import Distribution.Simple.Setup
@@ -280,10 +281,10 @@ data GhcProfAuto = GhcProfAutoAll       -- ^ @-fprof-auto@
                  | GhcProfAutoExported  -- ^ @-fprof-auto-exported@
  deriving (Show, Eq)
 
-runGHC :: Verbosity -> ConfiguredProgram -> Compiler -> Platform  -> GhcOptions
-       -> IO ()
-runGHC verbosity ghcProg comp platform opts = do
-  runProgramInvocation verbosity (ghcInvocation ghcProg comp platform opts)
+runGHC :: ConfiguredProgram -> Compiler -> Platform  -> GhcOptions
+       -> CabalM ()
+runGHC ghcProg comp platform opts = do
+  runProgramInvocation (ghcInvocation ghcProg comp platform opts)
 
 
 ghcInvocation :: ConfiguredProgram -> Compiler -> Platform -> GhcOptions

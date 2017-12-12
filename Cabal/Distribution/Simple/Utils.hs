@@ -31,7 +31,7 @@ module Distribution.Simple.Utils (
         dieNoVerbosity,
         die', dieWithLocation',
         dieNoWrap,
-        topHandler, topHandlerWith,
+        topHandler, topHandlerWith, topHandlerWithM,
         warn,
         notice, noticeNoWrap, noticeDoc,
         setupMessage,
@@ -179,6 +179,7 @@ import Distribution.Text
 import Distribution.Utils.Generic
 import Distribution.Utils.IOData (IOData(..), IODataMode(..))
 import qualified Distribution.Utils.IOData as IOData
+import Distribution.Monad
 import Distribution.ModuleName as ModuleName
 import Distribution.System
 import Distribution.Version
@@ -339,35 +340,41 @@ ioeGetVerbatim e = ioeGetLocation e == "dieVerbatim"
 verbatimUserError :: String -> IOError
 verbatimUserError = ioeSetVerbatim . userError
 
-dieWithLocation' :: Verbosity -> FilePath -> Maybe Int -> String -> IO a
-dieWithLocation' verbosity filename mb_lineno msg = withFrozenCallStack $ do
-    ts <- getPOSIXTime
-    pname <- getProgName
-    ioError . verbatimUserError
-            . withMetadata ts AlwaysMark VerboseTrace verbosity
-            . wrapTextVerbosity verbosity
-            $ pname ++ ": " ++
-              filename ++ (case mb_lineno of
-                            Just lineno -> ":" ++ show lineno
-                            Nothing -> "") ++
-              ": " ++ msg
+dieWithLocation' :: FilePath -> Maybe Int -> String -> CabalM a
+dieWithLocation' filename mb_lineno msg = withFrozenCallStack $ do
+    verbosity <- askVerbosity
+    liftIO $ do
+      ts <- getPOSIXTime
+      pname <- getProgName
+      ioError . verbatimUserError
+              . withMetadata ts AlwaysMark VerboseTrace verbosity
+              . wrapTextVerbosity verbosity
+              $ pname ++ ": " ++
+                filename ++ (case mb_lineno of
+                              Just lineno -> ":" ++ show lineno
+                              Nothing -> "") ++
+                ": " ++ msg
 
-die' :: Verbosity -> String -> IO a
-die' verbosity msg = withFrozenCallStack $ do
-    ts <- getPOSIXTime
-    pname <- getProgName
-    ioError . verbatimUserError
-            . withMetadata ts AlwaysMark VerboseTrace verbosity
-            . wrapTextVerbosity verbosity
-            $ pname ++ ": " ++ msg
+die' :: String -> CabalM a
+die' msg = withFrozenCallStack $ do
+    verbosity <- askVerbosity
+    liftIO $ do
+      ts <- getPOSIXTime
+      pname <- getProgName
+      ioError . verbatimUserError
+              . withMetadata ts AlwaysMark VerboseTrace verbosity
+              . wrapTextVerbosity verbosity
+              $ pname ++ ": " ++ msg
 
-dieNoWrap :: Verbosity -> String -> IO a
-dieNoWrap verbosity msg = withFrozenCallStack $ do
-    -- TODO: should this have program name or not?
-    ts <- getPOSIXTime
-    ioError . verbatimUserError
-            . withMetadata ts AlwaysMark VerboseTrace verbosity
-            $ msg
+dieNoWrap :: String -> CabalM a
+dieNoWrap msg = withFrozenCallStack $ do
+    verbosity <- askVerbosity
+    liftIO $ do
+      -- TODO: should this have program name or not?
+      ts <- getPOSIXTime
+      ioError . verbatimUserError
+              . withMetadata ts AlwaysMark VerboseTrace verbosity
+              $ msg
 
 -- | Given a block of IO code that may raise an exception, annotate
 -- it with the metadata from the current scope.  Use this as close
@@ -384,13 +391,16 @@ annotateIO verbosity act = do
              $ ioeGetErrorString ioe
 
 
-{-# NOINLINE topHandlerWith #-}
 topHandlerWith :: forall a. (Exception.SomeException -> IO a) -> IO a -> IO a
-topHandlerWith cont prog = do
+topHandlerWith = topHandlerWithM id
+
+{-# NOINLINE topHandlerWithM #-}
+topHandlerWithM :: forall m a. MonadIO m => (forall x. m x -> IO x) -> (Exception.SomeException -> m a) -> m a -> m a
+topHandlerWithM lift cont prog = liftIO $ do
     -- By default, stderr to a terminal device is NoBuffering. But this
     -- is *really slow*
     hSetBuffering stderr LineBuffering
-    Exception.catches prog [
+    Exception.catches (lift prog) [
         Exception.Handler rethrowAsyncExceptions
       , Exception.Handler rethrowExitStatus
       , Exception.Handler handle
@@ -410,7 +420,7 @@ topHandlerWith cont prog = do
       hFlush stdout
       pname <- getProgName
       hPutStr stderr (message pname se)
-      cont se
+      lift $ cont se
 
     message :: String -> Exception.SomeException -> String
     message pname (Exception.SomeException se) =
@@ -447,14 +457,16 @@ topHandler prog = topHandlerWith (const $ exitWith (ExitFailure 1)) prog
 --
 -- We display these at the 'normal' verbosity level.
 --
-warn :: Verbosity -> String -> IO ()
-warn verbosity msg = withFrozenCallStack $ do
-  when (verbosity >= normal) $ do
-    ts <- getPOSIXTime
-    hFlush stdout
-    hPutStr stderr . withMetadata ts NormalMark FlagTrace verbosity
-                   . wrapTextVerbosity verbosity
-                   $ "Warning: " ++ msg
+warn :: String -> CabalM ()
+warn msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= normal) $ do
+      ts <- getPOSIXTime
+      hFlush stdout
+      hPutStr stderr . withMetadata ts NormalMark FlagTrace verbosity
+                    . wrapTextVerbosity verbosity
+                    $ "Warning: " ++ msg
 
 -- | Useful status messages.
 --
@@ -463,83 +475,97 @@ warn verbosity msg = withFrozenCallStack $ do
 -- This is for the ordinary helpful status messages that users see. Just
 -- enough information to know that things are working but not floods of detail.
 --
-notice :: Verbosity -> String -> IO ()
-notice verbosity msg = withFrozenCallStack $ do
-  when (verbosity >= normal) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
-                   . wrapTextVerbosity verbosity
-                   $ msg
+notice :: String -> CabalM ()
+notice msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= normal) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
+                    . wrapTextVerbosity verbosity
+                    $ msg
 
 -- | Display a message at 'normal' verbosity level, but without
 -- wrapping.
 --
-noticeNoWrap :: Verbosity -> String -> IO ()
-noticeNoWrap verbosity msg = withFrozenCallStack $ do
-  when (verbosity >= normal) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity $ msg
+noticeNoWrap :: String -> CabalM ()
+noticeNoWrap msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= normal) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity $ msg
 
 -- | Pretty-print a 'Disp.Doc' status message at 'normal' verbosity
 -- level.  Use this if you need fancy formatting.
 --
-noticeDoc :: Verbosity -> Disp.Doc -> IO ()
-noticeDoc verbosity msg = withFrozenCallStack $ do
-  when (verbosity >= normal) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
-                   . Disp.renderStyle defaultStyle $ msg
+noticeDoc :: Disp.Doc -> CabalM ()
+noticeDoc msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= normal) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
+                    . Disp.renderStyle defaultStyle $ msg
 
 -- | Display a "setup status message".  Prefer using setupMessage'
 -- if possible.
 --
-setupMessage :: Verbosity -> String -> PackageIdentifier -> IO ()
-setupMessage verbosity msg pkgid = withFrozenCallStack $ do
-    noticeNoWrap verbosity (msg ++ ' ': display pkgid ++ "...")
+setupMessage :: String -> PackageIdentifier -> CabalM ()
+setupMessage msg pkgid = withFrozenCallStack $ do
+    noticeNoWrap (msg ++ ' ': display pkgid ++ "...")
 
 -- | More detail on the operation of some action.
 --
 -- We display these messages when the verbosity level is 'verbose'
 --
-info :: Verbosity -> String -> IO ()
-info verbosity msg = withFrozenCallStack $
-  when (verbosity >= verbose) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
-                   . wrapTextVerbosity verbosity
-                   $ msg
+info :: String -> CabalM ()
+info msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= verbose) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
+                    . wrapTextVerbosity verbosity
+                    $ msg
 
-infoNoWrap :: Verbosity -> String -> IO ()
-infoNoWrap verbosity msg = withFrozenCallStack $
-  when (verbosity >= verbose) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
-                   $ msg
+infoNoWrap :: String -> CabalM ()
+infoNoWrap msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= verbose) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
+                    $ msg
 
 -- | Detailed internal debugging information
 --
 -- We display these messages when the verbosity level is 'deafening'
 --
-debug :: Verbosity -> String -> IO ()
-debug verbosity msg = withFrozenCallStack $
-  when (verbosity >= deafening) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
-                   . wrapTextVerbosity verbosity
-                   $ msg
-    -- ensure that we don't lose output if we segfault/infinite loop
-    hFlush stdout
+debug :: String -> CabalM ()
+debug msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= deafening) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
+                    . wrapTextVerbosity verbosity
+                    $ msg
+      -- ensure that we don't lose output if we segfault/infinite loop
+      hFlush stdout
 
 -- | A variant of 'debug' that doesn't perform the automatic line
 -- wrapping. Produces better output in some cases.
-debugNoWrap :: Verbosity -> String -> IO ()
-debugNoWrap verbosity msg = withFrozenCallStack $
-  when (verbosity >= deafening) $ do
-    ts <- getPOSIXTime
-    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
-                   $ msg
-    -- ensure that we don't lose output if we segfault/infinite loop
-    hFlush stdout
+debugNoWrap :: String -> CabalM ()
+debugNoWrap msg = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  liftIO $ do
+    when (verbosity >= deafening) $ do
+      ts <- getPOSIXTime
+      hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
+                    $ msg
+      -- ensure that we don't lose output if we segfault/infinite loop
+      hFlush stdout
 
 -- | Perform an IO action, catching any IO exceptions and printing an error
 --   if one occurs.
@@ -694,195 +720,197 @@ maybeExit cmd = do
   res <- cmd
   unless (res == ExitSuccess) $ exitWith res
 
-printRawCommandAndArgs :: Verbosity -> FilePath -> [String] -> IO ()
-printRawCommandAndArgs verbosity path args = withFrozenCallStack $
-    printRawCommandAndArgsAndEnv verbosity path args Nothing Nothing
+printRawCommandAndArgs :: FilePath -> [String] -> CabalM ()
+printRawCommandAndArgs path args = withFrozenCallStack $
+    printRawCommandAndArgsAndEnv path args Nothing Nothing
 
-printRawCommandAndArgsAndEnv :: Verbosity
-                             -> FilePath
+printRawCommandAndArgsAndEnv :: FilePath
                              -> [String]
                              -> Maybe FilePath
                              -> Maybe [(String, String)]
-                             -> IO ()
-printRawCommandAndArgsAndEnv verbosity path args mcwd menv = do
+                             -> CabalM ()
+printRawCommandAndArgsAndEnv path args mcwd menv = do
     case menv of
-        Just env -> debugNoWrap verbosity ("Environment: " ++ show env)
+        Just env -> debugNoWrap ("Environment: " ++ show env)
         Nothing -> return ()
     case mcwd of
-        Just cwd -> debugNoWrap verbosity ("Working directory: " ++ show cwd)
+        Just cwd -> debugNoWrap ("Working directory: " ++ show cwd)
         Nothing -> return ()
-    infoNoWrap verbosity (showCommandForUser path args)
+    infoNoWrap (showCommandForUser path args)
 
 -- Exit with the same exit code if the subcommand fails
-rawSystemExit :: Verbosity -> FilePath -> [String] -> IO ()
-rawSystemExit verbosity path args = withFrozenCallStack $ do
-  printRawCommandAndArgs verbosity path args
-  hFlush stdout
-  exitcode <- rawSystem path args
+rawSystemExit :: FilePath -> [String] -> CabalM ()
+rawSystemExit path args = withFrozenCallStack $ do
+  printRawCommandAndArgs path args
+  exitcode <- liftIO $ do
+    hFlush stdout
+    rawSystem path args
   unless (exitcode == ExitSuccess) $ do
-    debug verbosity $ path ++ " returned " ++ show exitcode
-    exitWith exitcode
+    debug $ path ++ " returned " ++ show exitcode
+    liftIO $ exitWith exitcode
 
-rawSystemExitCode :: Verbosity -> FilePath -> [String] -> IO ExitCode
-rawSystemExitCode verbosity path args = withFrozenCallStack $ do
-  printRawCommandAndArgs verbosity path args
-  hFlush stdout
-  exitcode <- rawSystem path args
+rawSystemExitCode :: FilePath -> [String] -> CabalM ExitCode
+rawSystemExitCode path args = withFrozenCallStack $ do
+  printRawCommandAndArgs path args
+  exitcode <- liftIO $ do
+    hFlush stdout
+    rawSystem path args
   unless (exitcode == ExitSuccess) $ do
-    debug verbosity $ path ++ " returned " ++ show exitcode
+    debug $ path ++ " returned " ++ show exitcode
   return exitcode
 
-rawSystemExitWithEnv :: Verbosity
-                     -> FilePath
+rawSystemExitWithEnv :: FilePath
                      -> [String]
                      -> [(String, String)]
-                     -> IO ()
-rawSystemExitWithEnv verbosity path args env = withFrozenCallStack $ do
-    printRawCommandAndArgsAndEnv verbosity path args Nothing (Just env)
-    hFlush stdout
-    (_,_,_,ph) <- createProcess $
-                  (Process.proc path args) { Process.env = (Just env)
+                     -> CabalM ()
+rawSystemExitWithEnv path args env = withFrozenCallStack $ do
+    printRawCommandAndArgsAndEnv path args Nothing (Just env)
+    exitcode <- liftIO $ do
+      hFlush stdout
+      (_,_,_,ph) <- createProcess $
+                    (Process.proc path args) { Process.env = (Just env)
 #ifdef MIN_VERSION_process
 #if MIN_VERSION_process(1,2,0)
 -- delegate_ctlc has been added in process 1.2, and we still want to be able to
 -- bootstrap GHC on systems not having that version
-                                           , Process.delegate_ctlc = True
+                                             , Process.delegate_ctlc = True
 #endif
 #endif
-                                           }
-    exitcode <- waitForProcess ph
+                                             }
+      waitForProcess ph
     unless (exitcode == ExitSuccess) $ do
-        debug verbosity $ path ++ " returned " ++ show exitcode
-        exitWith exitcode
+        debug $ path ++ " returned " ++ show exitcode
+        liftIO $ exitWith exitcode
 
 -- Closes the passed in handles before returning.
-rawSystemIOWithEnv :: Verbosity
-                   -> FilePath
+rawSystemIOWithEnv :: FilePath
                    -> [String]
                    -> Maybe FilePath           -- ^ New working dir or inherit
                    -> Maybe [(String, String)] -- ^ New environment or inherit
                    -> Maybe Handle  -- ^ stdin
                    -> Maybe Handle  -- ^ stdout
                    -> Maybe Handle  -- ^ stderr
-                   -> IO ExitCode
-rawSystemIOWithEnv verbosity path args mcwd menv inp out err = withFrozenCallStack $ do
-    (_,_,_,ph) <- createProcessWithEnv verbosity path args mcwd menv
+                   -> CabalM ExitCode
+rawSystemIOWithEnv path args mcwd menv inp out err = withFrozenCallStack $ do
+    (_,_,_,ph) <- createProcessWithEnv path args mcwd menv
                                        (mbToStd inp) (mbToStd out) (mbToStd err)
-    exitcode <- waitForProcess ph
+    exitcode <- liftIO $ waitForProcess ph
     unless (exitcode == ExitSuccess) $ do
-      debug verbosity $ path ++ " returned " ++ show exitcode
+      debug $ path ++ " returned " ++ show exitcode
     return exitcode
   where
     mbToStd :: Maybe Handle -> Process.StdStream
     mbToStd = maybe Process.Inherit Process.UseHandle
 
 createProcessWithEnv ::
-     Verbosity
-  -> FilePath
+     FilePath
   -> [String]
   -> Maybe FilePath           -- ^ New working dir or inherit
   -> Maybe [(String, String)] -- ^ New environment or inherit
   -> Process.StdStream  -- ^ stdin
   -> Process.StdStream  -- ^ stdout
   -> Process.StdStream  -- ^ stderr
-  -> IO (Maybe Handle, Maybe Handle, Maybe Handle,ProcessHandle)
+  -> CabalM (Maybe Handle, Maybe Handle, Maybe Handle,ProcessHandle)
   -- ^ Any handles created for stdin, stdout, or stderr
   -- with 'CreateProcess', and a handle to the process.
-createProcessWithEnv verbosity path args mcwd menv inp out err = withFrozenCallStack $ do
-    printRawCommandAndArgsAndEnv verbosity path args mcwd menv
-    hFlush stdout
-    (inp', out', err', ph) <- createProcess $
-                                (Process.proc path args) {
-                                    Process.cwd           = mcwd
-                                  , Process.env           = menv
-                                  , Process.std_in        = inp
-                                  , Process.std_out       = out
-                                  , Process.std_err       = err
+createProcessWithEnv path args mcwd menv inp out err = withFrozenCallStack $ do
+    printRawCommandAndArgsAndEnv path args mcwd menv
+    liftIO $ do
+      hFlush stdout
+      (inp', out', err', ph) <- createProcess $
+                                  (Process.proc path args) {
+                                      Process.cwd           = mcwd
+                                    , Process.env           = menv
+                                    , Process.std_in        = inp
+                                    , Process.std_out       = out
+                                    , Process.std_err       = err
 #ifdef MIN_VERSION_process
 #if MIN_VERSION_process(1,2,0)
 -- delegate_ctlc has been added in process 1.2, and we still want to be able to
 -- bootstrap GHC on systems not having that version
-                                  , Process.delegate_ctlc = True
+                                    , Process.delegate_ctlc = True
 #endif
 #endif
-                                  }
-    return (inp', out', err', ph)
+                                    }
+      return (inp', out', err', ph)
 
 -- | Run a command and return its output.
 --
 -- The output is assumed to be text in the locale encoding.
 --
-rawSystemStdout :: Verbosity -> FilePath -> [String] -> IO String
-rawSystemStdout verbosity path args = withFrozenCallStack $ do
-  (IODataText output, errors, exitCode) <- rawSystemStdInOut verbosity path args
+rawSystemStdout :: FilePath -> [String] -> CabalM String
+rawSystemStdout path args = withFrozenCallStack $ do
+  (IODataText output, errors, exitCode) <- rawSystemStdInOut path args
                                                   Nothing Nothing
                                                   Nothing IODataModeText
   when (exitCode /= ExitSuccess) $
-    die errors
+    liftIO $ die errors
   return output
 
 -- | Run a command and return its output, errors and exit status. Optionally
 -- also supply some input. Also provides control over whether the binary/text
 -- mode of the input and output.
 --
-rawSystemStdInOut :: Verbosity
-                  -> FilePath                 -- ^ Program location
+rawSystemStdInOut :: FilePath                 -- ^ Program location
                   -> [String]                 -- ^ Arguments
                   -> Maybe FilePath           -- ^ New working dir or inherit
                   -> Maybe [(String, String)] -- ^ New environment or inherit
                   -> Maybe IOData             -- ^ input text and binary mode
                   -> IODataMode               -- ^ output in binary mode
-                  -> IO (IOData, String, ExitCode) -- ^ output, errors, exit
-rawSystemStdInOut verbosity path args mcwd menv input outputMode = withFrozenCallStack $ do
-  printRawCommandAndArgs verbosity path args
+                  -> CabalM (IOData, String, ExitCode) -- ^ output, errors, exit
+rawSystemStdInOut path args mcwd menv input outputMode = withFrozenCallStack $ do
+  printRawCommandAndArgs path args
 
-  Exception.bracket
+  runCabalMInIO $ \liftC -> Exception.bracket
      (runInteractiveProcess path args mcwd menv)
      (\(inh,outh,errh,_) -> hClose inh >> hClose outh >> hClose errh)
     $ \(inh,outh,errh,pid) -> do
+      (mberr1, mberr2, out, err, exitcode) <- do
 
-      -- output mode depends on what the caller wants
-      -- but the errors are always assumed to be text (in the current locale)
-      hSetBinaryMode errh False
+        -- output mode depends on what the caller wants
+        -- but the errors are always assumed to be text (in the current locale)
+        hSetBinaryMode errh False
 
-      -- fork off a couple threads to pull on the stderr and stdout
-      -- so if the process writes to stderr we do not block.
+        -- fork off a couple threads to pull on the stderr and stdout
+        -- so if the process writes to stderr we do not block.
 
-      err <- hGetContents errh
+        err <- hGetContents errh
 
-      out <- IOData.hGetContents outh outputMode
+        out <- IOData.hGetContents outh outputMode
 
-      mv <- newEmptyMVar
-      let force str = do
-            mberr <- Exception.try (evaluate (rnf str) >> return ())
-            putMVar mv (mberr :: Either IOError ())
-      _ <- forkIO $ force out
-      _ <- forkIO $ force err
+        mv <- newEmptyMVar
+        let force str = do
+              mberr <- Exception.try (evaluate (rnf str) >> return ())
+              putMVar mv (mberr :: Either IOError ())
+        _ <- forkIO $ force out
+        _ <- forkIO $ force err
 
-      -- push all the input, if any
-      case input of
-        Nothing -> return ()
-        Just inputData -> do
-          -- input mode depends on what the caller wants
-          IOData.hPutContents inh inputData
-          --TODO: this probably fails if the process refuses to consume
-          -- or if it closes stdin (eg if it exits)
+        -- push all the input, if any
+        case input of
+          Nothing -> return ()
+          Just inputData -> do
+            -- input mode depends on what the caller wants
+            IOData.hPutContents inh inputData
+            --TODO: this probably fails if the process refuses to consume
+            -- or if it closes stdin (eg if it exits)
 
-      -- wait for both to finish, in either order
-      mberr1 <- takeMVar mv
-      mberr2 <- takeMVar mv
+        -- wait for both to finish, in either order
+        mberr1 <- takeMVar mv
+        mberr2 <- takeMVar mv
 
-      -- wait for the program to terminate
-      exitcode <- waitForProcess pid
-      unless (exitcode == ExitSuccess) $
-        debug verbosity $ path ++ " returned " ++ show exitcode
-                       ++ if null err then "" else
-                          " with error message:\n" ++ err
-                       ++ case input of
-                            Nothing       -> ""
-                            Just d | IOData.null d -> ""
-                            Just (IODataText inp) -> "\nstdin input:\n" ++ inp
-                            Just (IODataBinary inp) -> "\nstdin input (binary):\n" ++ show inp
+        -- wait for the program to terminate
+        exitcode <- waitForProcess pid
+        pure (mberr1, mberr2, out, err, exitcode)
+
+      unless (exitcode == ExitSuccess) $ liftC $ do
+        debug $ path ++ " returned " ++ show exitcode
+                     ++ if null err then "" else
+                        " with error message:\n" ++ err
+                     ++ case input of
+                          Nothing       -> ""
+                          Just d | IOData.null d -> ""
+                          Just (IODataText inp) -> "\nstdin input:\n" ++ inp
+                          Just (IODataBinary inp) -> "\nstdin input (binary):\n" ++ show inp
 
       -- Check if we we hit an exception while consuming the output
       -- (e.g. a text decoding error)
@@ -900,13 +928,13 @@ rawSystemStdInOut verbosity path args mcwd menv input outputMode = withFrozenCal
 {-# DEPRECATED findProgramLocation
     "No longer used within Cabal, try findProgramOnSearchPath" #-}
 -- | Look for a program on the path.
-findProgramLocation :: Verbosity -> FilePath -> IO (Maybe FilePath)
-findProgramLocation verbosity prog = withFrozenCallStack $ do
-  debug verbosity $ "searching for " ++ prog ++ " in path."
-  res <- findExecutable prog
+findProgramLocation :: FilePath -> CabalM (Maybe FilePath)
+findProgramLocation prog = withFrozenCallStack $ do
+  debug $ "searching for " ++ prog ++ " in path."
+  res <- liftIO $ findExecutable prog
   case res of
-      Nothing   -> debug verbosity ("Cannot find " ++ prog ++ " on the path")
-      Just path -> debug verbosity ("found " ++ prog ++ " at "++ path)
+      Nothing   -> debug ("Cannot find " ++ prog ++ " on the path")
+      Just path -> debug ("found " ++ prog ++ " at "++ path)
   return res
 
 
@@ -917,19 +945,19 @@ findProgramLocation verbosity prog = withFrozenCallStack $ do
 findProgramVersion :: String             -- ^ version args
                    -> (String -> String) -- ^ function to select version
                                          --   number from program output
-                   -> Verbosity
                    -> FilePath           -- ^ location
-                   -> IO (Maybe Version)
-findProgramVersion versionArg selectVersion verbosity path = withFrozenCallStack $ do
-  str <- rawSystemStdout verbosity path [versionArg]
+                   -> CabalM (Maybe Version)
+findProgramVersion versionArg selectVersion path = withFrozenCallStack $ do
+  str <- runCabalMInIO $ \liftC ->
+          liftC (rawSystemStdout path [versionArg])
          `catchIO`   (\_ -> return "")
          `catchExit` (\_ -> return "")
   let version :: Maybe Version
       version = simpleParse (selectVersion str)
   case version of
-      Nothing -> warn verbosity $ "cannot determine version of " ++ path
-                               ++ " :\n" ++ show str
-      Just v  -> debug verbosity $ path ++ " is version " ++ display v
+      Nothing -> warn $ "cannot determine version of " ++ path
+                        ++ " :\n" ++ show str
+      Just v  -> debug $ path ++ " is version " ++ display v
   return version
 
 
@@ -941,8 +969,8 @@ findProgramVersion versionArg selectVersion verbosity path = withFrozenCallStack
 --
 -- > xargs (32*1024) (rawSystemExit verbosity) prog fixedArgs bigArgs
 --
-xargs :: Int -> ([String] -> IO ())
-      -> [String] -> [String] -> IO ()
+xargs :: Int -> ([String] -> CabalM ())
+      -> [String] -> [String] -> CabalM ()
 xargs maxSize rawSystemFun fixedArgs bigArgs =
   let fixedArgSize = sum (map length fixedArgs) + length fixedArgs
       chunkSize = maxSize - fixedArgSize
@@ -1183,107 +1211,111 @@ existsAndIsMoreRecentThan a b = do
 
 -- | Same as 'createDirectoryIfMissing' but logs at higher verbosity levels.
 --
-createDirectoryIfMissingVerbose :: Verbosity
-                                -> Bool     -- ^ Create its parents too?
+createDirectoryIfMissingVerbose :: Bool     -- ^ Create its parents too?
                                 -> FilePath
-                                -> IO ()
-createDirectoryIfMissingVerbose verbosity create_parents path0
+                                -> CabalM ()
+createDirectoryIfMissingVerbose create_parents path0
   | create_parents = withFrozenCallStack $ createDirs (parents path0)
   | otherwise      = withFrozenCallStack $ createDirs (take 1 (parents path0))
   where
     parents = reverse . scanl1 (</>) . splitDirectories . normalise
 
+    createDirs :: [FilePath] -> CabalM ()
     createDirs []         = return ()
     createDirs (dir:[])   = createDir dir throwIO
-    createDirs (dir:dirs) =
-      createDir dir $ \_ -> do
+    createDirs (dir:dirs) = do
+      verbosity <- askVerbosity
+      createDir dir $ \_ -> flip runCabalM verbosity $ do
         createDirs dirs
         createDir dir throwIO
 
-    createDir :: FilePath -> (IOException -> IO ()) -> IO ()
+    createDir :: FilePath -> (IOException -> IO ()) -> CabalM ()
     createDir dir notExistHandler = do
-      r <- tryIO $ createDirectoryVerbose verbosity dir
-      case (r :: Either IOException ()) of
-        Right ()                   -> return ()
-        Left  e
-          | isDoesNotExistError  e -> notExistHandler e
-          -- createDirectory (and indeed POSIX mkdir) does not distinguish
-          -- between a dir already existing and a file already existing. So we
-          -- check for it here. Unfortunately there is a slight race condition
-          -- here, but we think it is benign. It could report an exception in
-          -- the case that the dir did exist but another process deletes the
-          -- directory and creates a file in its place before we can check
-          -- that the directory did indeed exist.
-          | isAlreadyExistsError e -> (do
-              isDir <- doesDirectoryExist dir
-              unless isDir $ throwIO e
-              ) `catchIO` ((\_ -> return ()) :: IOException -> IO ())
-          | otherwise              -> throwIO e
+      x <- runCabalMInIO $ \liftC -> do
+        r <- tryIO $ liftC (createDirectoryVerbose dir)
+        case (r :: Either IOException ()) of
+          Right ()                   -> return ()
+          Left  e
+            | isDoesNotExistError  e -> notExistHandler e
+            -- createDirectory (and indeed POSIX mkdir) does not distinguish
+            -- between a dir already existing and a file already existing. So we
+            -- check for it here. Unfortunately there is a slight race condition
+            -- here, but we think it is benign. It could report an exception in
+            -- the case that the dir did exist but another process deletes the
+            -- directory and creates a file in its place before we can check
+            -- that the directory did indeed exist.
+            | isAlreadyExistsError e -> (do
+                isDir <- doesDirectoryExist dir
+                unless isDir $ throwIO e
+                ) `catchIO` ((\_ -> return ()) :: IOException -> IO ())
+            | otherwise              -> throwIO e
+      pure x
 
-createDirectoryVerbose :: Verbosity -> FilePath -> IO ()
-createDirectoryVerbose verbosity dir = withFrozenCallStack $ do
-  info verbosity $ "creating " ++ dir
-  createDirectory dir
-  setDirOrdinary dir
+createDirectoryVerbose :: FilePath -> CabalM ()
+createDirectoryVerbose dir = withFrozenCallStack $ do
+  info $ "creating " ++ dir
+  liftIO $ do
+    createDirectory dir
+    setDirOrdinary dir
 
 -- | Copies a file without copying file permissions. The target file is created
 -- with default permissions. Any existing target file is replaced.
 --
 -- At higher verbosity levels it logs an info message.
 --
-copyFileVerbose :: Verbosity -> FilePath -> FilePath -> IO ()
-copyFileVerbose verbosity src dest = withFrozenCallStack $ do
-  info verbosity ("copy " ++ src ++ " to " ++ dest)
-  copyFile src dest
+copyFileVerbose :: FilePath -> FilePath -> CabalM ()
+copyFileVerbose src dest = withFrozenCallStack $ do
+  info ("copy " ++ src ++ " to " ++ dest)
+  liftIO $ copyFile src dest
 
 -- | Install an ordinary file. This is like a file copy but the permissions
 -- are set appropriately for an installed file. On Unix it is \"-rw-r--r--\"
 -- while on Windows it uses the default permissions for the target directory.
 --
-installOrdinaryFile :: Verbosity -> FilePath -> FilePath -> IO ()
-installOrdinaryFile verbosity src dest = withFrozenCallStack $ do
-  info verbosity ("Installing " ++ src ++ " to " ++ dest)
-  copyOrdinaryFile src dest
+installOrdinaryFile :: FilePath -> FilePath -> CabalM ()
+installOrdinaryFile src dest = withFrozenCallStack $ do
+  info ("Installing " ++ src ++ " to " ++ dest)
+  liftIO $ copyOrdinaryFile src dest
 
 -- | Install an executable file. This is like a file copy but the permissions
 -- are set appropriately for an installed file. On Unix it is \"-rwxr-xr-x\"
 -- while on Windows it uses the default permissions for the target directory.
 --
-installExecutableFile :: Verbosity -> FilePath -> FilePath -> IO ()
-installExecutableFile verbosity src dest = withFrozenCallStack $ do
-  info verbosity ("Installing executable " ++ src ++ " to " ++ dest)
-  copyExecutableFile src dest
+installExecutableFile :: FilePath -> FilePath -> CabalM ()
+installExecutableFile src dest = withFrozenCallStack $ do
+  info ("Installing executable " ++ src ++ " to " ++ dest)
+  liftIO $ copyExecutableFile src dest
 
 -- | Install a file that may or not be executable, preserving permissions.
-installMaybeExecutableFile :: Verbosity -> FilePath -> FilePath -> IO ()
-installMaybeExecutableFile verbosity src dest = withFrozenCallStack $ do
-  perms <- getPermissions src
+installMaybeExecutableFile :: FilePath -> FilePath -> CabalM ()
+installMaybeExecutableFile src dest = withFrozenCallStack $ do
+  perms <- liftIO $ getPermissions src
   if (executable perms) --only checks user x bit
-    then installExecutableFile verbosity src dest
-    else installOrdinaryFile   verbosity src dest
+    then installExecutableFile src dest
+    else installOrdinaryFile   src dest
 
 -- | Given a relative path to a file, copy it to the given directory, preserving
 -- the relative path and creating the parent directories if needed.
-copyFileTo :: Verbosity -> FilePath -> FilePath -> IO ()
-copyFileTo verbosity dir file = withFrozenCallStack $ do
+copyFileTo :: FilePath -> FilePath -> CabalM ()
+copyFileTo dir file = withFrozenCallStack $ do
   let targetFile = dir </> file
-  createDirectoryIfMissingVerbose verbosity True (takeDirectory targetFile)
-  installOrdinaryFile verbosity file targetFile
+  createDirectoryIfMissingVerbose True (takeDirectory targetFile)
+  installOrdinaryFile file targetFile
 
 -- | Common implementation of 'copyFiles', 'installOrdinaryFiles',
 -- 'installExecutableFiles' and 'installMaybeExecutableFiles'.
-copyFilesWith :: (Verbosity -> FilePath -> FilePath -> IO ())
-              -> Verbosity -> FilePath -> [(FilePath, FilePath)] -> IO ()
-copyFilesWith doCopy verbosity targetDir srcFiles = withFrozenCallStack $ do
+copyFilesWith :: (FilePath -> FilePath -> CabalM ())
+              -> FilePath -> [(FilePath, FilePath)] -> CabalM ()
+copyFilesWith doCopy targetDir srcFiles = withFrozenCallStack $ do
 
   -- Create parent directories for everything
   let dirs = map (targetDir </>) . nub . map (takeDirectory . snd) $ srcFiles
-  traverse_ (createDirectoryIfMissingVerbose verbosity True) dirs
+  traverse_ (createDirectoryIfMissingVerbose True) dirs
 
   -- Copy all the files
   sequence_ [ let src  = srcBase   </> srcFile
                   dest = targetDir </> srcFile
-               in doCopy verbosity src dest
+               in doCopy src dest
             | (srcBase, srcFile) <- srcFiles ]
 
 -- | Copies a bunch of files to a target directory, preserving the directory
@@ -1307,43 +1339,43 @@ copyFilesWith doCopy verbosity targetDir srcFiles = withFrozenCallStack $ do
 -- use it with a freshly created directory so that it can be simply deleted if
 -- anything goes wrong.
 --
-copyFiles :: Verbosity -> FilePath -> [(FilePath, FilePath)] -> IO ()
-copyFiles v fp fs = withFrozenCallStack (copyFilesWith copyFileVerbose v fp fs)
+copyFiles :: FilePath -> [(FilePath, FilePath)] -> CabalM ()
+copyFiles fp fs = withFrozenCallStack (copyFilesWith copyFileVerbose fp fs)
 
 -- | This is like 'copyFiles' but uses 'installOrdinaryFile'.
 --
-installOrdinaryFiles :: Verbosity -> FilePath -> [(FilePath, FilePath)] -> IO ()
-installOrdinaryFiles v fp fs = withFrozenCallStack (copyFilesWith installOrdinaryFile v fp fs)
+installOrdinaryFiles :: FilePath -> [(FilePath, FilePath)] -> CabalM ()
+installOrdinaryFiles fp fs = withFrozenCallStack (copyFilesWith installOrdinaryFile fp fs)
 
 -- | This is like 'copyFiles' but uses 'installExecutableFile'.
 --
-installExecutableFiles :: Verbosity -> FilePath -> [(FilePath, FilePath)]
-                          -> IO ()
-installExecutableFiles v fp fs = withFrozenCallStack (copyFilesWith installExecutableFile v fp fs)
+installExecutableFiles :: FilePath -> [(FilePath, FilePath)]
+                          -> CabalM ()
+installExecutableFiles fp fs = withFrozenCallStack (copyFilesWith installExecutableFile fp fs)
 
 -- | This is like 'copyFiles' but uses 'installMaybeExecutableFile'.
 --
-installMaybeExecutableFiles :: Verbosity -> FilePath -> [(FilePath, FilePath)]
-                               -> IO ()
-installMaybeExecutableFiles v fp fs = withFrozenCallStack (copyFilesWith installMaybeExecutableFile v fp fs)
+installMaybeExecutableFiles :: FilePath -> [(FilePath, FilePath)]
+                               -> CabalM ()
+installMaybeExecutableFiles fp fs = withFrozenCallStack (copyFilesWith installMaybeExecutableFile fp fs)
 
 -- | This installs all the files in a directory to a target location,
 -- preserving the directory layout. All the files are assumed to be ordinary
 -- rather than executable files.
 --
-installDirectoryContents :: Verbosity -> FilePath -> FilePath -> IO ()
-installDirectoryContents verbosity srcDir destDir = withFrozenCallStack $ do
-  info verbosity ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
-  srcFiles <- getDirectoryContentsRecursive srcDir
-  installOrdinaryFiles verbosity destDir [ (srcDir, f) | f <- srcFiles ]
+installDirectoryContents :: FilePath -> FilePath -> CabalM ()
+installDirectoryContents srcDir destDir = withFrozenCallStack $ do
+  info ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
+  srcFiles <- liftIO $ getDirectoryContentsRecursive srcDir
+  installOrdinaryFiles destDir [ (srcDir, f) | f <- srcFiles ]
 
 -- | Recursively copy the contents of one directory to another path.
-copyDirectoryRecursive :: Verbosity -> FilePath -> FilePath -> IO ()
-copyDirectoryRecursive verbosity srcDir destDir = withFrozenCallStack $ do
-  info verbosity ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
-  srcFiles <- getDirectoryContentsRecursive srcDir
-  copyFilesWith (const copyFile) verbosity destDir [ (srcDir, f)
-                                                   | f <- srcFiles ]
+copyDirectoryRecursive :: FilePath -> FilePath -> CabalM ()
+copyDirectoryRecursive srcDir destDir = withFrozenCallStack $ do
+  info ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
+  srcFiles <- liftIO $ getDirectoryContentsRecursive srcDir
+  copyFilesWith (\f1 f2 -> liftIO $ copyFile f1 f2) destDir [ (srcDir, f)
+                                                            | f <- srcFiles ]
 
 -------------------
 -- File permissions
@@ -1362,19 +1394,19 @@ doesExecutableExist f = do
 
 {-# DEPRECATED smartCopySources
       "Use findModuleFiles and copyFiles or installOrdinaryFiles" #-}
-smartCopySources :: Verbosity -> [FilePath] -> FilePath
-                 -> [ModuleName] -> [String] -> IO ()
-smartCopySources verbosity searchPath targetDir moduleNames extensions = withFrozenCallStack $
-      findModuleFiles searchPath extensions moduleNames
-  >>= copyFiles verbosity targetDir
+smartCopySources :: [FilePath] -> FilePath
+                 -> [ModuleName] -> [String] -> CabalM ()
+smartCopySources searchPath targetDir moduleNames extensions = withFrozenCallStack $
+      liftIO (findModuleFiles searchPath extensions moduleNames)
+  >>= copyFiles targetDir
 
 {-# DEPRECATED copyDirectoryRecursiveVerbose
       "You probably want installDirectoryContents instead" #-}
-copyDirectoryRecursiveVerbose :: Verbosity -> FilePath -> FilePath -> IO ()
-copyDirectoryRecursiveVerbose verbosity srcDir destDir = withFrozenCallStack $ do
-  info verbosity ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
-  srcFiles <- getDirectoryContentsRecursive srcDir
-  copyFiles verbosity destDir [ (srcDir, f) | f <- srcFiles ]
+copyDirectoryRecursiveVerbose :: FilePath -> FilePath -> CabalM ()
+copyDirectoryRecursiveVerbose srcDir destDir = withFrozenCallStack $ do
+  info ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
+  srcFiles <- liftIO $ getDirectoryContentsRecursive srcDir
+  copyFiles destDir [ (srcDir, f) | f <- srcFiles ]
 
 ---------------------------
 -- Temporary files and dirs
@@ -1391,7 +1423,7 @@ defaultTempFileOptions = TempFileOptions { optKeepTempFiles = False }
 --
 withTempFile :: FilePath    -- ^ Temp dir to create the file in
                 -> String   -- ^ File name template. See 'openTempFile'.
-                -> (FilePath -> Handle -> IO a) -> IO a
+                -> (FilePath -> Handle -> CabalM a) -> CabalM a
 withTempFile tmpDir template action =
   withTempFileEx defaultTempFileOptions tmpDir template action
 
@@ -1400,14 +1432,15 @@ withTempFile tmpDir template action =
 withTempFileEx :: TempFileOptions
                  -> FilePath -- ^ Temp dir to create the file in
                  -> String   -- ^ File name template. See 'openTempFile'.
-                 -> (FilePath -> Handle -> IO a) -> IO a
+                 -> (FilePath -> Handle -> CabalM a) -> CabalM a
 withTempFileEx opts tmpDir template action =
-  Exception.bracket
-    (openTempFile tmpDir template)
-    (\(name, handle) -> do hClose handle
-                           unless (optKeepTempFiles opts) $
-                             handleDoesNotExist () . removeFile $ name)
-    (withLexicalCallStack (uncurry action))
+  runCabalMInIO $ \liftC ->
+    Exception.bracket
+      (openTempFile tmpDir template)
+      (\(name, handle) -> do hClose handle
+                             unless (optKeepTempFiles opts) $
+                               handleDoesNotExist () . removeFile $ name)
+      (withLexicalCallStack (liftC . uncurry action))
 
 -- | Create and use a temporary directory.
 --
@@ -1419,44 +1452,47 @@ withTempFileEx opts tmpDir template action =
 -- The @tmpDir@ will be a new subdirectory of the given directory, e.g.
 -- @src/sdist.342@.
 --
-withTempDirectory :: Verbosity -> FilePath -> String -> (FilePath -> IO a) -> IO a
-withTempDirectory verbosity targetDir template f = withFrozenCallStack $
-  withTempDirectoryEx verbosity defaultTempFileOptions targetDir template
-    (withLexicalCallStack f)
+withTempDirectory :: FilePath -> String -> (FilePath -> CabalM a) -> CabalM a
+withTempDirectory targetDir template f = withFrozenCallStack $ do
+  verbosity <- askVerbosity
+  withTempDirectoryEx defaultTempFileOptions targetDir template
+    (\fp -> runCabalMInIO $ \liftC -> withLexicalCallStack (liftC . f) fp)
 
 -- | A version of 'withTempDirectory' that additionally takes a
 -- 'TempFileOptions' argument.
-withTempDirectoryEx :: Verbosity -> TempFileOptions
-                       -> FilePath -> String -> (FilePath -> IO a) -> IO a
-withTempDirectoryEx _verbosity opts targetDir template f = withFrozenCallStack $
-  Exception.bracket
-    (createTempDirectory targetDir template)
-    (unless (optKeepTempFiles opts)
-     . handleDoesNotExist () . removeDirectoryRecursive)
-    (withLexicalCallStack f)
+withTempDirectoryEx :: TempFileOptions
+                       -> FilePath -> String -> (FilePath -> CabalM a) -> CabalM a
+withTempDirectoryEx opts targetDir template f = withFrozenCallStack $
+  runCabalMInIO $ \liftC ->
+    Exception.bracket
+      (createTempDirectory targetDir template)
+      (unless (optKeepTempFiles opts)
+      . handleDoesNotExist () . removeDirectoryRecursive)
+      (withLexicalCallStack (liftC . f ))
 
 -----------------------------------
 -- Safely reading and writing files
 
 {-# DEPRECATED rewriteFile "Use rewriteFileEx so that Verbosity is respected" #-}
 rewriteFile :: FilePath -> String -> IO ()
-rewriteFile = rewriteFileEx normal
+rewriteFile fp s = runCabalM (rewriteFileEx fp s) normal
 
 -- | Write a file but only if it would have new content. If we would be writing
 -- the same as the existing content then leave the file as is so that we do not
 -- update the file's modification time.
 --
 -- NB: the file is assumed to be ASCII-encoded.
-rewriteFileEx :: Verbosity -> FilePath -> String -> IO ()
-rewriteFileEx verbosity path newContent =
-  flip catchIO mightNotExist $ do
-    existingContent <- annotateIO verbosity $ readFile path
-    _ <- evaluate (length existingContent)
-    unless (existingContent == newContent) $
-      annotateIO verbosity $
-        writeFileAtomic path (BS.Char8.pack newContent)
+rewriteFileEx :: FilePath -> String -> CabalM ()
+rewriteFileEx path newContent = do
+  verbosity <- askVerbosity
+  liftIO $ flip catchIO (mightNotExist verbosity) $ do
+      existingContent <- annotateIO verbosity $ readFile path
+      _ <- evaluate (length existingContent)
+      unless (existingContent == newContent) $
+        annotateIO verbosity $
+          writeFileAtomic path (BS.Char8.pack newContent)
   where
-    mightNotExist e | isDoesNotExistError e
+    mightNotExist verbosity e | isDoesNotExistError e
                     = annotateIO verbosity $ writeFileAtomic path
                         (BS.Char8.pack newContent)
                     | otherwise
@@ -1501,8 +1537,8 @@ exeExtensions = case buildOS of
 -- ------------------------------------------------------------
 
 -- |Package description file (/pkgname/@.cabal@)
-defaultPackageDesc :: Verbosity -> IO FilePath
-defaultPackageDesc _verbosity = tryFindPackageDesc currentDir
+defaultPackageDesc :: CabalM FilePath
+defaultPackageDesc = liftIO $ tryFindPackageDesc currentDir
 
 -- |Find a package description file in the given directory.  Looks for
 -- @.cabal@ files.

@@ -26,8 +26,8 @@ import Distribution.Simple.Setup
          ( Flag(..), fromFlag, fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.Utils
          ( notice, die', info, rawSystemExitCode, writeFileAtomic )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, runCabalMInIO, liftIO )
 import Distribution.Text(display)
 import qualified Distribution.PackageDescription as PD
 
@@ -65,38 +65,37 @@ import System.FilePath
 
 
 -- | Entry point for the 'cabal get' command.
-get :: Verbosity
-    -> RepoContext
+get :: RepoContext
     -> GlobalFlags
     -> GetFlags
     -> [UserTarget]
-    -> IO ()
-get verbosity _ _ _ [] =
-    notice verbosity "No packages requested. Nothing to do."
+    -> CabalM ()
+get _ _ _ [] =
+    notice "No packages requested. Nothing to do."
 
-get verbosity repoCtxt globalFlags getFlags userTargets = do
+get repoCtxt globalFlags getFlags userTargets = do
   let useFork = case (getSourceRepository getFlags) of
         NoFlag -> False
         _      -> True
 
   unless useFork $
-    mapM_ (checkTarget verbosity) userTargets
+    mapM_ checkTarget userTargets
 
   let idxState = flagToMaybe $ getIndexState getFlags
 
-  sourcePkgDb <- getSourcePackagesAtIndexState verbosity repoCtxt idxState
+  sourcePkgDb <- getSourcePackagesAtIndexState repoCtxt idxState
 
-  pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
+  pkgSpecifiers <- resolveUserTargets repoCtxt
                    (fromFlag $ globalWorldFile globalFlags)
                    (packageIndex sourcePkgDb)
                    userTargets
 
-  pkgs <- either (die' verbosity . unlines . map show) return $
+  pkgs <- either (die' . unlines . map show) return $
             resolveWithoutDependencies
               (resolverParams sourcePkgDb pkgSpecifiers)
 
   unless (null prefix) $
-    createDirectoryIfMissing True prefix
+    liftIO $ createDirectoryIfMissing True prefix
 
   if useFork
     then fork pkgs
@@ -109,38 +108,38 @@ get verbosity repoCtxt globalFlags getFlags userTargets = do
 
     prefix = fromFlagOrDefault "" (getDestDir getFlags)
 
-    fork :: [UnresolvedSourcePackage] -> IO ()
+    fork :: [UnresolvedSourcePackage] -> CabalM ()
     fork pkgs = do
       let kind = fromFlag . getSourceRepository $ getFlags
-      branchers <- findUsableBranchers
-      mapM_ (forkPackage verbosity branchers prefix kind) pkgs
+      branchers <- liftIO $ findUsableBranchers
+      mapM_ (forkPackage branchers prefix kind) pkgs
 
-    unpack :: [UnresolvedSourcePackage] -> IO ()
+    unpack :: [UnresolvedSourcePackage] -> CabalM ()
     unpack pkgs = do
       forM_ pkgs $ \pkg -> do
-        location <- fetchPackage verbosity repoCtxt (packageSource pkg)
+        location <- fetchPackage repoCtxt (packageSource pkg)
         let pkgid = packageId pkg
             descOverride | usePristine = Nothing
                          | otherwise   = packageDescrOverride pkg
         case location of
           LocalTarballPackage tarballPath ->
-            unpackPackage verbosity prefix pkgid descOverride tarballPath
+            unpackPackage prefix pkgid descOverride tarballPath
 
           RemoteTarballPackage _tarballURL tarballPath ->
-            unpackPackage verbosity prefix pkgid descOverride tarballPath
+            unpackPackage prefix pkgid descOverride tarballPath
 
           RepoTarballPackage _repo _pkgid tarballPath ->
-            unpackPackage verbosity prefix pkgid descOverride tarballPath
+            unpackPackage prefix pkgid descOverride tarballPath
 
           LocalUnpackedPackage _ ->
             error "Distribution.Client.Get.unpack: the impossible happened."
       where
         usePristine = fromFlagOrDefault False (getPristine getFlags)
 
-checkTarget :: Verbosity -> UserTarget -> IO ()
-checkTarget verbosity target = case target of
-    UserTargetLocalDir       dir  -> die' verbosity (notTarball dir)
-    UserTargetLocalCabalFile file -> die' verbosity (notTarball file)
+checkTarget :: UserTarget -> CabalM ()
+checkTarget target = case target of
+    UserTargetLocalDir       dir  -> die' (notTarball dir)
+    UserTargetLocalCabalFile file -> die' (notTarball file)
     _                             -> return ()
   where
     notTarball t =
@@ -151,37 +150,37 @@ checkTarget verbosity target = case target of
 -- * Unpacking the source tarball
 -- ------------------------------------------------------------
 
-unpackPackage :: Verbosity -> FilePath -> PackageId
+unpackPackage :: FilePath -> PackageId
               -> PackageDescriptionOverride
-              -> FilePath  -> IO ()
-unpackPackage verbosity prefix pkgid descOverride pkgPath = do
+              -> FilePath  -> CabalM ()
+unpackPackage prefix pkgid descOverride pkgPath = do
     let pkgdirname = display pkgid
         pkgdir     = prefix </> pkgdirname
         pkgdir'    = addTrailingPathSeparator pkgdir
-    existsDir  <- doesDirectoryExist pkgdir
-    when existsDir $ die' verbosity $
+    existsDir  <- liftIO $ doesDirectoryExist pkgdir
+    when existsDir $ die' $
      "The directory \"" ++ pkgdir' ++ "\" already exists, not unpacking."
-    existsFile  <- doesFileExist pkgdir
-    when existsFile $ die' verbosity $
+    existsFile  <- liftIO $ doesFileExist pkgdir
+    when existsFile $ die' $
      "A file \"" ++ pkgdir ++ "\" is in the way, not unpacking."
-    notice verbosity $ "Unpacking to " ++ pkgdir'
-    Tar.extractTarGzFile prefix pkgdirname pkgPath
+    notice $ "Unpacking to " ++ pkgdir'
+    liftIO $ Tar.extractTarGzFile prefix pkgdirname pkgPath
 
     case descOverride of
       Nothing     -> return ()
       Just pkgtxt -> do
         let descFilePath = pkgdir </> display (packageName pkgid) <.> "cabal"
-        info verbosity $
+        info $
           "Updating " ++ descFilePath
                       ++ " with the latest revision from the index."
-        writeFileAtomic descFilePath pkgtxt
+        liftIO $ writeFileAtomic descFilePath pkgtxt
 
 
 -- ------------------------------------------------------------
 -- * Forking the source repository
 -- ------------------------------------------------------------
 
-data BranchCmd = BranchCmd (Verbosity -> FilePath -> IO ExitCode)
+data BranchCmd = BranchCmd (FilePath -> CabalM ExitCode)
 
 data Brancher = Brancher
     { brancherBinary :: String
@@ -214,8 +213,7 @@ findUsableBranchers = do
 
 -- | Fork a single package from a remote source repository to the local
 -- file system.
-forkPackage :: Verbosity
-            -> Data.Map.Map PD.RepoType Brancher
+forkPackage :: Data.Map.Map PD.RepoType Brancher
                -- ^ Branchers supported by the local machine.
             -> FilePath
                -- ^ The directory in which new branches or repositories will
@@ -224,32 +222,32 @@ forkPackage :: Verbosity
                -- ^ Which repo to choose.
             -> SourcePackage loc
                -- ^ The package to fork.
-            -> IO ()
-forkPackage verbosity branchers prefix kind src = do
+            -> CabalM ()
+forkPackage branchers prefix kind src = do
     let desc    = PD.packageDescription (packageDescription src)
         pkgid   = display (packageId src)
         pkgname = display (packageName src)
         destdir = prefix </> pkgname
 
-    destDirExists <- doesDirectoryExist destdir
+    destDirExists <- liftIO $ doesDirectoryExist destdir
     when destDirExists $ do
-        die' verbosity ("The directory " ++ show destdir ++ " already exists, not forking.")
+        die' ("The directory " ++ show destdir ++ " already exists, not forking.")
 
-    destFileExists  <- doesFileExist destdir
+    destFileExists  <- liftIO $ doesFileExist destdir
     when destFileExists $ do
-        die' verbosity ("A file " ++ show destdir ++ " is in the way, not forking.")
+        die' ("A file " ++ show destdir ++ " is in the way, not forking.")
 
     let repos = PD.sourceRepos desc
     case findBranchCmd branchers repos kind of
         Just (BranchCmd io) -> do
-            exitCode <- io verbosity destdir
+            exitCode <- io destdir
             case exitCode of
                 ExitSuccess -> return ()
-                ExitFailure _ -> die' verbosity ("Couldn't fork package " ++ pkgid)
+                ExitFailure _ -> die' ("Couldn't fork package " ++ pkgid)
         Nothing -> case repos of
-            [] -> die' verbosity ("Package " ++ pkgid
+            [] -> die' ("Package " ++ pkgid
                        ++ " does not have any source repositories.")
-            _ -> die' verbosity ("Package " ++ pkgid
+            _ -> die' ("Package " ++ pkgid
                       ++ " does not have any usable source repositories.")
 
 -- | Given a set of possible branchers, and a set of possible source
@@ -289,9 +287,9 @@ branchBzr = Brancher "bzr" $ \repo -> do
     let args dst = case PD.repoTag repo of
          Just tag -> ["branch", src, dst, "-r", "tag:" ++ tag]
          Nothing -> ["branch", src, dst]
-    return $ BranchCmd $ \verbosity dst -> do
-        notice verbosity ("bzr: branch " ++ show src)
-        rawSystemExitCode verbosity "bzr" (args dst)
+    return $ BranchCmd $ \dst -> do
+        notice ("bzr: branch " ++ show src)
+        rawSystemExitCode "bzr" (args dst)
 
 -- | Branch driver for Darcs.
 branchDarcs :: Brancher
@@ -300,31 +298,31 @@ branchDarcs = Brancher "darcs" $ \repo -> do
     let args dst = case PD.repoTag repo of
          Just tag -> ["get", src, dst, "-t", tag]
          Nothing -> ["get", src, dst]
-    return $ BranchCmd $ \verbosity dst -> do
-        notice verbosity ("darcs: get " ++ show src)
-        rawSystemExitCode verbosity "darcs" (args dst)
+    return $ BranchCmd $ \dst -> do
+        notice ("darcs: get " ++ show src)
+        rawSystemExitCode "darcs" (args dst)
 
 -- | Branch driver for Git.
 branchGit :: Brancher
 branchGit = Brancher "git" $ \repo -> do
     src <- PD.repoLocation repo
-    let postClone verbosity dst = case PD.repoTag repo of
-         Just t -> do
+    let postClone dst = case PD.repoTag repo of
+         Just t -> runCabalMInIO $ \liftC -> do
              cwd <- getCurrentDirectory
              setCurrentDirectory dst
              finally
-                 (rawSystemExitCode verbosity "git" ["checkout", t])
+                 (liftC $ rawSystemExitCode "git" ["checkout", t])
                  (setCurrentDirectory cwd)
          Nothing -> return ExitSuccess
-    return $ BranchCmd $ \verbosity dst -> do
-        notice verbosity ("git: clone " ++ show src)
-        code <- rawSystemExitCode verbosity "git" (["clone", src, dst] ++
+    return $ BranchCmd $ \dst -> do
+        notice ("git: clone " ++ show src)
+        code <- rawSystemExitCode "git" (["clone", src, dst] ++
                     case PD.repoBranch repo of
                         Nothing -> []
                         Just b -> ["--branch", b])
         case code of
             ExitFailure _ -> return code
-            ExitSuccess -> postClone verbosity  dst
+            ExitSuccess -> postClone dst
 
 -- | Branch driver for Mercurial.
 branchHg :: Brancher
@@ -337,15 +335,15 @@ branchHg = Brancher "hg" $ \repo -> do
          Just t -> ["--rev", t]
          Nothing -> []
     let args dst = ["clone", src, dst] ++ branchArgs ++ tagArgs
-    return $ BranchCmd $ \verbosity dst -> do
-        notice verbosity ("hg: clone " ++ show src)
-        rawSystemExitCode verbosity "hg" (args dst)
+    return $ BranchCmd $ \dst -> do
+        notice ("hg: clone " ++ show src)
+        rawSystemExitCode "hg" (args dst)
 
 -- | Branch driver for Subversion.
 branchSvn :: Brancher
 branchSvn = Brancher "svn" $ \repo -> do
     src <- PD.repoLocation repo
     let args dst = ["checkout", src, dst]
-    return $ BranchCmd $ \verbosity dst -> do
-        notice verbosity ("svn: checkout " ++ show src)
-        rawSystemExitCode verbosity "svn" (args dst)
+    return $ BranchCmd $ \dst -> do
+        notice ("svn: checkout " ++ show src)
+        rawSystemExitCode "svn" (args dst)

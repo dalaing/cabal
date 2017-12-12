@@ -18,6 +18,7 @@ module Distribution.Simple.Program.Ld (
 import Prelude ()
 import Distribution.Compat.Prelude
 
+import Control.Monad.Trans (liftIO)
 import Distribution.Simple.Compiler (arResponseFilesSupported)
 import Distribution.Simple.LocalBuildInfo (LocalBuildInfo(..))
 import Distribution.Simple.Program.ResponseFile
@@ -31,8 +32,7 @@ import Distribution.Simple.Setup
          ( fromFlagOrDefault, configUseResponseFiles )
 import Distribution.Simple.Utils
          ( defaultTempFileOptions )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad ( CabalM )
 
 import System.Directory
          ( renameFile )
@@ -41,9 +41,9 @@ import System.FilePath
 
 -- | Call @ld -r@ to link a bunch of object files together.
 --
-combineObjectFiles :: Verbosity -> LocalBuildInfo -> ConfiguredProgram
-                   -> FilePath -> [FilePath] -> IO ()
-combineObjectFiles verbosity lbi ld target files = do
+combineObjectFiles :: LocalBuildInfo -> ConfiguredProgram
+                   -> FilePath -> [FilePath] -> CabalM ()
+combineObjectFiles lbi ld target files = do
 
   -- Unlike "ar", the "ld" tool is not designed to be used with xargs. That is,
   -- if we have more object files than fit on a single command line then we
@@ -78,16 +78,16 @@ combineObjectFiles verbosity lbi ld target files = do
     then
       run $ multiStageProgramInvocation simple (initial, middle, final) files
     else
-      withResponseFile verbosity defaultTempFileOptions targetDir "ld.rsp" Nothing files $
-        \path -> runProgramInvocation verbosity $ invokeWithResponesFile path
+      withResponseFile defaultTempFileOptions targetDir "ld.rsp" Nothing files $
+        \path -> runProgramInvocation $ invokeWithResponesFile path
 
   where
     tmpfile        = target <.> "tmp" -- perhaps should use a proper temp file
 
-    run :: [ProgramInvocation] -> IO ()
+    run :: [ProgramInvocation] -> CabalM ()
     run []         = return ()
-    run [inv]      = runProgramInvocation verbosity inv
-    run (inv:invs) = do runProgramInvocation verbosity inv
-                        renameFile target tmpfile
+    run [inv]      = runProgramInvocation inv
+    run (inv:invs) = do runProgramInvocation inv
+                        liftIO $ renameFile target tmpfile
                         run invs
 

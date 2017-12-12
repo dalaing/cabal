@@ -8,7 +8,7 @@ import Distribution.Compat.Prelude
 import Distribution.Types.PackageId
 import Distribution.Types.ComponentName
 import Distribution.Compat.Stack
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.ModuleName
 import Distribution.Text
 import Distribution.Simple.Utils
@@ -37,16 +37,16 @@ import Text.PrettyPrint
 -- for (2) which component (with enough details to uniquely identify
 -- the build in question.)
 --
-setupMessage' :: Text a => Verbosity
-             -> String            -- ^ Operation being done (capitalized), on:
+setupMessage' :: Text a =>
+                String            -- ^ Operation being done (capitalized), on:
              -> PackageIdentifier -- ^ Package
              -> ComponentName     -- ^ Component name
              -> Maybe [(ModuleName, a)] -- ^ Instantiation, if available.
                                         -- Polymorphic to take
                                         -- 'OpenModule' or 'Module'
-             -> IO ()
-setupMessage' verbosity msg pkgid cname mb_insts = withFrozenCallStack $ do
-    noticeDoc verbosity $
+             -> CabalM ()
+setupMessage' msg pkgid cname mb_insts = withFrozenCallStack $ do
+    noticeDoc $
       case mb_insts of
         Just insts | not (null insts) ->
           hang (msg_doc <+> text "instantiated with") 2
@@ -59,3 +59,4 @@ setupMessage' verbosity msg pkgid cname mb_insts = withFrozenCallStack $ do
   where
     msg_doc = text msg <+> text (showComponentName cname)
     for_doc = text "for" <+> disp pkgid <<>> text ".."
+ 

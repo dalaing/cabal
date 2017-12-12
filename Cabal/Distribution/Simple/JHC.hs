@@ -39,6 +39,7 @@ import Distribution.Version
 import Distribution.Package
 import Distribution.Simple.Utils
 import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Text
 
 import System.FilePath          ( (</>) )
@@ -54,11 +55,11 @@ import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 -- -----------------------------------------------------------------------------
 -- Configuring
 
-configure :: Verbosity -> Maybe FilePath -> Maybe FilePath
-          -> ProgramDb -> IO (Compiler, Maybe Platform, ProgramDb)
-configure verbosity hcPath _hcPkgPath progdb = do
+configure :: Maybe FilePath -> Maybe FilePath
+          -> ProgramDb -> CabalM (Compiler, Maybe Platform, ProgramDb)
+configure hcPath _hcPkgPath progdb = do
 
-  (jhcProg, _, progdb') <- requireProgramVersion verbosity
+  (jhcProg, _, progdb') <- requireProgramVersion
                            jhcProgram (orLaterVersion (mkVersion [0,7,2]))
                            (userMaybeSpecifyPath "jhc" hcPath progdb)
 
@@ -90,13 +91,13 @@ jhcLanguageExtensions =
     ,(DisableExtension CPP                        , Just "-fno-cpp")
     ]
 
-getInstalledPackages :: Verbosity -> PackageDBStack -> ProgramDb
-                    -> IO InstalledPackageIndex
-getInstalledPackages verbosity _packageDBs progdb = do
+getInstalledPackages :: PackageDBStack -> ProgramDb
+                    -> CabalM InstalledPackageIndex
+getInstalledPackages _packageDBs progdb = do
    -- jhc --list-libraries lists all available libraries.
    -- How shall I find out, whether they are global or local
    -- without checking all files and locations?
-   str <- getDbProgramOutput verbosity jhcProgram progdb ["--list-libraries"]
+   str <- getDbProgramOutput jhcProgram progdb ["--list-libraries"]
    let pCheck :: [(a, String)] -> [a]
        pCheck rs = [ r | (r,s) <- rs, all isSpace s ]
    let parseLine ln =
@@ -116,30 +117,32 @@ getInstalledPackages verbosity _packageDBs progdb = do
 
 -- | Building a package for JHC.
 -- Currently C source files are not supported.
-buildLib :: Verbosity -> PackageDescription -> LocalBuildInfo
-                      -> Library            -> ComponentLocalBuildInfo -> IO ()
-buildLib verbosity pkg_descr lbi lib clbi = do
+buildLib :: PackageDescription -> LocalBuildInfo
+                      -> Library            -> ComponentLocalBuildInfo -> CabalM ()
+buildLib pkg_descr lbi lib clbi = do
+  verbosity <- askVerbosity
   let Just jhcProg = lookupProgram jhcProgram (withPrograms lbi)
   let libBi = libBuildInfo lib
   let args  = constructJHCCmdLine lbi libBi clbi (buildDir lbi) verbosity
   let pkgid = display (packageId pkg_descr)
       pfile = buildDir lbi </> "jhc-pkg.conf"
       hlfile= buildDir lbi </> (pkgid ++ ".hl")
-  writeFileAtomic pfile . BS.Char8.pack $ jhcPkgConf pkg_descr
-  runProgram verbosity jhcProg $
+  liftIO $ writeFileAtomic pfile . BS.Char8.pack $ jhcPkgConf pkg_descr
+  runProgram jhcProg $
      ["--build-hl="++pfile, "-o", hlfile] ++
      args ++ map display (allLibModules lib clbi)
 
 -- | Building an executable for JHC.
 -- Currently C source files are not supported.
-buildExe :: Verbosity -> PackageDescription -> LocalBuildInfo
-                      -> Executable         -> ComponentLocalBuildInfo -> IO ()
-buildExe verbosity _pkg_descr lbi exe clbi = do
+buildExe :: PackageDescription -> LocalBuildInfo
+                      -> Executable         -> ComponentLocalBuildInfo -> CabalM ()
+buildExe _pkg_descr lbi exe clbi = do
+  verbosity <- askVerbosity
   let Just jhcProg = lookupProgram jhcProgram (withPrograms lbi)
   let exeBi = buildInfo exe
   let out   = buildDir lbi </> display (exeName exe)
   let args  = constructJHCCmdLine lbi exeBi clbi (buildDir lbi) verbosity
-  runProgram verbosity jhcProg (["-o",out] ++ args ++ [modulePath exe])
+  runProgram jhcProg (["-o",out] ++ args ++ [modulePath exe])
 
 constructJHCCmdLine :: LocalBuildInfo -> BuildInfo -> ComponentLocalBuildInfo
                     -> FilePath -> Verbosity -> [String]
@@ -172,24 +175,23 @@ jhcPkgConf pd =
              ,sline "hidden-modules" (comma . otherModules . libBuildInfo . lib)
              ]
 
-installLib :: Verbosity
-           -> LocalBuildInfo
+installLib :: LocalBuildInfo
            -> FilePath
            -> FilePath
            -> FilePath
            -> PackageDescription
            -> Library
            -> ComponentLocalBuildInfo
-           -> IO ()
-installLib verb _lbi dest _dyn_dest build_dir pkg_descr _lib _clbi = do
+           -> CabalM ()
+installLib _lbi dest _dyn_dest build_dir pkg_descr _lib _clbi = do
     let p = display (packageId pkg_descr)++".hl"
-    createDirectoryIfMissingVerbose verb True dest
-    installOrdinaryFile verb (build_dir </> p) (dest </> p)
+    createDirectoryIfMissingVerbose True dest
+    installOrdinaryFile (build_dir </> p) (dest </> p)
 
-installExe :: Verbosity -> FilePath -> FilePath -> (FilePath,FilePath) -> PackageDescription -> Executable -> IO ()
-installExe verb dest build_dir (progprefix,progsuffix) _ exe = do
+installExe :: FilePath -> FilePath -> (FilePath,FilePath) -> PackageDescription -> Executable -> CabalM ()
+installExe dest build_dir (progprefix,progsuffix) _ exe = do
     let exe_name = display $ exeName exe
         src = exe_name </> exeExtension
         out   = (progprefix ++ exe_name ++ progsuffix) </> exeExtension
-    createDirectoryIfMissingVerbose verb True dest
-    installExecutableFile verb (build_dir </> src) (dest </> out)
+    createDirectoryIfMissingVerbose True dest
+    installExecutableFile (build_dir </> src) (dest </> out)

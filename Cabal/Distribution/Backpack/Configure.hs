@@ -41,7 +41,6 @@ import Distribution.Simple.LocalBuildInfo
 import Distribution.Types.AnnotatedId
 import Distribution.Types.ComponentRequestedSpec
 import Distribution.Types.ComponentInclude
-import Distribution.Verbosity
 import qualified Distribution.Compat.Graph as Graph
 import Distribution.Compat.Graph (Graph, IsNode(..))
 import Distribution.Utils.LogProgress
@@ -58,8 +57,7 @@ import Text.PrettyPrint
 ------------------------------------------------------------------------------
 
 configureComponentLocalBuildInfos
-    :: Verbosity
-    -> Bool                   -- use_external_internal_deps
+    :: Bool                   -- use_external_internal_deps
     -> ComponentRequestedSpec
     -> Bool                   -- deterministic
     -> Flag String            -- configIPID
@@ -72,7 +70,7 @@ configureComponentLocalBuildInfos
     -> Compiler
     -> LogProgress ([ComponentLocalBuildInfo], InstalledPackageIndex)
 configureComponentLocalBuildInfos
-    verbosity use_external_internal_deps enabled deterministic ipid_flag cid_flag pkg_descr
+    use_external_internal_deps enabled deterministic ipid_flag cid_flag pkg_descr
     prePkgDeps flagAssignment instantiate_with installedPackageSet comp = do
     -- NB: In single component mode, this returns a *single* component.
     -- In this graph, the graph is NOT closed.
@@ -107,7 +105,7 @@ configureComponentLocalBuildInfos
                  (Map.fromList (Installed.instantiatedWith pkg))
             | otherwise = error ("uid_lookup: " ++ display uid)
           where uid = unDefUnitId def_uid
-    graph2 <- toLinkedComponents verbosity uid_lookup
+    graph2 <- toLinkedComponents uid_lookup
                     (package pkg_descr) shape_pkg_map graph1
 
     infoProgress $

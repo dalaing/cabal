@@ -36,6 +36,7 @@ import Distribution.Client.Setup
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
+import Distribution.Monad
 
 import Distribution.Simple.Utils
          ( writeFileAtomic, warn, notice, noticeNoWrap )
@@ -50,61 +51,62 @@ import Control.Monad
 import qualified Hackage.Security.Client as Sec
 
 -- | 'update' downloads the package list from all known servers
-update :: Verbosity -> UpdateFlags -> RepoContext -> IO ()
-update verbosity _ repoCtxt | null (repoContextRepos repoCtxt) = do
-  warn verbosity $ "No remote package servers have been specified. Usually "
+update :: UpdateFlags -> RepoContext -> CabalM ()
+update _ repoCtxt | null (repoContextRepos repoCtxt) = do
+  warn $ "No remote package servers have been specified. Usually "
                 ++ "you would have one specified in the config file."
-update verbosity updateFlags repoCtxt = do
+update updateFlags repoCtxt = do
   let repos       = repoContextRepos repoCtxt
       remoteRepos = mapMaybe maybeRepoRemote repos
   case remoteRepos of
     [] -> return ()
     [remoteRepo] ->
-        notice verbosity $ "Downloading the latest package list from "
+        notice $ "Downloading the latest package list from "
                         ++ remoteRepoName remoteRepo
-    _ -> notice verbosity . unlines
+    _ -> notice . unlines
             $ "Downloading the latest package lists from: "
             : map (("- " ++) . remoteRepoName) remoteRepos
-  jobCtrl <- newParallelJobControl (length repos)
-  mapM_ (spawnJob jobCtrl . updateRepo verbosity updateFlags repoCtxt) repos
-  mapM_ (\_ -> collectJob jobCtrl) repos
+  jobCtrl <- liftIO $ newParallelJobControl (length repos)
+  runCabalMInIO $ \liftC -> mapM_ (spawnJob jobCtrl . liftC . updateRepo updateFlags repoCtxt) repos
+  liftIO $ mapM_ (\_ -> collectJob jobCtrl) repos
 
-updateRepo :: Verbosity -> UpdateFlags -> RepoContext -> Repo -> IO ()
-updateRepo verbosity updateFlags repoCtxt repo = do
+updateRepo :: UpdateFlags -> RepoContext -> Repo -> CabalM ()
+updateRepo updateFlags repoCtxt repo = do
   transport <- repoContextGetTransport repoCtxt
   case repo of
     RepoLocal{..} -> return ()
     RepoRemote{..} -> do
-      downloadResult <- downloadIndex transport verbosity repoRemote repoLocalDir
+      downloadResult <- downloadIndex transport repoRemote repoLocalDir
       case downloadResult of
         FileAlreadyInCache ->
-          setModificationTime (indexBaseName repo <.> "tar") =<< getCurrentTime
+          liftIO $ setModificationTime (indexBaseName repo <.> "tar") =<< getCurrentTime
         FileDownloaded indexPath -> do
-          writeFileAtomic (dropExtension indexPath) . maybeDecompress
+          liftIO $ writeFileAtomic (dropExtension indexPath) . maybeDecompress
                                                   =<< BS.readFile indexPath
-          updateRepoIndexCache verbosity (RepoIndex repoCtxt repo)
+          updateRepoIndexCache (RepoIndex repoCtxt repo)
     RepoSecure{} -> repoContextWithSecureRepo repoCtxt repo $ \repoSecure -> do
       let index = RepoIndex repoCtxt repo
       -- NB: This may be a nullTimestamp if we've never updated before
-      current_ts <- currentIndexTimestamp (lessVerbose verbosity) repoCtxt repo
+      current_ts <- localVerbosity lessVerbose $ currentIndexTimestamp repoCtxt repo
       -- NB: always update the timestamp, even if we didn't actually
       -- download anything
-      writeIndexTimestamp index (fromFlag (updateIndexState updateFlags))
-      ce <- if repoContextIgnoreExpiry repoCtxt
-              then Just `fmap` getCurrentTime
-              else return Nothing
-      updated <- Sec.uncheckClientErrors $ Sec.checkForUpdates repoSecure ce
+      updated <- liftIO $ do
+        writeIndexTimestamp index (fromFlag (updateIndexState updateFlags))
+        ce <- if repoContextIgnoreExpiry repoCtxt
+                then Just `fmap` getCurrentTime
+                else return Nothing
+        Sec.uncheckClientErrors $ Sec.checkForUpdates repoSecure ce
       -- Update cabal's internal index as well so that it's not out of sync
       -- (If all access to the cache goes through hackage-security this can go)
       case updated of
         Sec.NoUpdates  ->
-          setModificationTime (indexBaseName repo <.> "tar") =<< getCurrentTime
+          liftIO $ setModificationTime (indexBaseName repo <.> "tar") =<< getCurrentTime
         Sec.HasUpdates ->
-          updateRepoIndexCache verbosity index
+          updateRepoIndexCache index
       -- TODO: This will print multiple times if there are multiple
       -- repositories: main problem is we don't have a way of updating
       -- a specific repo.  Once we implement that, update this.
       when (current_ts /= nullTimestamp) $
-        noticeNoWrap verbosity $
+        noticeNoWrap $
           "To revert to previous state run:\n" ++
           "    cabal update --index-state='" ++ display current_ts ++ "'\n"

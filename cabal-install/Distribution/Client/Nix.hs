@@ -25,7 +25,7 @@ import System.Process (showCommandForUser)
 import Distribution.Compat.Environment
        ( lookupEnv, setEnv, unsetEnv )
 
-import Distribution.Verbosity
+import Distribution.Monad
 
 import Distribution.Simple.Program
        ( Program(..), ProgramDb
@@ -39,9 +39,9 @@ import Distribution.Client.GlobalFlags (GlobalFlags(..))
 import Distribution.Client.Sandbox.Types (UseSandbox(..))
 
 
-configureOneProgram :: Verbosity -> Program -> IO ProgramDb
-configureOneProgram verb prog =
-  configureProgram verb prog (addKnownProgram prog emptyProgramDb)
+configureOneProgram :: Program -> CabalM ProgramDb
+configureOneProgram prog =
+  configureProgram prog (addKnownProgram prog emptyProgramDb)
 
 
 touchFile :: FilePath -> IO ()
@@ -68,9 +68,9 @@ findNixExpr globalFlags config = do
 
 
 -- set IN_NIX_SHELL so that builtins.getEnv in Nix works as in nix-shell
-inFakeNixShell :: IO a -> IO a
+inFakeNixShell :: CabalM a -> CabalM a
 inFakeNixShell f =
-  bracket (fakeEnv "IN_NIX_SHELL" "1") (resetEnv "IN_NIX_SHELL") (\_ -> f)
+  runCabalMInIO $ \liftC -> bracket (fakeEnv "IN_NIX_SHELL" "1") (resetEnv "IN_NIX_SHELL") (\_ -> liftC f)
   where
     fakeEnv var new = do
       old <- lookupEnv var
@@ -80,74 +80,75 @@ inFakeNixShell f =
 
 
 nixInstantiate
-  :: Verbosity
-  -> FilePath
+  :: FilePath
   -> Bool
   -> GlobalFlags
   -> SavedConfig
-  -> IO ()
-nixInstantiate verb dist force globalFlags config =
+  -> CabalM ()
+nixInstantiate dist force globalFlags config = runCabalMInIO $ \liftC ->
   findNixExpr globalFlags config >>= \case
     Nothing -> return ()
-    Just shellNix -> do
-      alreadyInShell <- inNixShell
-      shellDrv <- drvPath dist shellNix
-      instantiated <- doesFileExist shellDrv
-      -- an extra timestamp file is necessary because the derivation lives in
-      -- the store so its mtime is always 1.
-      let timestamp = timestampPath dist shellNix
-      upToDate <- existsAndIsMoreRecentThan timestamp shellNix
+    Just shellNix -> liftC $ do
+      (shellDrv, timestamp, ready) <- liftIO $ do
+        alreadyInShell <- inNixShell
+        shellDrv' <- drvPath dist shellNix
+        instantiated <- doesFileExist shellDrv'
+        -- an extra timestamp file is necessary because the derivation lives in
+        -- the store so its mtime is always 1.
+        let timestamp' = timestampPath dist shellNix
+        upToDate <- existsAndIsMoreRecentThan timestamp' shellNix
 
-      let ready = alreadyInShell || (instantiated && upToDate && not force)
+        let ready' = alreadyInShell || (instantiated && upToDate && not force)
+        return (shellDrv', timestamp', ready')
+
       unless ready $ do
 
         let prog = simpleProgram "nix-instantiate"
-        progdb <- configureOneProgram verb prog
+        progdb <- configureOneProgram prog
 
-        removeGCRoots verb dist
-        touchFile timestamp
+        removeGCRoots dist
+        liftIO $ touchFile timestamp
 
         _ <- inFakeNixShell
-             (getDbProgramOutput verb prog progdb
+             (getDbProgramOutput prog progdb
               [ "--add-root", shellDrv, "--indirect", shellNix ])
         return ()
 
 
 nixShell
-  :: Verbosity
-  -> FilePath
+  :: FilePath
   -> GlobalFlags
   -> SavedConfig
-  -> IO ()
+  -> CabalM ()
      -- ^ The action to perform inside a nix-shell. This is also the action
      -- that will be performed immediately if Nix is disabled.
-  -> IO ()
-nixShell verb dist globalFlags config go = do
+  -> CabalM ()
+nixShell dist globalFlags config go = do
 
-  alreadyInShell <- inNixShell
+  alreadyInShell <- liftIO inNixShell
 
   if alreadyInShell
     then go
     else do
-      findNixExpr globalFlags config >>= \case
+      liftIO (findNixExpr globalFlags config) >>= \case
         Nothing -> go
         Just shellNix -> do
 
           let prog = simpleProgram "nix-shell"
-          progdb <- configureOneProgram verb prog
+          progdb <- configureOneProgram prog
 
-          cabal <- getExecutablePath
+          cabal <- liftIO getExecutablePath
 
           -- alreadyInShell == True in child process
-          setEnv "CABAL_IN_NIX_SHELL" "1"
+          liftIO $ setEnv "CABAL_IN_NIX_SHELL" "1"
 
           -- Run cabal with the same arguments inside nix-shell.
           -- When the child process reaches the top of nixShell, it will
           -- detect that it is running inside the shell and fall back
           -- automatically.
-          shellDrv <- drvPath dist shellNix
-          args <- getArgs
-          runDbProgram verb prog progdb
+          shellDrv <- liftIO $ drvPath dist shellNix
+          args <- liftIO $ getArgs
+          runDbProgram prog progdb
             [ "--add-root", gcrootPath dist </> "result", "--indirect", shellDrv
             , "--run", showCommandForUser cabal args
             ]
@@ -177,26 +178,25 @@ inNixShell :: IO Bool
 inNixShell = isJust <$> lookupEnv "CABAL_IN_NIX_SHELL"
 
 
-removeGCRoots :: Verbosity -> FilePath -> IO ()
-removeGCRoots verb dist = do
+removeGCRoots :: FilePath -> CabalM ()
+removeGCRoots dist = do
   let tgt = gcrootPath dist
-  exists <- doesDirectoryExist tgt
+  exists <- liftIO $ doesDirectoryExist tgt
   when exists $ do
-    debug verb ("removing Nix gcroots from " ++ tgt)
-    removeDirectoryRecursive tgt
+    debug ("removing Nix gcroots from " ++ tgt)
+    liftIO $ removeDirectoryRecursive tgt
 
 
 nixShellIfSandboxed
-  :: Verbosity
-  -> FilePath
+  :: FilePath
   -> GlobalFlags
   -> SavedConfig
   -> UseSandbox
-  -> IO ()
+  -> CabalM ()
      -- ^ The action to perform inside a nix-shell. This is also the action
      -- that will be performed immediately if Nix is disabled.
-  -> IO ()
-nixShellIfSandboxed verb dist globalFlags config useSandbox go =
+  -> CabalM ()
+nixShellIfSandboxed dist globalFlags config useSandbox go =
   case useSandbox of
     NoSandbox -> go
-    UseSandbox _ -> nixShell verb dist globalFlags config go
+    UseSandbox _ -> nixShell dist globalFlags config go

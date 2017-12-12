@@ -47,8 +47,8 @@ import Distribution.System
          ( Platform )
 import Distribution.Text
          ( display )
-import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Monad
+         ( CabalM, liftIO )
 import Distribution.Version
          ( Version, alterVersion
          , LowerBound(..), UpperBound(..), VersionRange(..), asVersionIntervals
@@ -96,8 +96,7 @@ showBounds padTo p = unwords $
 
 -- | Entry point for the @gen-bounds@ command.
 genBounds
-    :: Verbosity
-    -> PackageDBStack
+    :: PackageDBStack
     -> RepoContext
     -> Compiler
     -> Platform
@@ -105,43 +104,45 @@ genBounds
     -> Maybe SandboxPackageInfo
     -> GlobalFlags
     -> FreezeFlags
-    -> IO ()
-genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+    -> CabalM ()
+genBounds packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       globalFlags freezeFlags = do
 
     let cinfo = compilerInfo comp
 
-    cwd <- getCurrentDirectory
-    path <- tryFindPackageDesc cwd
-    gpd <- readGenericPackageDescription verbosity path
+    path <- liftIO $ do
+      cwd <- getCurrentDirectory
+      tryFindPackageDesc cwd
+    gpd <- readGenericPackageDescription path
     -- NB: We don't enable tests or benchmarks, since often they
     -- don't really have useful bounds.
     let epd = finalizePD mempty defaultComponentRequestedSpec
                     (const True) platform cinfo [] gpd
     case epd of
-      Left _ -> putStrLn "finalizePD failed"
+      Left _ -> liftIO $ putStrLn "finalizePD failed"
       Right (pd,_) -> do
         let needBounds = filter (not . hasUpperBound . depVersion) $
                          enabledBuildDepends pd defaultComponentRequestedSpec
 
         if (null needBounds)
-          then putStrLn
+          then liftIO $ putStrLn
                "Congratulations, all your dependencies have upper bounds!"
           else go needBounds
   where
      go needBounds = do
        pkgs  <- getFreezePkgs
-                  verbosity packageDBs repoCtxt comp platform progdb
+                  packageDBs repoCtxt comp platform progdb
                   mSandboxPkgInfo globalFlags freezeFlags
 
-       putStrLn boundsNeededMsg
+       liftIO $ do
+         putStrLn boundsNeededMsg
 
-       let isNeeded pkg = unPackageName (packageName pkg)
-                          `elem` map depName needBounds
-       let thePkgs = filter isNeeded pkgs
+         let isNeeded pkg = unPackageName (packageName pkg)
+                              `elem` map depName needBounds
+         let thePkgs = filter isNeeded pkgs
 
-       let padTo = maximum $ map (length . unPackageName . packageName) pkgs
-       traverse_ (putStrLn . (++",") . showBounds padTo) thePkgs
+         let padTo = maximum $ map (length . unPackageName . packageName) pkgs
+         traverse_ (putStrLn . (++",") . showBounds padTo) thePkgs
 
      depName :: Dependency -> String
      depName (Dependency pn _) = unPackageName pn

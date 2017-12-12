@@ -40,7 +40,7 @@ isUseSandbox NoSandbox      = False
 
 -- | Execute an action only if we're in a sandbox, feeding to it the path to the
 -- sandbox directory.
-whenUsingSandbox :: UseSandbox -> (FilePath -> IO ()) -> IO ()
+whenUsingSandbox :: Monad m => UseSandbox -> (FilePath -> m ()) -> m ()
 whenUsingSandbox NoSandbox               _   = return ()
 whenUsingSandbox (UseSandbox sandboxDir) act = act sandboxDir
 

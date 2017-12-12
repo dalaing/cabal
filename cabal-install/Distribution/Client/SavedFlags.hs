@@ -10,6 +10,7 @@ import Distribution.Simple.UserHooks ( Args )
 import Distribution.Simple.Utils
        ( createDirectoryIfMissingVerbose, unintersperse )
 import Distribution.Verbosity
+import Distribution.Monad
 
 import Control.Exception ( Exception, throwIO )
 import Control.Monad ( liftM )
@@ -20,11 +21,11 @@ import System.Directory ( doesFileExist )
 import System.FilePath ( takeDirectory )
 
 
-writeSavedArgs :: Verbosity -> FilePath -> [String] -> IO ()
-writeSavedArgs verbosity path args = do
-  createDirectoryIfMissingVerbose
-    (lessVerbose verbosity) True (takeDirectory path)
-  writeFile path (intercalate "\0" args)
+writeSavedArgs :: FilePath -> [String] -> CabalM ()
+writeSavedArgs path args = do
+  localVerbosity lessVerbose $
+    createDirectoryIfMissingVerbose True (takeDirectory path)
+  liftIO $ writeFile path (intercalate "\0" args)
 
 
 -- | Write command-line flags to a file, separated by null characters. This
@@ -32,9 +33,9 @@ writeSavedArgs verbosity path args = do
 -- character also avoids the problem of escaping newlines or spaces,
 -- because unlike other whitespace characters, the null character is
 -- not valid in command-line arguments.
-writeCommandFlags :: Verbosity -> FilePath -> CommandUI flags -> flags -> IO ()
-writeCommandFlags verbosity path command flags =
-  writeSavedArgs verbosity path (commandShowOptions command flags)
+writeCommandFlags :: FilePath -> CommandUI flags -> flags -> CabalM ()
+writeCommandFlags path command flags =
+  writeSavedArgs path (commandShowOptions command flags)
 
 
 readSavedArgs :: FilePath -> IO (Maybe [String])

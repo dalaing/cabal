@@ -37,7 +37,7 @@ module Distribution.Simple.Program.Find (
 import Prelude ()
 import Distribution.Compat.Prelude
 
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Simple.Utils
 import Distribution.System
 import Distribution.Compat.Environment
@@ -74,14 +74,14 @@ instance Binary ProgramSearchPathEntry
 defaultProgramSearchPath :: ProgramSearchPath
 defaultProgramSearchPath = [ProgramSearchPathDefault]
 
-findProgramOnSearchPath :: Verbosity -> ProgramSearchPath
-                        -> FilePath -> IO (Maybe (FilePath, [FilePath]))
-findProgramOnSearchPath verbosity searchpath prog = do
-    debug verbosity $ "Searching for " ++ prog ++ " in path."
-    res <- tryPathElems [] searchpath
+findProgramOnSearchPath :: ProgramSearchPath
+                        -> FilePath -> CabalM (Maybe (FilePath, [FilePath]))
+findProgramOnSearchPath searchpath prog = do
+    debug $ "Searching for " ++ prog ++ " in path."
+    res <- liftIO $ tryPathElems [] searchpath
     case res of
-      Nothing   -> debug verbosity ("Cannot find " ++ prog ++ " on the path")
-      Just (path, _) -> debug verbosity ("Found " ++ prog ++ " at "++ path)
+      Nothing   -> debug ("Cannot find " ++ prog ++ " on the path")
+      Just (path, _) -> debug ("Found " ++ prog ++ " at "++ path)
     return res
   where
     tryPathElems :: [[FilePath]] -> [ProgramSearchPathEntry]

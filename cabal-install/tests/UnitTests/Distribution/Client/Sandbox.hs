@@ -3,6 +3,8 @@ module UnitTests.Distribution.Client.Sandbox (
   ) where
 
 import Distribution.Client.Sandbox (withSandboxBinDirOnSearchPath)
+import Distribution.Verbosity (silent)
+import Distribution.Monad (runCabalM, liftIO)
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -16,13 +18,15 @@ tests = [ testCase "sandboxBinDirOnSearchPath" sandboxBinDirOnSearchPathTest
 
 sandboxBinDirOnSearchPathTest :: Assertion
 sandboxBinDirOnSearchPathTest =
-  withSandboxBinDirOnSearchPath "foo" $ do
-    r <- getSearchPath
-    assertBool "'foo/bin' not on search path" $ ("foo" </> "bin") `elem` r
+  flip runCabalM silent $
+    withSandboxBinDirOnSearchPath "foo" . liftIO $ do
+      r <- getSearchPath
+      assertBool "'foo/bin' not on search path" $ ("foo" </> "bin") `elem` r
 
 oldSearchPathRestoreTest :: Assertion
 oldSearchPathRestoreTest = do
   r <- getSearchPath
-  withSandboxBinDirOnSearchPath "foo" $ return ()
+  flip runCabalM silent $
+    withSandboxBinDirOnSearchPath "foo" $ return ()
   r' <- getSearchPath
   assertEqual "Old search path wasn't restored" r r'

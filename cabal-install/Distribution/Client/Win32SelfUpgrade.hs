@@ -52,6 +52,7 @@ import System.Directory (canonicalizePath)
 import System.FilePath (takeBaseName, replaceBaseName, equalFilePath)
 
 import Distribution.Verbosity as Verbosity (Verbosity, showForCabal)
+import Distribution.Monad ( CabalM )
 import Distribution.Simple.Utils (debug, info)
 
 import Prelude hiding (log)
@@ -62,10 +63,9 @@ import Prelude hiding (log)
 -- We require that the new process accepts a command line invocation that
 -- calls 'deleteOldExeFile', passing in the PID and exe file.
 --
-possibleSelfUpgrade :: Verbosity
-                    -> [FilePath]
-                    -> IO a -> IO a
-possibleSelfUpgrade verbosity newPaths action = do
+possibleSelfUpgrade :: [FilePath]
+                    -> CabalM a -> CabalM a
+possibleSelfUpgrade newPaths action = do
   dstPath <- canonicalizePath =<< Win32.getModuleFileName Win32.nullHANDLE
 
   newPaths' <- mapM canonicalizePath newPaths
@@ -74,10 +74,10 @@ possibleSelfUpgrade verbosity newPaths action = do
   if not doingSelfUpgrade
     then action
     else do
-      info verbosity $ "cabal-install does the replace-own-exe-file dance..."
+      info $ "cabal-install does the replace-own-exe-file dance..."
       tmpPath <- moveOurExeOutOfTheWay verbosity
       result <- action
-      scheduleOurDemise verbosity dstPath tmpPath
+      scheduleOurDemise dstPath tmpPath
         (\pid path -> ["win32selfupgrade", pid, path
                       ,"--verbose=" ++ Verbosity.showForCabal verbosity])
       return result
@@ -97,59 +97,60 @@ syncEventName = "Local\\cabal-install-upgrade"
 -- while we're still running, fortunately we can rename it, at least within
 -- the same directory.
 --
-moveOurExeOutOfTheWay :: Verbosity -> IO FilePath
-moveOurExeOutOfTheWay verbosity = do
-  ourPID  <-       getCurrentProcessId
-  dstPath <- Win32.getModuleFileName Win32.nullHANDLE
+moveOurExeOutOfTheWay :: CabalM FilePath
+moveOurExeOutOfTheWay = do
+  ourPID  <- liftIO getCurrentProcessId
+  dstPath <- liftIO $ Win32.getModuleFileName Win32.nullHANDLE
 
   let tmpPath = replaceBaseName dstPath (takeBaseName dstPath ++ show ourPID)
 
-  debug verbosity $ "moving " ++ dstPath ++ " to " ++ tmpPath
-  Win32.moveFile dstPath tmpPath
+  debug $ "moving " ++ dstPath ++ " to " ++ tmpPath
+  liftIO $ Win32.moveFile dstPath tmpPath
   return tmpPath
 
 -- | Assuming we've now installed the new exe file in the right place, we
 -- launch it and ask it to delete our exe file when we eventually terminate.
 --
-scheduleOurDemise :: Verbosity -> FilePath -> FilePath
-                  -> (String -> FilePath -> [String]) -> IO ()
-scheduleOurDemise verbosity dstPath tmpPath mkArgs = do
-  ourPID <- getCurrentProcessId
-  event  <- createEvent syncEventName
+scheduleOurDemise :: FilePath -> FilePath
+                  -> (String -> FilePath -> [String]) -> CabalM ()
+scheduleOurDemise dstPath tmpPath mkArgs = do
+  ourPID <- liftIO getCurrentProcessId
+  event  <- liftIO $ createEvent syncEventName
 
   let args = mkArgs (show ourPID) tmpPath
   log $ "launching child " ++ unwords (dstPath : map show args)
-  _ <- runProcess dstPath args Nothing Nothing Nothing Nothing Nothing
+  _ <- liftIO $ runProcess dstPath args Nothing Nothing Nothing Nothing Nothing
 
   log $ "waiting for the child to start up"
-  waitForSingleObject event (10*1000) -- wait at most 10 sec
+  liftIO $ waitForSingleObject event (10*1000) -- wait at most 10 sec
   log $ "child started ok"
 
   where
-    log msg = debug verbosity ("Win32Reinstall.parent: " ++ msg)
+    log msg = debug ("Win32Reinstall.parent: " ++ msg)
 
 -- | Assuming we're now in the new child process, we've been asked by the old
 -- process to wait for it to terminate and then we can remove the old exe file
 -- that it renamed itself to.
 --
-deleteOldExeFile :: Verbosity -> Int -> FilePath -> IO ()
-deleteOldExeFile verbosity oldPID tmpPath = do
+deleteOldExeFile :: Int -> FilePath -> CabalM ()
+deleteOldExeFile oldPID tmpPath = do
   log $ "process started. Will delete exe file of process "
      ++ show oldPID ++ " at path " ++ tmpPath
 
   log $ "getting handle of parent process " ++ show oldPID
-  oldPHANDLE <- Win32.openProcess Win32.sYNCHORNIZE False (fromIntegral oldPID)
+  oldPHANDLE <- liftIO $ Win32.openProcess Win32.sYNCHORNIZE False (fromIntegral oldPID)
 
   log $ "synchronising with parent"
-  event <- openEvent syncEventName
-  setEvent event
+  liftIO $ do
+    event <- openEvent syncEventName
+    setEvent event
 
   log $ "waiting for parent process to terminate"
-  waitForSingleObject oldPHANDLE Win32.iNFINITE
+  liftIO $ waitForSingleObject oldPHANDLE Win32.iNFINITE
   log $ "parent process terminated"
 
   log $ "deleting parent's old .exe file"
-  Win32.deleteFile tmpPath
+  liftIO $ Win32.deleteFile tmpPath
 
   where
     log msg = debug verbosity ("Win32Reinstall.child: " ++ msg)
@@ -211,15 +212,14 @@ setEvent handle =
 
 #else
 
-import Distribution.Verbosity (Verbosity)
+import Distribution.Monad (CabalM)
 import Distribution.Simple.Utils (die')
 
-possibleSelfUpgrade :: Verbosity
-                    -> [FilePath]
-                    -> IO a -> IO a
-possibleSelfUpgrade _ _ action = action
+possibleSelfUpgrade :: [FilePath]
+                    -> CabalM a -> CabalM a
+possibleSelfUpgrade _ action = action
 
-deleteOldExeFile :: Verbosity -> Int -> FilePath -> IO ()
-deleteOldExeFile verbosity _ _ = die' verbosity "win32selfupgrade not needed except on win32"
+deleteOldExeFile :: Int -> FilePath -> CabalM ()
+deleteOldExeFile _ _ = die' "win32selfupgrade not needed except on win32"
 
 #endif

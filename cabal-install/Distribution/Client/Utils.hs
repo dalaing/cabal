@@ -27,7 +27,7 @@ import Distribution.Compat.Environment
 import Distribution.Compat.Exception   ( catchIO )
 import Distribution.Compat.Time ( getModTime )
 import Distribution.Simple.Setup       ( Flag(..) )
-import Distribution.Verbosity
+import Distribution.Monad
 import Distribution.Simple.Utils       ( die', findPackageDesc )
 import qualified Data.ByteString.Lazy as BS
 import Data.Bits
@@ -102,34 +102,35 @@ removeExistingFile path = do
 --
 withTempFileName :: FilePath
                  -> String
-                 -> (FilePath -> IO a) -> IO a
+                 -> (FilePath -> CabalM a) -> CabalM a
 withTempFileName tmpDir template action =
+  runCabalMInIO $ \liftC ->
   Exception.bracket
     (openTempFile tmpDir template)
     (\(name, _) -> removeExistingFile name)
-    (\(name, h) -> hClose h >> action name)
+    (\(name, h) -> hClose h >> liftC (action name))
 
 -- | Executes the action in the specified directory.
 --
 -- Warning: This operation is NOT thread-safe, because current
 -- working directory is a process-global concept.
-inDir :: Maybe FilePath -> IO a -> IO a
+inDir :: Maybe FilePath -> CabalM a -> CabalM a
 inDir Nothing m = m
-inDir (Just d) m = do
+inDir (Just d) m = runCabalMInIO $ \liftC -> do
   old <- getCurrentDirectory
   setCurrentDirectory d
-  m `Exception.finally` setCurrentDirectory old
+  liftC m `Exception.finally` setCurrentDirectory old
 
 -- | Executes the action with an environment variable set to some
 -- value.
 --
 -- Warning: This operation is NOT thread-safe, because current
 -- environment is a process-global concept.
-withEnv :: String -> String -> IO a -> IO a
-withEnv k v m = do
+withEnv :: String -> String -> CabalM a -> CabalM a
+withEnv k v m = runCabalMInIO $ \liftC -> do
   mb_old <- lookupEnv k
   setEnv k v
-  m `Exception.finally` (case mb_old of
+  liftC m `Exception.finally` (case mb_old of
     Nothing -> unsetEnv k
     Just old -> setEnv k old)
 
@@ -138,8 +139,8 @@ withEnv k v m = do
 --
 -- Warning: This operation is NOT thread-safe, because the
 -- environment variables are a process-global concept.
-withExtraPathEnv :: [FilePath] -> IO a -> IO a
-withExtraPathEnv paths m = do
+withExtraPathEnv :: [FilePath] -> CabalM a -> CabalM a
+withExtraPathEnv paths m = runCabalMInIO $ \liftC -> do
   oldPathSplit <- getSearchPath
   let newPath = mungePath $ intercalate [searchPathSeparator] (paths ++ oldPathSplit)
       oldPath = mungePath $ intercalate [searchPathSeparator] oldPathSplit
@@ -148,15 +149,16 @@ withExtraPathEnv paths m = do
       mungePath p | p == ""   = "/dev/null"
                   | otherwise = p
   setEnv "PATH" newPath
-  m `Exception.finally` setEnv "PATH" oldPath
+  liftC m `Exception.finally` setEnv "PATH" oldPath
 
 -- | Log directory change in 'make' compatible syntax
-logDirChange :: (String -> IO ()) -> Maybe FilePath -> IO a -> IO a
+logDirChange :: (String -> CabalM ()) -> Maybe FilePath -> CabalM a -> CabalM a
 logDirChange _ Nothing m = m
 logDirChange l (Just d) m = do
   l $ "cabal: Entering directory '" ++ d ++ "'\n"
-  m `Exception.finally`
-    (l $ "cabal: Leaving directory '" ++ d ++ "'\n")
+  runCabalMInIO $ \liftC -> do
+    liftC m `Exception.finally`
+      (liftC . l $ "cabal: Leaving directory '" ++ d ++ "'\n")
 
 foreign import ccall "getNumberOfProcessors" c_getNumberOfProcessors :: IO CInt
 
@@ -299,17 +301,17 @@ relaxEncodingErrors handle = do
       return ()
 
 -- |Like 'tryFindPackageDesc', but with error specific to add-source deps.
-tryFindAddSourcePackageDesc :: Verbosity -> FilePath -> String -> IO FilePath
-tryFindAddSourcePackageDesc verbosity depPath err = tryFindPackageDesc verbosity depPath $
+tryFindAddSourcePackageDesc :: FilePath -> String -> CabalM FilePath
+tryFindAddSourcePackageDesc depPath err = tryFindPackageDesc depPath $
     err ++ "\n" ++ "Failed to read cabal file of add-source dependency: "
     ++ depPath
 
 -- |Try to find a @.cabal@ file, in directory @depPath@. Fails if one cannot be
 -- found, with @err@ prefixing the error message. This function simply allows
 -- us to give a more descriptive error than that provided by @findPackageDesc@.
-tryFindPackageDesc :: Verbosity -> FilePath -> String -> IO FilePath
-tryFindPackageDesc verbosity depPath err = do
-    errOrCabalFile <- findPackageDesc depPath
+tryFindPackageDesc :: FilePath -> String -> CabalM FilePath
+tryFindPackageDesc depPath err = do
+    errOrCabalFile <- liftIO $ findPackageDesc depPath
     case errOrCabalFile of
         Right file -> return file
-        Left _ -> die' verbosity err
+        Left _ -> die' err
